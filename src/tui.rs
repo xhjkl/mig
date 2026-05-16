@@ -231,6 +231,11 @@ impl AppState {
         }
     }
 
+    fn toggle_mark_and_advance(&mut self) {
+        self.toggle_mark();
+        self.move_cursor_down();
+    }
+
     fn open_comparison(&mut self) {
         let opened = if self.marks.is_empty() {
             self.cursor_id().map(OpenedComparison::Cursor)
@@ -379,7 +384,7 @@ fn handle_key(app: &mut AppState, code: KeyCode) -> KeyOutcome {
         AppMode::Timeline => match code {
             KeyCode::Up => app.move_cursor_up(),
             KeyCode::Down => app.move_cursor_down(),
-            KeyCode::Char(' ') => app.toggle_mark(),
+            KeyCode::Char(' ') => app.toggle_mark_and_advance(),
             KeyCode::Enter => app.open_comparison(),
             KeyCode::Esc | KeyCode::Char('q') => return KeyOutcome::Exit,
             _ => {}
@@ -1873,7 +1878,8 @@ mod tests {
         let mut app = AppState::timeline_fixture(TuiTheme::Dark);
         let first = app.cursor_id().unwrap();
         handle_key(&mut app, KeyCode::Char(' '));
-        handle_key(&mut app, KeyCode::Down);
+        assert_ne!(app.cursor_id(), Some(first));
+
         let second = app.cursor_id().unwrap();
         handle_key(&mut app, KeyCode::Char(' '));
 
@@ -1887,6 +1893,18 @@ mod tests {
         handle_key(&mut app, KeyCode::Esc);
         assert_eq!(app.mode, AppMode::Timeline);
         assert_eq!(app.marks.len(), 2);
+    }
+
+    #[test]
+    fn space_marking_stops_at_last_timeline_entry() {
+        let mut app = AppState::timeline_fixture(TuiTheme::Dark);
+        app.cursor.index = app.timeline.entries.len() - 1;
+        let last = app.cursor_id().unwrap();
+
+        handle_key(&mut app, KeyCode::Char(' '));
+
+        assert_eq!(app.cursor_id(), Some(last));
+        assert!(app.marks.contains(&last));
     }
 
     #[test]
