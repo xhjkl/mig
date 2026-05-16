@@ -1,0 +1,17 @@
+[package]
+name = "mig"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Live diff memory for agent-inhabited worktrees"
+resolver = "2"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+ignore = "0.4.25"
+notify = { version = "8.2.0", features = ["macos_kqueue"] }
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_29"] }
+ropey = "1.6.1"
+similar = "3.1.0"
