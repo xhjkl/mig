@@ -20,6 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use std::collections::BTreeSet;
 use std::io::{self, Stdout};
 use std::ops::Range;
 use std::time::Duration;
@@ -27,9 +28,11 @@ use std::time::Duration;
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 20;
 const MIN_STACKED_CONTENT_WIDTH: u16 = 72;
+const MIN_TIMELINE_CONTENT_WIDTH: u16 = 72;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum TryoutScene {
+    Timeline,
     InlineChange,
     WholeFunction,
     MoveWithoutIdentity,
@@ -53,26 +56,33 @@ impl TuiTheme {
 }
 
 pub(crate) fn run_tryout(scene: TryoutScene, theme: TuiTheme) -> Result<()> {
-    let state = match scene {
-        TryoutScene::InlineChange => inline_change_state(),
-        TryoutScene::WholeFunction => whole_function_state(),
-        TryoutScene::MoveWithoutIdentity => move_without_identity_state(),
+    let app = match scene {
+        TryoutScene::Timeline => AppState::timeline_fixture(theme),
+        TryoutScene::InlineChange => AppState::comparison(theme, inline_change_state()),
+        TryoutScene::WholeFunction => AppState::comparison(theme, whole_function_state()),
+        TryoutScene::MoveWithoutIdentity => {
+            AppState::comparison(theme, move_without_identity_state())
+        }
     };
-    run_state(&state, theme)
+    run_app(app)
 }
 
 pub(crate) fn run_state(state: &DiffState, theme: TuiTheme) -> Result<()> {
-    run_tui(state, theme.palette())
+    run_app(AppState::comparison(theme, state.clone()))
 }
 
-fn run_tui(state: &DiffState, palette: Palette) -> Result<()> {
+fn run_app(app: AppState) -> Result<()> {
+    run_tui(app)
+}
+
+fn run_tui(mut app: AppState) -> Result<()> {
     let mut session = TerminalSession::enter()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_event_loop(&mut terminal, state, palette);
+    let result = run_event_loop(&mut terminal, &mut app);
     terminal.show_cursor()?;
     session.leave()?;
     result
@@ -109,12 +119,226 @@ impl Drop for TerminalSession {
     }
 }
 
+#[derive(Clone, Debug)]
+struct AppState {
+    mode: AppMode,
+    theme: TuiTheme,
+    timeline: Timeline,
+    cursor: TimelineCursor,
+    marks: BTreeSet<TimelineEntryId>,
+    opened: Option<OpenedComparison>,
+}
+
+impl AppState {
+    fn comparison(theme: TuiTheme, diff: DiffState) -> Self {
+        let entry = TimelineEntry {
+            id: TimelineEntryId(0),
+            backing_rev: None,
+            label: "comparison".to_owned(),
+            summary: "opened diff".to_owned(),
+            diff,
+        };
+        Self {
+            mode: AppMode::Comparison,
+            theme,
+            timeline: Timeline {
+                entries: vec![entry],
+            },
+            cursor: TimelineCursor { index: 0 },
+            marks: BTreeSet::new(),
+            opened: Some(OpenedComparison::Cursor(TimelineEntryId(0))),
+        }
+    }
+
+    fn timeline_fixture(theme: TuiTheme) -> Self {
+        let timeline = Timeline {
+            entries: vec![
+                TimelineEntry {
+                    id: TimelineEntryId(0),
+                    backing_rev: Some(BackingRev::git("HEAD~2")),
+                    label: "HEAD~2".to_owned(),
+                    summary: "baseline before Mig session".to_owned(),
+                    diff: inline_change_state(),
+                },
+                TimelineEntry {
+                    id: TimelineEntryId(1),
+                    backing_rev: None,
+                    label: "src/tui.rs+1-1".to_owned(),
+                    summary: "rename inline token wording".to_owned(),
+                    diff: inline_change_state(),
+                },
+                TimelineEntry {
+                    id: TimelineEntryId(2),
+                    backing_rev: None,
+                    label: "src/lib.rs+3-1".to_owned(),
+                    summary: "reshape summarize_turn".to_owned(),
+                    diff: whole_function_state(),
+                },
+                TimelineEntry {
+                    id: TimelineEntryId(3),
+                    backing_rev: None,
+                    label: "src/tui.rs+1-1".to_owned(),
+                    summary: "move tracing without identity".to_owned(),
+                    diff: move_without_identity_state(),
+                },
+                TimelineEntry {
+                    id: TimelineEntryId(4),
+                    backing_rev: Some(BackingRev::git("HEAD")),
+                    label: "HEAD".to_owned(),
+                    summary: "durable checkpoint".to_owned(),
+                    diff: move_without_identity_state(),
+                },
+            ],
+        };
+        Self {
+            mode: AppMode::Timeline,
+            theme,
+            timeline,
+            cursor: TimelineCursor { index: 1 },
+            marks: BTreeSet::new(),
+            opened: None,
+        }
+    }
+
+    fn palette(&self) -> Palette {
+        self.theme.palette()
+    }
+
+    fn cursor_entry(&self) -> Option<&TimelineEntry> {
+        self.timeline.entries.get(self.cursor.index)
+    }
+
+    fn cursor_id(&self) -> Option<TimelineEntryId> {
+        self.cursor_entry().map(|entry| entry.id)
+    }
+
+    fn move_cursor_up(&mut self) {
+        self.cursor.index = self.cursor.index.saturating_sub(1);
+    }
+
+    fn move_cursor_down(&mut self) {
+        if self.cursor.index + 1 < self.timeline.entries.len() {
+            self.cursor.index += 1;
+        }
+    }
+
+    fn toggle_mark(&mut self) {
+        let Some(id) = self.cursor_id() else {
+            return;
+        };
+        if !self.marks.remove(&id) {
+            self.marks.insert(id);
+        }
+    }
+
+    fn open_comparison(&mut self) {
+        let opened = if self.marks.is_empty() {
+            self.cursor_id().map(OpenedComparison::Cursor)
+        } else {
+            Some(OpenedComparison::Marked(
+                self.marks.iter().copied().collect(),
+            ))
+        };
+        let Some(opened) = opened else {
+            return;
+        };
+        self.opened = Some(opened);
+        self.mode = AppMode::Comparison;
+    }
+
+    fn opened_diff(&self) -> Option<&DiffState> {
+        match self.opened.as_ref()? {
+            OpenedComparison::Cursor(id) => self.timeline.entry(*id).map(|entry| &entry.diff),
+            OpenedComparison::Marked(ids) => ids
+                .iter()
+                .filter_map(|id| self.timeline.entry(*id))
+                .next_back()
+                .map(|entry| &entry.diff),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppMode {
+    Timeline,
+    Comparison,
+}
+
+#[derive(Clone, Debug)]
+struct Timeline {
+    entries: Vec<TimelineEntry>,
+}
+
+impl Timeline {
+    fn entry(&self, id: TimelineEntryId) -> Option<&TimelineEntry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TimelineEntry {
+    id: TimelineEntryId,
+    backing_rev: Option<BackingRev>,
+    label: String,
+    summary: String,
+    diff: DiffState,
+}
+
+impl TimelineEntry {
+    fn identity(&self) -> &str {
+        if let Some(backing_rev) = self.backing_rev.as_ref() {
+            backing_rev.display_rev()
+        } else {
+            &self.label
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+struct TimelineEntryId(usize);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackingRev {
+    system: VcsSystem,
+    rev: String,
+}
+
+impl BackingRev {
+    fn git(rev: &str) -> Self {
+        Self {
+            system: VcsSystem::Git,
+            rev: rev.to_owned(),
+        }
+    }
+
+    fn display_rev(&self) -> &str {
+        match self.system {
+            VcsSystem::Git => &self.rev,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VcsSystem {
+    Git,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimelineCursor {
+    index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OpenedComparison {
+    Cursor(TimelineEntryId),
+    Marked(Vec<TimelineEntryId>),
+}
+
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    state: &DiffState,
-    palette: Palette,
+    app: &mut AppState,
 ) -> Result<()> {
-    terminal.draw(|frame| render(frame, state, &palette))?;
+    terminal.draw(|frame| render(frame, app))?;
 
     loop {
         if event::poll(Duration::from_millis(100))? {
@@ -123,15 +347,18 @@ fn run_event_loop(
                     let is_ctrl_c = key.kind == KeyEventKind::Press
                         && key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL);
-                    let is_quit = key.kind == KeyEventKind::Press
-                        && key.code == KeyCode::Char('q')
-                        && key.modifiers.is_empty();
-                    if is_ctrl_c || is_quit {
+                    if is_ctrl_c {
                         break;
+                    }
+                    if key.kind == KeyEventKind::Press {
+                        if handle_key(app, key.code) == KeyOutcome::Exit {
+                            break;
+                        }
+                        terminal.draw(|frame| render(frame, app))?;
                     }
                 }
                 Event::Resize(_, _) => {
-                    terminal.draw(|frame| render(frame, state, &palette))?;
+                    terminal.draw(|frame| render(frame, app))?;
                 }
                 _ => {}
             }
@@ -141,12 +368,50 @@ fn run_event_loop(
     Ok(())
 }
 
-fn render(frame: &mut Frame<'_>, state: &DiffState, palette: &Palette) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyOutcome {
+    Continue,
+    Exit,
+}
+
+fn handle_key(app: &mut AppState, code: KeyCode) -> KeyOutcome {
+    match app.mode {
+        AppMode::Timeline => match code {
+            KeyCode::Up => app.move_cursor_up(),
+            KeyCode::Down => app.move_cursor_down(),
+            KeyCode::Char(' ') => app.toggle_mark(),
+            KeyCode::Enter => app.open_comparison(),
+            KeyCode::Esc | KeyCode::Char('q') => return KeyOutcome::Exit,
+            _ => {}
+        },
+        AppMode::Comparison => match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.mode = AppMode::Timeline;
+            }
+            _ => {}
+        },
+    }
+    KeyOutcome::Continue
+}
+
+fn render(frame: &mut Frame<'_>, app: &AppState) {
+    let palette = app.palette();
     if frame.area().width < MIN_TERMINAL_WIDTH || frame.area().height < MIN_TERMINAL_HEIGHT {
-        render_too_small(frame, palette);
+        render_too_small(frame, &palette);
         return;
     }
 
+    match app.mode {
+        AppMode::Timeline => render_timeline(frame, app, &palette),
+        AppMode::Comparison => render_comparison(frame, app, &palette),
+    }
+}
+
+fn render_comparison(frame: &mut Frame<'_>, app: &AppState, palette: &Palette) {
+    let Some(state) = app.opened_diff() else {
+        render_timeline(frame, app, palette);
+        return;
+    };
     let area = frame.area();
     let layout = resolved_layout(state);
     frame.render_widget(Clear, area);
@@ -196,6 +461,177 @@ fn render_too_small(frame: &mut Frame<'_>, palette: &Palette) {
         )
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn render_timeline(frame: &mut Frame<'_>, app: &AppState, palette: &Palette) {
+    let area = frame.area();
+    let rows = timeline_rows(app, palette);
+    let timeline = timeline_geometry(area, &rows);
+    frame.render_widget(Clear, area);
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!(
+                "entry {} / {}",
+                app.cursor.index + 1,
+                app.timeline.entries.len()
+            ),
+            header_style(palette),
+        ),
+        Span::styled(
+            format!("  marks {}", app.marks.len()),
+            Style::default().fg(palette.gutter_fg),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(
+            timeline
+                .content
+                .centered_line(header, separator_style(palette)),
+        ),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+    );
+    render_full_width_separator(frame, area, area.y + 1, palette);
+
+    let body = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(3),
+        ..area
+    };
+    render_timeline_rows(frame, body, &timeline, rows);
+
+    let footer_y = area.y + area.height.saturating_sub(1);
+    let footer = timeline_footer(app, palette);
+    frame.render_widget(
+        Paragraph::new(
+            timeline
+                .content
+                .positioned_line(footer, Style::default().fg(palette.gutter_fg)),
+        ),
+        Rect {
+            x: area.x,
+            y: footer_y,
+            width: area.width,
+            height: 1,
+        },
+    );
+}
+
+fn timeline_rows(app: &AppState, palette: &Palette) -> Vec<TimelineRenderRow> {
+    app.timeline
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let is_cursor = index == app.cursor.index;
+            let is_marked = app.marks.contains(&entry.id);
+            let line = timeline_entry_line(entry, index, is_cursor, is_marked, palette);
+            let style = if is_cursor {
+                Style::default()
+                    .fg(palette.changed_new_fg)
+                    .bg(palette.changed_bg)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            TimelineRenderRow { line, style }
+        })
+        .collect()
+}
+
+fn render_timeline_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    timeline: &TimelineGeometry,
+    rows: Vec<TimelineRenderRow>,
+) {
+    for (offset, row) in rows.into_iter().enumerate() {
+        let y = area.y + offset as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(timeline.content.positioned_line(row.line, row.style)),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TimelineRenderRow {
+    line: Line<'static>,
+    style: Style,
+}
+
+fn timeline_entry_line(
+    entry: &TimelineEntry,
+    index: usize,
+    is_cursor: bool,
+    is_marked: bool,
+    palette: &Palette,
+) -> Line<'static> {
+    let bg = if is_cursor {
+        palette.changed_bg
+    } else {
+        Color::Reset
+    };
+    let text = if is_cursor {
+        palette.changed_new_fg
+    } else {
+        palette.text
+    };
+    let muted = if is_cursor {
+        palette.changed_old_fg
+    } else {
+        palette.gutter_fg
+    };
+    let identity = entry.identity();
+    let identity_color = if is_cursor {
+        text
+    } else if entry.backing_rev.is_some() {
+        palette.header
+    } else {
+        text
+    };
+    let cursor = if is_cursor { ">" } else { " " };
+    let mark = if is_marked { "*" } else { " " };
+
+    Line::from(vec![
+        Span::styled(
+            format!("{cursor}{mark} "),
+            Style::default().fg(muted).bg(bg),
+        ),
+        Span::styled(
+            format!("{:>2} ", index + 1),
+            Style::default().fg(muted).bg(bg),
+        ),
+        Span::styled(
+            format!("{identity:<18} "),
+            Style::default()
+                .fg(identity_color)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(entry.summary.clone(), Style::default().fg(text).bg(bg)),
+    ])
+}
+
+fn timeline_footer(app: &AppState, palette: &Palette) -> Line<'static> {
+    let opened = match app.opened.as_ref() {
+        Some(OpenedComparison::Cursor(id)) => format!("opened entry {}", id.0 + 1),
+        Some(OpenedComparison::Marked(ids)) => format!("opened {} marked entries", ids.len()),
+        None => "opened none".to_owned(),
+    };
+    Line::from(Span::styled(opened, Style::default().fg(palette.gutter_fg)))
 }
 
 fn body_area(area: Rect) -> Rect {
@@ -917,6 +1353,24 @@ fn stacked_geometry(area: Rect, state: &DiffState, rows: &[UnifiedRow]) -> Stack
 }
 
 #[derive(Clone, Debug)]
+struct TimelineGeometry {
+    content: ContentColumn,
+}
+
+fn timeline_geometry(area: Rect, rows: &[TimelineRenderRow]) -> TimelineGeometry {
+    TimelineGeometry {
+        content: ContentColumn::centered(
+            area.width,
+            content_width(
+                area.width,
+                rows.iter().map(|row| row.line.width()),
+                usize::from(MIN_TIMELINE_CONTENT_WIDTH),
+            ),
+        ),
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ContentColumn {
     pane_width: u16,
     content_x: u16,
@@ -1320,6 +1774,24 @@ mod tests {
     }
 
     #[test]
+    fn timeline_geometry_centers_content_column() {
+        let app = AppState::timeline_fixture(TuiTheme::Dark);
+        let rows = timeline_rows(&app, &Palette::dark_terminal());
+        let geometry = timeline_geometry(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 24,
+            },
+            &rows,
+        );
+        assert!(geometry.content.content_width < geometry.content.pane_width);
+        assert!(geometry.content.content_width >= MIN_TIMELINE_CONTENT_WIDTH);
+        assert!(geometry.content.content_x > 0);
+    }
+
+    #[test]
     fn soft_wrap_line_preserves_basic_continuation_indent() {
         let style = Style::default().bg(Color::Blue);
         let line = Line::from(vec![
@@ -1342,12 +1814,105 @@ mod tests {
     }
 
     #[test]
+    fn timeline_fixture_starts_in_timeline_place() {
+        let app = AppState::timeline_fixture(TuiTheme::Dark);
+        assert_eq!(app.mode, AppMode::Timeline);
+        assert_eq!(app.timeline.entries.len(), 5);
+        assert_eq!(app.cursor.index, 1);
+        assert!(app.opened.is_none());
+    }
+
+    #[test]
+    fn selected_backed_timeline_identity_uses_selected_foreground() {
+        let app = AppState::timeline_fixture(TuiTheme::Dark);
+        let palette = Palette::dark_terminal();
+        let entry = &app.timeline.entries[0];
+
+        let line = timeline_entry_line(entry, 0, true, false, &palette);
+
+        assert_eq!(line.spans[2].style.fg, Some(palette.changed_new_fg));
+    }
+
+    #[test]
+    fn timeline_enter_opens_cursor_and_escape_returns() {
+        let mut app = AppState::timeline_fixture(TuiTheme::Dark);
+        handle_key(&mut app, KeyCode::Down);
+        let id = app.cursor_id().unwrap();
+
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, AppMode::Comparison);
+        assert_eq!(app.opened, Some(OpenedComparison::Cursor(id)));
+
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, AppMode::Timeline);
+        assert_eq!(app.cursor_id(), Some(id));
+    }
+
+    #[test]
+    fn q_and_escape_leave_comparison_before_exiting() {
+        let mut app = AppState::timeline_fixture(TuiTheme::Dark);
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, AppMode::Comparison);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('q')),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.mode, AppMode::Timeline);
+        assert_eq!(handle_key(&mut app, KeyCode::Char('q')), KeyOutcome::Exit);
+
+        let mut app = AppState::timeline_fixture(TuiTheme::Dark);
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(handle_key(&mut app, KeyCode::Esc), KeyOutcome::Continue);
+        assert_eq!(app.mode, AppMode::Timeline);
+        assert_eq!(handle_key(&mut app, KeyCode::Esc), KeyOutcome::Exit);
+    }
+
+    #[test]
+    fn timeline_marks_open_marked_comparison() {
+        let mut app = AppState::timeline_fixture(TuiTheme::Dark);
+        let first = app.cursor_id().unwrap();
+        handle_key(&mut app, KeyCode::Char(' '));
+        handle_key(&mut app, KeyCode::Down);
+        let second = app.cursor_id().unwrap();
+        handle_key(&mut app, KeyCode::Char(' '));
+
+        handle_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, AppMode::Comparison);
+        assert_eq!(
+            app.opened,
+            Some(OpenedComparison::Marked(vec![first, second]))
+        );
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, AppMode::Timeline);
+        assert_eq!(app.marks.len(), 2);
+    }
+
+    #[test]
+    fn timeline_scene_renders_to_ratatui() -> Result<()> {
+        let app = AppState::timeline_fixture(TuiTheme::Dark);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| render(frame, &app))?;
+        let buffer = terminal.backend().to_string();
+        assert!(buffer.contains("entry 2 / 5"));
+        assert!(buffer.contains("HEAD~2"));
+        assert!(buffer.contains("src/tui.rs+1-1"));
+        assert!(buffer.contains("rename inline token wording"));
+        assert!(!buffer.contains("Mig Timeline"));
+        assert!(!buffer.contains("L1 git"));
+        assert!(!buffer.contains("L2 mig"));
+        Ok(())
+    }
+
+    #[test]
     fn inline_change_scene_renders_to_ratatui() -> Result<()> {
         let state = inline_change_state();
+        let app = AppState::comparison(TuiTheme::Dark, state);
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend)?;
-        let palette = Palette::dark_terminal();
-        terminal.draw(|frame| render(frame, &state, &palette))?;
+        terminal.draw(|frame| render(frame, &app))?;
         let buffer = terminal.backend().to_string();
         assert!(buffer.contains("left.rs @ git:HEAD~1"));
         assert!(buffer.contains("right.rs @ git:worktree"));
@@ -1358,10 +1923,10 @@ mod tests {
     fn inline_change_scene_can_render_stacked_projection() -> Result<()> {
         let mut state = inline_change_state();
         state.view.viewport.layout = DiffLayout::Stacked;
+        let app = AppState::comparison(TuiTheme::Dark, state);
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend)?;
-        let palette = Palette::dark_terminal();
-        terminal.draw(|frame| render(frame, &state, &palette))?;
+        terminal.draw(|frame| render(frame, &app))?;
         let buffer = terminal.backend().to_string();
         assert!(buffer.contains("-left.rs @ git:HEAD~1 | +right.rs @ git:worktree"));
         assert!(buffer.contains("-   2"));
@@ -1372,10 +1937,10 @@ mod tests {
     #[test]
     fn whole_function_scene_renders_to_ratatui() -> Result<()> {
         let state = whole_function_state();
+        let app = AppState::comparison(TuiTheme::Dark, state);
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend)?;
-        let palette = Palette::dark_terminal();
-        terminal.draw(|frame| render(frame, &state, &palette))?;
+        terminal.draw(|frame| render(frame, &app))?;
         let buffer = terminal.backend().to_string();
         assert!(buffer.contains("summarize_turn"));
         assert!(buffer.contains("event_count"));
@@ -1393,20 +1958,20 @@ mod tests {
         });
         mig::diff_model::assert_diff_state_invariants(&state);
 
+        let app = AppState::comparison(TuiTheme::Dark, state);
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend)?;
-        let palette = Palette::dark_terminal();
-        terminal.draw(|frame| render(frame, &state, &palette))?;
+        terminal.draw(|frame| render(frame, &app))?;
         Ok(())
     }
 
     #[test]
     fn move_without_identity_scene_renders_stacked_markers() -> Result<()> {
         let state = move_without_identity_state();
+        let app = AppState::comparison(TuiTheme::Dark, state);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend)?;
-        let palette = Palette::dark_terminal();
-        terminal.draw(|frame| render(frame, &state, &palette))?;
+        terminal.draw(|frame| render(frame, &app))?;
         let buffer = terminal.backend().to_string();
         assert!(buffer.contains("-   2"));
         assert!(buffer.contains("+   8"));
@@ -1416,10 +1981,10 @@ mod tests {
     #[test]
     fn inline_change_scene_renders_resize_hint_when_too_small() -> Result<()> {
         let state = inline_change_state();
+        let app = AppState::comparison(TuiTheme::Dark, state);
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend)?;
-        let palette = Palette::dark_terminal();
-        terminal.draw(|frame| render(frame, &state, &palette))?;
+        terminal.draw(|frame| render(frame, &app))?;
         let buffer = terminal.backend().to_string();
         assert!(buffer.contains("Mig needs more room"));
         assert!(buffer.contains("60x20"));
