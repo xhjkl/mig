@@ -56,9 +56,9 @@ struct RibbonItem<'a> {
 impl GutterLayout {
     fn new(diff: &FileDiff) -> Self {
         let label_columns = diff
-            .windows
+            .hunks
             .iter()
-            .flat_map(|window| &window.rows)
+            .flat_map(|hunk| &hunk.rows)
             .map(row_label_columns)
             .max()
             .unwrap_or(0);
@@ -395,7 +395,7 @@ fn render_file_ribbon(frame: &mut Frame<'_>, area: Rect, items: &[RibbonItem<'_>
     );
 }
 
-/// Contiguous ribbon window around the active review, with explicit hidden edges.
+/// Contiguous ribbon run around the active review, with explicit hidden edges.
 fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'static> {
     if items.is_empty() || active >= items.len() || width == 0 {
         return Line::from("");
@@ -406,7 +406,7 @@ fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'s
     let mut start = active;
     let mut end = active + 1;
 
-    // Grow evenly from the active item. A contiguous window keeps ordering legible.
+    // Grow evenly from the active item. A contiguous run keeps ordering legible.
     loop {
         let left_first = active - start < end - active;
         let sides = if left_first {
@@ -424,7 +424,7 @@ fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'s
             let Some((candidate_start, candidate_end)) = candidate else {
                 continue;
             };
-            let candidate_width = ribbon_window_width(items, candidate_start, candidate_end);
+            let candidate_width = ribbon_run_width(items, candidate_start, candidate_end);
             if candidate_width > available {
                 continue;
             }
@@ -482,7 +482,7 @@ enum RibbonSide {
     Right,
 }
 
-fn ribbon_window_width(items: &[RibbonItem<'_>], start: usize, end: usize) -> usize {
+fn ribbon_run_width(items: &[RibbonItem<'_>], start: usize, end: usize) -> usize {
     let item_width = (start..end)
         .map(|index| ribbon_item_width(items[index]))
         .sum::<usize>();
@@ -560,16 +560,16 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, required_width: usize) {
 }
 
 fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Line<'static>> {
-    if diff.windows.is_empty() {
+    if diff.hunks.is_empty() {
         return vec![Line::from(""), Line::styled("  no changes", muted())];
     }
 
     let mut rows = Vec::new();
-    for (index, window) in diff.windows.iter().enumerate() {
+    for (index, hunk) in diff.hunks.iter().enumerate() {
         if index > 0 {
             rows.push(Line::from(""));
         }
-        for row in &window.rows {
+        for row in &hunk.rows {
             match row {
                 DiffRow::Code { line, role } => {
                     let marker = (*role == CodeRole::Reflow).then_some(('~', Palette::FAINT));
@@ -1032,7 +1032,7 @@ impl Palette {
 mod tests {
     use super::*;
     use crate::{
-        diff::{DiffWindow, LineMapping, diff_file},
+        diff::{Hunk, LineCoverage, diff_file},
         fixture::{AFTER, BEFORE, LABEL},
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -1089,7 +1089,7 @@ mod tests {
             .iter()
             .position(|line| line.contains("legacy_counter → {Metric, ReviewMeter}"))
             .expect("import must be rendered");
-        assert_eq!(import, move_end + 2, "windows need exactly one blank row");
+        assert_eq!(import, move_end + 2, "hunks need exactly one blank row");
 
         for annotation in [
             "LOGIC",
@@ -1240,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn gutter_follows_displayed_labels_instead_of_window_mapping() {
+    fn gutter_follows_displayed_labels_instead_of_hunk_coverage() {
         let line = |number| CodeLine {
             number,
             spans: vec![CodeSpan {
@@ -1252,8 +1252,8 @@ mod tests {
         let diff = FileDiff {
             path: "src/large.rs".to_owned(),
             generated: false,
-            windows: vec![DiffWindow {
-                mapping: LineMapping {
+            hunks: vec![Hunk {
+                coverage: LineCoverage {
                     before: Some(1..2),
                     after: Some(1..2),
                 },

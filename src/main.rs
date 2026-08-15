@@ -102,7 +102,7 @@ fn plan_file_pair(
     let after_source = String::from_utf8(after_source)
         .with_context(|| format!("file is not UTF-8: {}", after.display()))?;
     let diff = diff_file(&path, &before_source, &after_source)?;
-    if diff.windows.is_empty() {
+    if diff.hunks.is_empty() {
         return Ok(None);
     }
 
@@ -200,7 +200,7 @@ mod tests {
 
         assert!(matches!(
             review,
-            FileReview::Diff(diff) if diff.path == "input.txt" && !diff.windows.is_empty()
+            FileReview::Diff(diff) if diff.path == "input.txt" && !diff.hunks.is_empty()
         ));
     }
 }

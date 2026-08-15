@@ -380,9 +380,11 @@ mod tests {
                 "z-generated.txt"
             ]
         );
-        assert!(diffs.iter().all(|review| {
-            matches!(review, FileReview::Diff(diff) if !diff.windows.is_empty())
-        }));
+        assert!(
+            diffs.iter().all(|review| {
+                matches!(review, FileReview::Diff(diff) if !diff.hunks.is_empty())
+            })
+        );
         assert!(diffs[..6].iter().all(|review| !review.is_generated()));
         assert!(diffs[6..].iter().all(FileReview::is_generated));
 
@@ -433,9 +435,9 @@ mod tests {
             panic!("small text change must remain a diff");
         };
         let rendered = diff
-            .windows
+            .hunks
             .iter()
-            .flat_map(|window| &window.rows)
+            .flat_map(|hunk| &hunk.rows)
             .map(|row| format!("{row:?}"))
             .collect::<String>();
         assert!(rendered.contains("head"));
@@ -598,7 +600,7 @@ mod tests {
 
         assert!(matches!(
             reviews.as_slice(),
-            [FileReview::Diff(diff)] if diff.path == "exact.txt" && !diff.windows.is_empty()
+            [FileReview::Diff(diff)] if diff.path == "exact.txt" && !diff.hunks.is_empty()
         ));
     }
 

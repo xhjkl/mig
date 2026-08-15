@@ -31,7 +31,7 @@ pub struct CodeSpan {
     pub mark: DiffMark,
 }
 
-/// Original source line retained inside a bounded diff window.
+/// Original source line retained inside a bounded diff hunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodeLine {
     pub number: usize,
@@ -49,14 +49,14 @@ pub struct WordDiff {
     pub suffix: String,
 }
 
-/// One-based, half-open before/current bounds covered by a review row or window.
+/// One-based, half-open before/after bounds covered by a review row or hunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LineMapping {
+pub struct LineCoverage {
     pub before: Option<Range<usize>>,
     pub after: Option<Range<usize>>,
 }
 
-/// How one current-world source line communicates its role in the window.
+/// How one current-world source line communicates its role in the hunk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodeRole {
     Context,
@@ -64,7 +64,7 @@ pub enum CodeRole {
     Reflow,
 }
 
-/// Presentation-ready row chosen while planning a bounded diff window.
+/// Presentation-ready row chosen while planning a bounded diff hunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiffRow {
     Code {
@@ -84,23 +84,23 @@ pub enum DiffRow {
         after: CodeLine,
     },
     Wordwise(WordDiff),
-    Elision(LineMapping),
+    Elision(LineCoverage),
 }
 
 /// Bounded view into a file containing related, presentation-ready rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiffWindow {
-    pub mapping: LineMapping,
+pub struct Hunk {
+    pub coverage: LineCoverage,
     pub rows: Vec<DiffRow>,
 }
 
-/// Render-ready stream of bounded windows for one source file.
+/// Render-ready stream of bounded hunks for one source file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileDiff {
     pub path: String,
     /// Whether either source revision declares itself generated near its header.
     pub generated: bool,
-    pub windows: Vec<DiffWindow>,
+    pub hunks: Vec<Hunk>,
 }
 
 /// Select syntax-aware Rust review when safe, otherwise plan an exact line review.
@@ -122,10 +122,10 @@ fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     }
 
     let matches = correspond(&before_file.definitions, &after_file.definitions);
-    let windows = plan_unified(&before_file, &after_file, &matches);
+    let hunks = plan_structural_hunks(&before_file, &after_file, &matches);
     // Unknown top-level forms must not disappear beside recognized structural edits.
     if before != after
-        && (windows.is_empty()
+        && (hunks.is_empty()
             || !structural_projection_covers_plain_changes(
                 before,
                 after,
@@ -139,7 +139,7 @@ fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     Ok(FileDiff {
         path: path.to_owned(),
         generated: false,
-        windows,
+        hunks,
     })
 }
 
@@ -283,12 +283,12 @@ fn diff_plain(path: &str, before: &str, after: &str, generated: bool) -> FileDif
         .collect::<Vec<_>>();
     let matches = local_matches(&before_keys, &after_keys);
     let events = plain_events(before.len(), after.len(), matches);
-    let windows = plan_plain_windows(&before, &after, &events);
+    let hunks = plan_plain_hunks(&before, &after, &events);
 
     FileDiff {
         path: path.to_owned(),
         generated,
-        windows,
+        hunks,
     }
 }
 
@@ -357,11 +357,11 @@ fn plain_events(
 }
 
 /// Merge nearby changes using the same context radius on both sides.
-fn plan_plain_windows(
+fn plan_plain_hunks(
     before: &[PlainLine<'_>],
     after: &[PlainLine<'_>],
     events: &[PlainEvent],
-) -> Vec<DiffWindow> {
+) -> Vec<Hunk> {
     let changes = events
         .iter()
         .enumerate()
@@ -371,7 +371,7 @@ fn plan_plain_windows(
         return Vec::new();
     };
 
-    let mut windows = Vec::new();
+    let mut hunks = Vec::new();
     let mut group_start = first;
     let mut group_end = first;
     for change in changes.into_iter().skip(1) {
@@ -382,7 +382,7 @@ fn plan_plain_windows(
             continue;
         }
 
-        windows.push(plan_plain_window(
+        hunks.push(plan_plain_hunk(
             before,
             after,
             events,
@@ -392,27 +392,27 @@ fn plan_plain_windows(
         group_start = change;
         group_end = change;
     }
-    windows.push(plan_plain_window(
+    hunks.push(plan_plain_hunk(
         before,
         after,
         events,
         group_start,
         group_end,
     ));
-    windows
+    hunks
 }
 
-fn plan_plain_window(
+fn plan_plain_hunk(
     before: &[PlainLine<'_>],
     after: &[PlainLine<'_>],
     events: &[PlainEvent],
     first_change: usize,
     last_change: usize,
-) -> DiffWindow {
+) -> Hunk {
     let start = first_change.saturating_sub(PLAIN_CONTEXT_LINES);
     let end = (last_change + PLAIN_CONTEXT_LINES + 1).min(events.len());
     let events = &events[start..end];
-    let mut mapping = LineMapping {
+    let mut coverage = LineCoverage {
         before: None,
         after: None,
     };
@@ -424,12 +424,16 @@ fn plan_plain_window(
                 before: before_index,
                 after: after_index,
             } => {
-                include_plain_mapping(
-                    &mut mapping.before,
+                include_plain_coverage(
+                    &mut coverage.before,
                     before,
                     &(*before_index..*before_index + 1),
                 );
-                include_plain_mapping(&mut mapping.after, after, &(*after_index..*after_index + 1));
+                include_plain_coverage(
+                    &mut coverage.after,
+                    after,
+                    &(*after_index..*after_index + 1),
+                );
                 rows.push(DiffRow::Code {
                     line: plain_code_line(after[*after_index], DiffMark::Context),
                     role: CodeRole::Context,
@@ -439,8 +443,8 @@ fn plan_plain_window(
                 before: before_range,
                 after: after_range,
             } => {
-                include_plain_mapping(&mut mapping.before, before, before_range);
-                include_plain_mapping(&mut mapping.after, after, after_range);
+                include_plain_coverage(&mut coverage.before, before, before_range);
+                include_plain_coverage(&mut coverage.after, after, after_range);
                 render_plain_change(
                     &mut rows,
                     &before[before_range.clone()],
@@ -450,11 +454,11 @@ fn plan_plain_window(
         }
     }
 
-    DiffWindow { mapping, rows }
+    Hunk { coverage, rows }
 }
 
-fn include_plain_mapping(
-    mapping: &mut Option<Range<usize>>,
+fn include_plain_coverage(
+    coverage: &mut Option<Range<usize>>,
     lines: &[PlainLine<'_>],
     indices: &Range<usize>,
 ) {
@@ -469,12 +473,12 @@ fn include_plain_mapping(
     };
     let covered = first.number..last.number + 1;
 
-    let Some(mapping) = mapping else {
-        *mapping = Some(covered);
+    let Some(coverage) = coverage else {
+        *coverage = Some(covered);
         return;
     };
-    mapping.start = mapping.start.min(covered.start);
-    mapping.end = mapping.end.max(covered.end);
+    coverage.start = coverage.start.min(covered.start);
+    coverage.end = coverage.end.max(covered.end);
 }
 
 fn render_plain_change(rows: &mut Vec<DiffRow>, before: &[PlainLine<'_>], after: &[PlainLine<'_>]) {
@@ -605,42 +609,42 @@ fn correspond<'a>(
 }
 
 /// Sole owner of review grouping, ordering, row treatments, and elision.
-fn plan_unified(
+fn plan_structural_hunks(
     before: &SyntaxFile<'_>,
     after: &SyntaxFile<'_>,
     matches: &[DefinitionMatch<'_>],
-) -> Vec<DiffWindow> {
+) -> Vec<Hunk> {
     let moves = moved_definitions(matches);
     let moved_starts = moves
         .iter()
         .map(|(before, _)| before.lines.start)
         .collect::<HashSet<_>>();
 
-    let mut definitions = plan_definition_windows(before, after, matches);
+    let mut definitions = plan_definition_hunks(before, after, matches);
     definitions.sort_by_key(|(line, _)| *line);
 
-    let mut windows = definitions
+    let mut hunks = definitions
         .into_iter()
-        .map(|(_, window)| window)
+        .map(|(_, hunk)| hunk)
         .collect::<Vec<_>>();
-    windows.extend(
+    hunks.extend(
         moves
             .into_iter()
             .map(|(before_definition, after_definition)| {
-                plan_move_window(after, before_definition, after_definition)
+                plan_move_hunk(after, before_definition, after_definition)
             }),
     );
-    windows.extend(plan_import_windows(&before.imports, &after.imports));
-    windows.extend(plan_reflow_windows(before, after, matches, &moved_starts));
-    windows
+    hunks.extend(plan_import_hunks(&before.imports, &after.imports));
+    hunks.extend(plan_reflow_hunks(before, after, matches, &moved_starts));
+    hunks
 }
 
-fn plan_definition_windows(
+fn plan_definition_hunks(
     before_file: &SyntaxFile<'_>,
     after_file: &SyntaxFile<'_>,
     matches: &[DefinitionMatch<'_>],
-) -> Vec<(usize, DiffWindow)> {
-    let mut windows = Vec::new();
+) -> Vec<(usize, Hunk)> {
+    let mut hunks = Vec::new();
     for matched in matches {
         match *matched {
             DefinitionMatch::Matched { before, after } => {
@@ -652,9 +656,9 @@ fn plan_definition_windows(
                     && !after.has_error
                     && before.code_fingerprint == after.code_fingerprint
                 {
-                    windows.extend(comments.into_iter().map(|comment| {
+                    hunks.extend(comments.into_iter().map(|comment| {
                         let line = comment_line(&comment);
-                        (line, plan_comment_window(comment))
+                        (line, plan_comment_hunk(comment))
                     }));
                     continue;
                 }
@@ -673,19 +677,13 @@ fn plan_definition_windows(
                 let after_lines =
                     render_definition(after_file, after, &after_context, DiffMark::Added, true);
                 let boundaries = blank_boundaries(after_file, after);
-                let mapping = LineMapping {
+                let coverage = LineCoverage {
                     before: Some(before.lines.clone()),
                     after: Some(after.lines.clone()),
                 };
-                windows.push((
+                hunks.push((
                     before.lines.start,
-                    plan_definition_window(
-                        mapping,
-                        before_lines,
-                        after_lines,
-                        boundaries,
-                        comments,
-                    ),
+                    plan_definition_hunk(coverage, before_lines, after_lines, boundaries, comments),
                 ));
             }
             DefinitionMatch::Removed(definition) => {
@@ -697,13 +695,13 @@ fn plan_definition_windows(
                     false,
                 );
                 let boundaries = blank_boundaries(before_file, definition);
-                let mapping = LineMapping {
+                let coverage = LineCoverage {
                     before: Some(definition.lines.clone()),
                     after: None,
                 };
-                windows.push((
+                hunks.push((
                     definition.lines.start,
-                    plan_definition_window(mapping, lines, Vec::new(), boundaries, Vec::new()),
+                    plan_definition_hunk(coverage, lines, Vec::new(), boundaries, Vec::new()),
                 ));
             }
             DefinitionMatch::Added(definition) => {
@@ -715,27 +713,27 @@ fn plan_definition_windows(
                     false,
                 );
                 let boundaries = blank_boundaries(after_file, definition);
-                let mapping = LineMapping {
+                let coverage = LineCoverage {
                     before: None,
                     after: Some(definition.lines.clone()),
                 };
-                windows.push((
+                hunks.push((
                     definition.lines.start,
-                    plan_definition_window(mapping, Vec::new(), lines, boundaries, Vec::new()),
+                    plan_definition_hunk(coverage, Vec::new(), lines, boundaries, Vec::new()),
                 ));
             }
         }
     }
-    windows
+    hunks
 }
 
-fn plan_definition_window(
-    mapping: LineMapping,
+fn plan_definition_hunk(
+    coverage: LineCoverage,
     before: Vec<CodeLine>,
     after: Vec<CodeLine>,
     boundaries: (Option<CodeLine>, Option<CodeLine>),
     commentary: Vec<CommentEdit>,
-) -> DiffWindow {
+) -> Hunk {
     let mut rows = Vec::new();
     if let Some(line) = boundaries.0 {
         rows.push(DiffRow::Code {
@@ -777,15 +775,15 @@ fn plan_definition_window(
         });
     }
 
-    DiffWindow {
-        mapping,
+    Hunk {
+        coverage,
         rows: abbreviate_rows(rows),
     }
 }
 
-fn plan_comment_window(change: CommentEdit) -> DiffWindow {
-    DiffWindow {
-        mapping: LineMapping {
+fn plan_comment_hunk(change: CommentEdit) -> Hunk {
+    Hunk {
+        coverage: LineCoverage {
             before: change
                 .before
                 .as_ref()
@@ -802,12 +800,12 @@ fn plan_comment_window(change: CommentEdit) -> DiffWindow {
     }
 }
 
-fn plan_move_window(
+fn plan_move_hunk(
     after_file: &SyntaxFile<'_>,
     before: &Definition<'_>,
     after: &Definition<'_>,
-) -> DiffWindow {
-    let mapping = LineMapping {
+) -> Hunk {
+    let coverage = LineCoverage {
         before: Some(before.lines.clone()),
         after: Some(after.lines.clone()),
     };
@@ -815,14 +813,14 @@ fn plan_move_window(
     let preview = render_definition(after_file, after, &context, DiffMark::Context, false);
     let mut preview = preview.into_iter();
     let Some(first) = preview.next() else {
-        return DiffWindow {
-            mapping,
+        return Hunk {
+            coverage,
             rows: Vec::new(),
         };
     };
     let mut preview = preview.collect::<Vec<_>>();
     let last = preview.pop();
-    // Establish the old/current mapping once, then remain in current source.
+    // Establish the before-to-after correspondence once, then remain on the after side.
     let mut rows = vec![DiffRow::Moved {
         before: Some(before.lines.start),
         after: first,
@@ -837,7 +835,7 @@ fn plan_move_window(
             role: CodeRole::Context,
         });
     } else if !preview.is_empty() {
-        rows.push(DiffRow::Elision(LineMapping {
+        rows.push(DiffRow::Elision(LineCoverage {
             before: Some(before_range),
             after: Some(after_range),
         }));
@@ -848,10 +846,10 @@ fn plan_move_window(
             after: last,
         });
     }
-    DiffWindow { mapping, rows }
+    Hunk { coverage, rows }
 }
 
-fn plan_import_windows(before: &[Import<'_>], after: &[Import<'_>]) -> Vec<DiffWindow> {
+fn plan_import_hunks(before: &[Import<'_>], after: &[Import<'_>]) -> Vec<Hunk> {
     let before_text = before
         .iter()
         .map(|import| import.text)
@@ -872,8 +870,8 @@ fn plan_import_windows(before: &[Import<'_>], after: &[Import<'_>]) -> Vec<DiffW
 
     (0..count)
         .map(|index| word_diff(removed.get(index), added.get(index)))
-        .map(|word| DiffWindow {
-            mapping: LineMapping {
+        .map(|word| Hunk {
+            coverage: LineCoverage {
                 before: word.before_line.map(|line| line..line + 1),
                 after: word.after_line.map(|line| line..line + 1),
             },
@@ -944,12 +942,12 @@ fn increasing_subsequence(values: &[usize]) -> HashSet<usize> {
     stable
 }
 
-fn plan_reflow_windows(
+fn plan_reflow_hunks(
     before_file: &SyntaxFile<'_>,
     after_file: &SyntaxFile<'_>,
     matches: &[DefinitionMatch<'_>],
     moved_starts: &HashSet<usize>,
-) -> Vec<DiffWindow> {
+) -> Vec<Hunk> {
     // Reflow is a semantic claim, so parser recovery anywhere makes us conservative.
     if before_file.tree.root_node().has_error() || after_file.tree.root_node().has_error() {
         return Vec::new();
@@ -1001,8 +999,8 @@ fn plan_reflow_windows(
                     },
                 })
                 .collect();
-            Some(DiffWindow {
-                mapping: LineMapping {
+            Some(Hunk {
+                coverage: LineCoverage {
                     before: Some(before.lines.clone()),
                     after: Some(after.lines.clone()),
                 },
@@ -1166,7 +1164,7 @@ fn context_span(text: &str) -> CodeSpan {
     }
 }
 
-/// Preserve the window frame and every signal row; fold only distant context.
+/// Preserve the hunk frame and every signal row; fold only distant context.
 fn abbreviate_rows(rows: Vec<DiffRow>) -> Vec<DiffRow> {
     if rows.len() <= 4 {
         return rows;
@@ -1215,7 +1213,7 @@ fn abbreviate_rows(rows: Vec<DiffRow>) -> Vec<DiffRow> {
             .filter_map(row_after_line)
             .max()
             .map(|line| line + 1);
-        abbreviated.push(DiffRow::Elision(LineMapping {
+        abbreviated.push(DiffRow::Elision(LineCoverage {
             before: None,
             after: after_start.zip(after_end).map(|(start, end)| start..end),
         }));
@@ -1232,7 +1230,7 @@ fn row_after_line(row: &DiffRow) -> Option<usize> {
         DiffRow::LineEnding { .. } => None,
         DiffRow::Moved { after, .. } => Some(after.number),
         DiffRow::Wordwise(word) => word.after_line,
-        DiffRow::Elision(mapping) => mapping.after.as_ref().map(|range| range.start),
+        DiffRow::Elision(coverage) => coverage.after.as_ref().map(|range| range.start),
     }
 }
 
@@ -1657,16 +1655,16 @@ mod tests {
     use crate::fixture::{AFTER, BEFORE, LABEL};
 
     #[test]
-    fn fixture_becomes_an_ordered_stream_of_windows() {
+    fn fixture_becomes_an_ordered_stream_of_hunks() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
-        assert_eq!(diff.windows.len(), 6);
+        assert_eq!(diff.hunks.len(), 6);
         assert!(matches!(
-            diff.windows[4].rows.as_slice(),
+            diff.hunks[4].rows.as_slice(),
             [DiffRow::Wordwise(_)]
         ));
         assert!(matches!(
-            diff.windows[5].rows.as_slice(),
+            diff.hunks[5].rows.as_slice(),
             [
                 DiffRow::Code { .. },
                 DiffRow::Code { .. },
@@ -1676,36 +1674,35 @@ mod tests {
     }
 
     #[test]
-    fn definition_window_groups_treatments_and_elides_distant_context() {
+    fn definition_hunk_groups_treatments_and_elides_distant_context() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-        let window = window_containing(&diff, "fn load_profile");
+        let hunk = hunk_containing(&diff, "fn load_profile");
 
-        assert_eq!(window.mapping.before, Some(23..31));
-        assert_eq!(window.mapping.after, Some(16..24));
-        assert_eq!(window.rows.len(), 8);
+        assert_eq!(hunk.coverage.before, Some(23..31));
+        assert_eq!(hunk.coverage.after, Some(16..24));
+        assert_eq!(hunk.rows.len(), 8);
         assert_eq!(
-            window
-                .rows
+            hunk.rows
                 .iter()
                 .filter(|row| matches!(row, DiffRow::Elision(_)))
                 .count(),
             2
         );
 
-        let linewise = window.rows.iter().find_map(|row| {
+        let linewise = hunk.rows.iter().find_map(|row| {
             let DiffRow::Linewise { before, after } = row else {
                 return None;
             };
             Some((before.as_ref()?, after.as_ref()?))
         });
         let Some((before_comment, after_comment)) = linewise else {
-            panic!("comment edit must stay inside its definition window");
+            panic!("comment edit must stay inside its definition hunk");
         };
         assert!(line_text(before_comment).contains("already trusted"));
         assert!(line_text(after_comment).contains("must be revalidated"));
         assert!(line_text(after_comment).starts_with("    //"));
 
-        let inline = window.rows.iter().find_map(|row| {
+        let inline = hunk.rows.iter().find_map(|row| {
             let DiffRow::Code {
                 line,
                 role: CodeRole::Inline,
@@ -1732,15 +1729,14 @@ mod tests {
         let before = "fn run() {\n    before_one();\n\n    before_two();\n}\n";
         let after = "fn run() {\n    after_one();\n\n    after_two();\n}\n";
         let diff = diff_file("src/run.rs", before, after).expect("source must parse");
-        let window = window_containing(&diff, "fn run");
+        let hunk = hunk_containing(&diff, "fn run");
 
         assert!(
-            window
-                .rows
+            hunk.rows
                 .iter()
                 .all(|row| !matches!(row, DiffRow::Elision(_)))
         );
-        assert!(window.rows.iter().any(|row| {
+        assert!(hunk.rows.iter().any(|row| {
             matches!(
                 row,
                 DiffRow::Code {
@@ -1752,34 +1748,34 @@ mod tests {
     }
 
     #[test]
-    fn move_window_lives_in_the_present_and_elides_its_unchanged_body() {
+    fn move_hunk_lives_in_the_present_and_elides_its_unchanged_body() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-        let window = window_containing(&diff, "fn cache_key");
+        let hunk = hunk_containing(&diff, "fn cache_key");
 
-        assert_eq!(window.mapping.before, Some(16..22));
-        assert_eq!(window.mapping.after, Some(38..44));
-        assert_eq!(window.rows.len(), 3);
+        assert_eq!(hunk.coverage.before, Some(16..22));
+        assert_eq!(hunk.coverage.after, Some(38..44));
+        assert_eq!(hunk.rows.len(), 3);
 
         let DiffRow::Moved {
             before: Some(before),
             after,
-        } = &window.rows[0]
+        } = &hunk.rows[0]
         else {
-            panic!("move must begin with an old-to-current line mapping");
+            panic!("move must begin with a before-to-after line correspondence");
         };
         assert_eq!((*before, after.number), (16, 38));
         assert!(line_text(after).contains("fn cache_key"));
 
-        let DiffRow::Elision(mapping) = &window.rows[1] else {
+        let DiffRow::Elision(coverage) = &hunk.rows[1] else {
             panic!("unchanged moved body must be abbreviated");
         };
-        assert_eq!(mapping.before, Some(17..21));
-        assert_eq!(mapping.after, Some(39..43));
+        assert_eq!(coverage.before, Some(17..21));
+        assert_eq!(coverage.after, Some(39..43));
 
         let DiffRow::Moved {
             before: None,
             after,
-        } = &window.rows[2]
+        } = &hunk.rows[2]
         else {
             panic!("the closing line must use only its current line number");
         };
@@ -1793,9 +1789,9 @@ mod tests {
         let after = "fn second() {\n    second_body();\n}\n\nfn first() {\n    first_body();\n}\n";
         let diff = diff_file("src/run.rs", before, after).expect("source must parse");
         let moved = diff
-            .windows
+            .hunks
             .iter()
-            .find(|window| matches!(window.rows.first(), Some(DiffRow::Moved { .. })))
+            .find(|hunk| matches!(hunk.rows.first(), Some(DiffRow::Moved { .. })))
             .expect("one definition must be presented as moved");
 
         assert!(matches!(
@@ -1812,36 +1808,36 @@ mod tests {
     }
 
     #[test]
-    fn expanded_fixture_adds_distinct_policy_and_payload_windows() {
+    fn expanded_fixture_adds_distinct_policy_and_payload_hunks() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
-        let policy = window_containing(&diff, "fn should_refresh");
-        assert!(window_has_text(policy, "Only stale profiles"));
-        assert!(window_has_text(policy, "Stale and legacy profiles"));
-        assert!(window_has_text(
+        let policy = hunk_containing(&diff, "fn should_refresh");
+        assert!(hunk_has_text(policy, "Only stale profiles"));
+        assert!(hunk_has_text(policy, "Stale and legacy profiles"));
+        assert!(hunk_has_text(
             policy,
             "profile.schema < 4 || age > Duration::from_secs(300)"
         ));
-        assert!(window_has_added_text(policy, "schema"));
+        assert!(hunk_has_added_text(policy, "schema"));
 
-        let normalization = window_containing(&diff, "fn display_label");
-        assert!(window_has_added_text(normalization, "replace"));
-        assert!(window_has_text(
+        let normalization = hunk_containing(&diff, "fn display_label");
+        assert!(hunk_has_added_text(normalization, "replace"));
+        assert!(hunk_has_text(
             normalization,
             "profile.display_name.trim().to_owned().replace('\\n', \" \")"
         ));
     }
 
     #[test]
-    fn imports_and_reflow_use_distinct_late_windows() {
+    fn imports_and_reflow_use_distinct_late_hunks() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
         let import = diff
-            .windows
+            .hunks
             .iter()
-            .find(|window| matches!(window.rows.as_slice(), [DiffRow::Wordwise(_)]))
-            .expect("fixture must include a wordwise import window");
-        let formatting = window_containing(&diff, "fn render_response");
+            .find(|hunk| matches!(hunk.rows.as_slice(), [DiffRow::Wordwise(_)]))
+            .expect("fixture must include a wordwise import hunk");
+        let formatting = hunk_containing(&diff, "fn render_response");
         let [DiffRow::Wordwise(import)] = import.rows.as_slice() else {
             panic!("import replacement must be a wordwise row");
         };
@@ -1850,8 +1846,8 @@ mod tests {
         assert_eq!(import.added, "{Metric, ReviewMeter}");
         assert_eq!(import.suffix, ";");
 
-        assert_eq!(formatting.mapping.before, Some(32..38));
-        assert_eq!(formatting.mapping.after, Some(25..28));
+        assert_eq!(formatting.coverage.before, Some(32..38));
+        assert_eq!(formatting.coverage.after, Some(25..28));
         assert!(matches!(
             formatting.rows.as_slice(),
             [
@@ -1876,7 +1872,7 @@ mod tests {
         let source = "use std::fmt;\n\nfn stable() { fmt::write(); }\n";
         let diff = diff_file("src/stable.rs", source, source).expect("source must parse");
 
-        assert!(diff.windows.is_empty());
+        assert!(diff.hunks.is_empty());
     }
 
     #[test]
@@ -1885,7 +1881,7 @@ mod tests {
 
         let diff = diff_file("src/broken.rs", source, source).expect("parser must recover");
 
-        assert!(diff.windows.is_empty());
+        assert!(diff.hunks.is_empty());
     }
 
     #[test]
@@ -1897,9 +1893,9 @@ mod tests {
 
         let diff = diff_file("src/thing.rs", before, after).expect("source must parse");
 
-        assert_eq!(diff.windows.len(), 1);
-        assert!(window_has_added_text(&diff.windows[0], "new"));
-        assert!(!window_has_text(&diff.windows[0], "second"));
+        assert_eq!(diff.hunks.len(), 1);
+        assert!(hunk_has_added_text(&diff.hunks[0], "new"));
+        assert!(!hunk_has_text(&diff.hunks[0], "second"));
     }
 
     #[test]
@@ -1911,14 +1907,14 @@ mod tests {
         let removed = diff_file("src/run.rs", commented, plain).expect("source must parse");
 
         assert!(matches!(
-            added.windows[0].rows.as_slice(),
+            added.hunks[0].rows.as_slice(),
             [DiffRow::Linewise {
                 before: None,
                 after: Some(_)
             }]
         ));
         assert!(matches!(
-            removed.windows[0].rows.as_slice(),
+            removed.hunks[0].rows.as_slice(),
             [DiffRow::Linewise {
                 before: Some(_),
                 after: None
@@ -1932,7 +1928,7 @@ mod tests {
 
         let diff = diff_file("src/run.rs", "", after).expect("source must parse");
 
-        assert!(window_has_added_text(&diff.windows[0], "explain why"));
+        assert!(hunk_has_added_text(&diff.hunks[0], "explain why"));
     }
 
     #[test]
@@ -1943,10 +1939,10 @@ mod tests {
         let diff = diff_file("notes.txt", before, after).expect("plain diff cannot fail");
 
         assert!(!diff.generated);
-        assert_eq!(diff.windows.len(), 1);
-        assert_eq!(diff.windows[0].mapping.before, Some(1..4));
-        assert_eq!(diff.windows[0].mapping.after, Some(1..4));
-        let changed = diff.windows[0].rows.iter().find_map(|row| {
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.hunks[0].coverage.before, Some(1..4));
+        assert_eq!(diff.hunks[0].coverage.after, Some(1..4));
+        let changed = diff.hunks[0].rows.iter().find_map(|row| {
             let DiffRow::Linewise {
                 before: Some(before),
                 after: Some(after),
@@ -1986,7 +1982,7 @@ mod tests {
         let after = "one\ntwo\nadd\nthree\n";
 
         let diff = diff_file("notes", before, after).expect("plain diff cannot fail");
-        let rows = &diff.windows[0].rows;
+        let rows = &diff.hunks[0].rows;
 
         assert!(rows.iter().any(|row| {
             matches!(
@@ -2009,17 +2005,17 @@ mod tests {
     }
 
     #[test]
-    fn distant_plain_changes_become_focused_windows() {
+    fn distant_plain_changes_become_focused_hunks() {
         let before = "one\nold two\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nold twelve\nthirteen\nfourteen\n";
         let after = "one\nnew two\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nnew twelve\nthirteen\nfourteen\n";
 
         let diff = diff_file("notes.md", before, after).expect("plain diff cannot fail");
 
-        assert_eq!(diff.windows.len(), 2);
-        assert_eq!(diff.windows[0].mapping.before, Some(1..6));
-        assert_eq!(diff.windows[0].mapping.after, Some(1..6));
-        assert_eq!(diff.windows[1].mapping.before, Some(9..15));
-        assert_eq!(diff.windows[1].mapping.after, Some(9..15));
+        assert_eq!(diff.hunks.len(), 2);
+        assert_eq!(diff.hunks[0].coverage.before, Some(1..6));
+        assert_eq!(diff.hunks[0].coverage.after, Some(1..6));
+        assert_eq!(diff.hunks[1].coverage.before, Some(9..15));
+        assert_eq!(diff.hunks[1].coverage.after, Some(9..15));
     }
 
     #[test]
@@ -2029,8 +2025,8 @@ mod tests {
 
         let diff = diff_file("notes.txt", before, after).expect("plain diff cannot fail");
 
-        assert_eq!(diff.windows.len(), 1);
-        assert!(diff.windows[0].rows.iter().any(|row| {
+        assert_eq!(diff.hunks.len(), 1);
+        assert!(diff.hunks[0].rows.iter().any(|row| {
             matches!(
                 row,
                 DiffRow::Code {
@@ -2046,7 +2042,7 @@ mod tests {
         let diff = diff_file("notes.txt", "same\n", "same").expect("plain diff cannot fail");
 
         assert!(matches!(
-            diff.windows[0].rows.as_slice(),
+            diff.hunks[0].rows.as_slice(),
             [
                 DiffRow::Linewise {
                     before: Some(before),
@@ -2075,13 +2071,13 @@ mod tests {
         assert!(diff.generated);
         assert!(marker_added.generated);
         assert!(
-            diff.windows[0]
+            diff.hunks[0]
                 .rows
                 .iter()
                 .any(|row| matches!(row, DiffRow::Linewise { .. }))
         );
         assert!(
-            diff.windows[0]
+            diff.hunks[0]
                 .rows
                 .iter()
                 .all(|row| !matches!(row, DiffRow::Wordwise(_)))
@@ -2124,11 +2120,11 @@ mod tests {
         ] {
             let diff = diff_file("src/lib.rs", before, after).expect("plain fallback cannot fail");
 
-            assert!(!diff.windows.is_empty());
+            assert!(!diff.hunks.is_empty());
             assert!(
-                diff.windows
+                diff.hunks
                     .iter()
-                    .flat_map(|window| &window.rows)
+                    .flat_map(|hunk| &hunk.rows)
                     .any(|row| matches!(row, DiffRow::Linewise { .. }))
             );
         }
@@ -2140,7 +2136,7 @@ mod tests {
 
         let diff = diff_file("README", source, source).expect("plain diff cannot fail");
 
-        assert!(diff.windows.is_empty());
+        assert!(diff.hunks.is_empty());
     }
 
     #[test]
@@ -2159,15 +2155,15 @@ mod tests {
         line.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
-    fn window_containing<'a>(diff: &'a FileDiff, needle: &str) -> &'a DiffWindow {
-        diff.windows
+    fn hunk_containing<'a>(diff: &'a FileDiff, needle: &str) -> &'a Hunk {
+        diff.hunks
             .iter()
-            .find(|window| window_has_text(window, needle))
-            .unwrap_or_else(|| panic!("fixture must contain a window for {needle}"))
+            .find(|hunk| hunk_has_text(hunk, needle))
+            .unwrap_or_else(|| panic!("fixture must contain a hunk for {needle}"))
     }
 
-    fn window_has_text(window: &DiffWindow, needle: &str) -> bool {
-        window.rows.iter().any(|row| match row {
+    fn hunk_has_text(hunk: &Hunk, needle: &str) -> bool {
+        hunk.rows.iter().any(|row| match row {
             DiffRow::Code { line, .. } | DiffRow::Moved { after: line, .. } => {
                 line_text(line).contains(needle)
             }
@@ -2192,8 +2188,8 @@ mod tests {
         })
     }
 
-    fn window_has_added_text(window: &DiffWindow, needle: &str) -> bool {
-        window.rows.iter().any(|row| match row {
+    fn hunk_has_added_text(hunk: &Hunk, needle: &str) -> bool {
+        hunk.rows.iter().any(|row| match row {
             DiffRow::Code { line, .. } | DiffRow::Moved { after: line, .. } => line
                 .spans
                 .iter()
