@@ -7,25 +7,28 @@ when a Rust parse is trustworthy; a line diff is the conservative fallback.
 ## Data flow
 
 ```text
-before/after text + display path
-              │
-              ▼
-   syntax or line projection
-              │
-              ▼
-  correspondence + hunk planning
-              │
-              ▼
- FileReview (rows, coverage, boundaries)
-              │
-              ▼
- terminal layout, color, clipping, navigation
+before/after text + display path       retained input notice
+              │                                  │
+              ▼                                  │
+   syntax or line projection                     │
+              │                                  │
+              ▼                                  │
+  correspondence + hunk planning                 │
+              │                                  │
+              ▼                                  │
+          FileDiff ───────────────┬───────────────┘
+                                  ▼
+                             FileReview
+                                  │
+                                  ▼
+             terminal layout, color, clipping, navigation
 ```
 
-Revision acquisition ends at the text-pair boundary. The planner owns every
-claim about the change: correspondence, row treatment, grouping, elision,
-source coverage, and whether displayed content reaches EOF. The UI consumes
-those facts and never reconstructs edits from rendered text.
+Revision acquisition hands the review layer either a bounded text pair or a
+retained notice. The diff planner owns every claim about a change:
+correspondence, row treatment, grouping, elision, source coverage, and whether
+displayed content reaches EOF. The UI consumes those facts and never
+reconstructs edits from rendered text.
 
 ## Correspondence
 
@@ -38,14 +41,17 @@ without letting a large repetitive region dominate time or memory.
 Structural fingerprints certify unchanged shape instead of guessing from text
 similarity. Identity plus an exact fingerprint resolves duplicate occurrences;
 the stable-order subsequence distinguishes retained order from moves. A
-structural plan is accepted only for recovery-free syntax whose projection
-covers every literal edit. Otherwise the whole file uses the line plan: a
-noisier complete review is preferable to a confident-looking omission.
+structural plan is accepted only for recovery-free syntax with no line-ending
+change or non-whitespace edit outside its projection. Otherwise the whole file
+uses the line plan: a noisier complete review is preferable to a
+confident-looking omission.
 
-The line plan anchors exact lines first. Inside an unmatched HTML gap it makes a
-second pass using equality without leading indentation; those matches render as
-reflow. This keeps a reindented subtree attached to itself when a wrapper is
-inserted, while the wrapper remains the actual addition.
+The line plan anchors exact lines first. Inside an unmatched authored-HTML gap
+it makes a second pass for a complete tag block immediately surrounded by a new
+`div` wrapper, using equality without leading indentation where whitespace is
+not source data. Reindented matches render as reflow. This keeps the wrapped
+element attached to itself while the wrapper remains the actual addition.
+Generated files retain exact correspondence.
 
 ## Bounded review
 
