@@ -15,7 +15,9 @@ diff_file(path, before, after)
         └── plain line planner
         │
         ▼
-FileDiff → DiffWindow → DiffRow
+FileReview
+        ├── FileDiff → Hunk → DiffRow
+        └── FileNotice
         │
         ▼
 terminal UI
@@ -24,37 +26,79 @@ terminal UI
 The core produces presentation-ready rows. The UI owns layout, clipping, color,
 and navigation; it does not infer correspondence or edits.
 
+## Repository backend
+
+Mig uses `gix` directly and does not invoke the Git executable at runtime. The
+status pass unions HEAD→index, index→worktree, and nonignored untracked
+candidates, with rename detection and submodule worktree inspection disabled.
+Candidate order is undefined by the parallel backend, so Mig restores lexical
+repository-relative order before planning reviews.
+
+Status is deliberately only a candidate generator. Mig pins the HEAD tree once,
+uses that same tree for status and baseline object lookup, then compares its
+blob bytes directly with the current regular file. This final comparison removes
+staged changes that were subsequently restored to HEAD and never substitutes
+index content for the before-world. An unborn HEAD uses Git's empty tree.
+
+`gix` was selected over `git2` after equivalent status prototypes. `git2` had a
+smaller API and dependency graph, but bundled a native C backend and rejected
+SHA-256 repositories. `gix` was faster in the representative repositories,
+keeps `cargo install` pure Rust, supports SHA-1 and SHA-256, and exposes object
+headers so the size guard runs before blob materialization. Its accepted costs
+are a larger compile graph and a pre-1.0 API.
+
 ## Input and dispatch
 
 With no arguments, `m` reviews the net `HEAD`→working-tree state beneath the
 current directory, including deletions and nonignored untracked paths.
-NUL-containing and non-UTF-8 files are skipped.
+NUL-containing and non-UTF-8 files are skipped. Current worktree inputs must be
+regular files; links and special entries are left to Git's ordinary diff tools.
+Standard ignores include per-directory `.gitignore`, `.git/info/exclude`, and
+the configured global excludes file; tracked paths remain reviewable even when
+an ignore rule later matches them. Renames appear as one deletion and one
+addition.
+
+Each source revision is capped at 16 MiB before it is loaded or parsed. The
+worktree reader checks the opened file and remains bounded if that file grows;
+committed blobs are sized against a pinned HEAD revision. A path over the limit
+stays in the review as a navigable notice naming both observed sizes instead of
+being silently skipped. Explicit file pairs use the same limit.
 
 A lowercase `.rs` extension selects structural Rust diffing. Other paths use
 the plain planner.
 
-A case-sensitive `@generated` substring within the first 20 lines of either
-revision forces the plain planner. Generated files remain visible, are tagged
-in the UI, and follow authored files in directory reviews.
+A standalone, case-sensitive `@generated` token on a comment/marker line within
+the first 20 lines of either revision forces the plain planner. Generated files
+remain visible, are tagged in the UI, and follow authored files in directory
+reviews.
 
 ## Review model
 
 ```text
-FileDiff
-└── DiffWindow
-    ├── LineMapping
-    └── DiffRow
-        ├── Code
-        ├── Linewise
-        ├── Moved
-        ├── Wordwise
-        └── Elision
+FileReview
+├── FileDiff
+│   └── Hunk
+│       ├── LineCoverage
+│       └── DiffRow
+│           ├── Code
+│           ├── Linewise
+│           ├── LineEnding
+│           ├── Moved
+│           ├── Wordwise
+│           └── Elision
+└── FileNotice
+    └── TooLarge
 ```
 
-`LineMapping` stores one-based, half-open source ranges. Rows carry render-ready
-source fragments and syntax/change spans. Windows group one reviewable area;
+`LineCoverage` stores one-based, half-open source ranges. Rows carry render-ready
+source fragments and syntax/change spans. Hunks group one reviewable area;
 unchanged interiors may become explicit elisions, except that a single omitted
 line is always shown.
+
+The UI presents review items in one path-ordered ribbon. The active path is
+bold; left/right (or `h`/`l`, `[`/`]`) moves between paths and resets the body
+scroll. When the complete ribbon does not fit, it keeps the active filename
+visible and marks hidden neighbors with ellipses.
 
 ## Rust frontend
 
@@ -87,8 +131,10 @@ The planner then emits:
 - move rows for structurally identical definitions outside the stable order;
 - reflow rows when source bytes changed but the full structure did not.
 
-Reflow is certified only when both parses are free of recovery. Recovery may
-produce a conservative structural diff, but never a reflow claim.
+Reflow is certified only when both parses are free of recovery. Any recovered
+parse uses the conservative plain planner. A valid Rust plan also falls back to
+plain rows when a line ending changes or an exact non-whitespace edit falls
+outside its structural projection.
 
 ## Plain frontend
 
@@ -98,8 +144,8 @@ whitespace, word, and punctuation runs. Remaining lines are additions or
 deletions.
 
 Each hunk retains three surrounding context lines. Nearby hunks merge. Line
-endings participate in identity, so an end-of-file newline change remains
-visible.
+endings participate in identity, and a dedicated row names LF, CRLF, or a
+missing end-of-file newline.
 
 ## Limits
 
@@ -109,3 +155,9 @@ that boundary.
 
 There is no generic language abstraction yet. A second structural frontend
 should determine the shared interface rather than encoding it speculatively.
+
+## Source layout
+
+Rust module roots use `X.rs`, with child modules under `X/**`; `X/mod.rs` is
+forbidden. Clippy enforces the convention for compiled modules, and the
+repository layout test also catches unlinked files.
