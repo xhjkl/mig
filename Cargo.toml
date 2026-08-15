@@ -1,14 +1,29 @@
 [package]
 name = "mig"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A tool that shows what changed in a file"
+autobins = false
+default-run = "m"
+
+[[bin]]
+name = "m"
+path = "src/main.rs"
+
+[[bin]]
+name = "f"
+path = "src/bin/f.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
+gix = { version = "0.86.0", default-features = false, features = ["max-performance-safe", "sha1", "sha256", "status"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 tree-sitter = "0.26.11"
 tree-sitter-rust = "0.24.2"
 unicode-width = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3.23.0"
