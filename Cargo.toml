@@ -26,7 +26,11 @@ crossterm = "0.29.0"
 gix = { version = "0.86.0", default-features = false, features = ["max-performance-safe", "sha1", "sha256", "status"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 tree-sitter = "0.26.11"
+tree-sitter-css = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-javascript = "0.25.0"
 tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 unicode-width = "0.2.2"
 
 [dev-dependencies]
