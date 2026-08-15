@@ -1,3 +1,13 @@
+pub mod web;
+
+/// Static source pair consumed by a visual fixture binary.
+#[derive(Clone, Copy)]
+pub struct Fixture {
+    pub path: &'static str,
+    pub before: &'static str,
+    pub after: &'static str,
+}
+
 /// Display name for Mig's structural-review fixture.
 pub const LABEL: &str = "src/profile.rs";
 

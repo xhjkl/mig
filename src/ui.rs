@@ -33,6 +33,8 @@ const RIBBON_MARGIN: &str = "  ";
 const RIBBON_SEPARATOR: &str = " │ ";
 const RIBBON_OMISSION: &str = "…";
 const GENERATED_BADGE: &str = " @generated";
+/// Stable source-local tab geometry, independent of gutter width.
+const SOURCE_TAB_STOP: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceSide {
@@ -615,6 +617,9 @@ fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Li
                 DiffRow::Elision(_) => rows.push(elision_line(gutter, width)),
             }
         }
+        if hunk.ends_at_eof {
+            rows.push(eof_guardian_line(gutter));
+        }
     }
     rows
 }
@@ -764,12 +769,12 @@ fn source_line(
     };
     spans.push(Span::styled(format!("{} │ ", line.number), gutter_style));
     let mut used = gutter.width();
+    let mut source_column = 0;
     for span in &line.spans {
         if used >= width {
             break;
         }
-        let text = clip_text(&span.text, width - used);
-        let text_width = UnicodeWidthStr::width(text.as_str());
+        let (text, text_width) = clip_source_text(&span.text, width - used, source_column);
         if text_width == 0 {
             continue;
         }
@@ -782,6 +787,7 @@ fn source_line(
         };
         spans.push(Span::styled(text, style));
         used += text_width;
+        source_column += text_width;
     }
     Line::from(spans)
 }
@@ -799,12 +805,14 @@ fn moved_source_line(
         Style::default().fg(Palette::MOVE),
     )];
     let mut used = gutter.width();
+    let mut source_column = 0;
     for span in &line.spans {
         if used >= width {
             break;
         }
-        let text = clip_text(&span.text, width - used);
-        used += UnicodeWidthStr::width(text.as_str());
+        let (text, text_width) = clip_source_text(&span.text, width - used, source_column);
+        used += text_width;
+        source_column += text_width;
         let style = if span.mark == DiffMark::Context {
             softened_syntax_style(span.syntax)
         } else {
@@ -833,6 +841,14 @@ fn elision_line(gutter: GutterLayout, width: usize) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// Aligned file boundary that becomes the final scrollable row of an EOF hunk.
+fn eof_guardian_line(gutter: GutterLayout) -> Line<'static> {
+    Line::styled(
+        format!("{} │", gutter.padding("")),
+        Style::default().fg(Palette::GUTTER),
+    )
 }
 
 fn word_diff_line(diff: &WordDiff, gutter: GutterLayout, width: usize) -> Line<'static> {
@@ -921,6 +937,34 @@ fn clip_text(text: &str, width: usize) -> String {
         used += character_width;
     }
     output
+}
+
+/// Display source tabs before clipping so Ratatui cannot discard their indentation.
+fn clip_source_text(text: &str, width: usize, start_column: usize) -> (String, usize) {
+    let mut output = String::with_capacity(text.len());
+    let mut used = 0;
+    for character in text.chars() {
+        if character == '\t' {
+            let column = start_column.saturating_add(used);
+            let tab_width = SOURCE_TAB_STOP - column % SOURCE_TAB_STOP;
+            let available = width.saturating_sub(used);
+            let displayed = tab_width.min(available);
+            output.push_str(&" ".repeat(displayed));
+            used += displayed;
+            if displayed < tab_width {
+                break;
+            }
+            continue;
+        }
+
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    (output, used)
 }
 
 /// Tail-preserving path clipping keeps the distinguishing file name on screen.
@@ -1033,7 +1077,7 @@ mod tests {
     use super::*;
     use crate::{
         diff::{Hunk, LineCoverage, diff_file},
-        fixture::{AFTER, BEFORE, LABEL},
+        fixture::{AFTER, BEFORE, LABEL, web},
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
@@ -1257,6 +1301,7 @@ mod tests {
                     before: Some(1..2),
                     after: Some(1..2),
                 },
+                ends_at_eof: false,
                 rows: vec![
                     DiffRow::Code {
                         line: line(2),
@@ -1289,6 +1334,116 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(pipe_columns, vec![gutter.label_columns + 1; 2]);
         assert!(rows.iter().any(|line| line.contains("- 123456 │")));
+    }
+
+    #[test]
+    fn source_tab_stops_continue_across_styled_spans() {
+        let line = CodeLine {
+            number: 1,
+            spans: vec![
+                CodeSpan {
+                    text: "ab".to_owned(),
+                    syntax: SyntaxClass::Plain,
+                    mark: DiffMark::Context,
+                },
+                CodeSpan {
+                    text: "\tvalue".to_owned(),
+                    syntax: SyntaxClass::Keyword,
+                    mark: DiffMark::Added,
+                },
+            ],
+        };
+
+        let row = source_line(
+            &line,
+            None,
+            GutterLayout { label_columns: 1 },
+            80,
+            SourceSide::Current,
+            false,
+        );
+
+        assert_eq!(composed_line_text(&row), "1 │ ab  value");
+    }
+
+    #[test]
+    fn eof_hunk_ends_with_an_aligned_guardian() {
+        let diff = diff_file("notes.txt", "old\n", "new\n").expect("plain diff");
+        let gutter = GutterLayout::new(&diff);
+
+        let rows = compose_review(&diff, gutter, 80);
+        let rows = rows.iter().map(composed_line_text).collect::<Vec<_>>();
+        let guardian = rows.last().expect("EOF hunk needs a guardian");
+        let expected = format!("{}│", " ".repeat(gutter.label_columns + 1));
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(guardian, &expected);
+        assert_eq!(guardian.matches('│').count(), 1);
+    }
+
+    #[test]
+    fn html_wrapper_surrounds_one_reflowed_image_with_additions() {
+        let fixture = web::HTML;
+        let diff = diff_file(fixture.path, fixture.before, fixture.after).expect("HTML diff");
+        let mut app = App::new(vec![diff]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render HTML wrapper");
+
+        let screen = buffer_text(terminal.backend().buffer());
+        let opening = screen
+            .find("+ 2 │   <div class=\"profile-card__portrait\">")
+            .expect("added wrapper opening");
+        let image = screen
+            .find("~ 3 │     <img")
+            .expect("retained reindented image");
+        let closing = screen
+            .find("+ 8 │   </div>")
+            .expect("added wrapper closing");
+        assert!(opening < image && image < closing);
+        assert_eq!(screen.matches("src=\"/avatars/ada.webp\"").count(), 1);
+        assert!(!screen.contains("- 2 │   <img"));
+    }
+
+    #[test]
+    fn tabbed_html_reflow_renders_current_source_indentation() {
+        let before = "<article>\n\t<img\n\t\tsrc=\"avatar.webp\"\n\t/>\n</article>\n";
+        let after = concat!(
+            "<article>\n",
+            "\t<div>\n",
+            "\t\t<img",
+            "                           ",
+            "\n",
+            "\t\t\tsrc=\"avatar.webp\"\n",
+            "\t\t/>\n",
+            "\t</div>\n",
+            "</article>\n",
+        );
+        let diff = diff_file("after.html", before, after).expect("HTML diff");
+        let mut app = App::new(vec![diff]);
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render tabbed HTML wrapper");
+
+        let screen = buffer_text(terminal.backend().buffer());
+        for expected in [
+            "+ 2 │     <div>",
+            "~ 3 │         <img",
+            "~ 4 │             src=\"avatar.webp\"",
+            "~ 5 │         />",
+            "+ 6 │     </div>",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "missing rendered row {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -1330,6 +1485,34 @@ mod tests {
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
         );
         assert_eq!(app.scroll, 8.min(end));
+    }
+
+    #[test]
+    fn end_navigation_lands_on_the_eof_guardian() {
+        let before = (1..=24)
+            .map(|line| format!("old line {line}\n"))
+            .collect::<String>();
+        let after = (1..=24)
+            .map(|line| format!("new line {line}\n"))
+            .collect::<String>();
+        let diff = diff_file("notes.txt", &before, &after).expect("plain diff");
+        let gutter = GutterLayout::new(&diff);
+        let expected = format!("{}│", " ".repeat(gutter.label_columns + 1));
+        let mut app = App::new(vec![diff]);
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render top of review");
+        handle_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render end of review");
+
+        let final_row = buffer_row_text(terminal.backend().buffer(), 17);
+        assert!(app.scroll > 0, "fixture must exercise scrolling");
+        assert_eq!(final_row.trim_end(), expected);
     }
 
     #[test]
@@ -1490,6 +1673,17 @@ mod tests {
 
         let screen = buffer_text(terminal.backend().buffer());
         assert!(screen.contains("line ending: LF → no newline at end of file"));
+
+        let gutter = GutterLayout::new(app.current_diff());
+        let rows = compose_review(app.current_diff(), gutter, 100);
+        let rows = rows.iter().map(composed_line_text).collect::<Vec<_>>();
+        let ending = rows
+            .iter()
+            .position(|row| row.contains("no newline at end of file"))
+            .expect("line-ending explanation");
+        let expected = format!("{}│", " ".repeat(gutter.label_columns + 1));
+        assert_eq!(ending + 2, rows.len());
+        assert_eq!(rows.last(), Some(&expected));
     }
 
     #[test]
@@ -1535,6 +1729,13 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn composed_line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn buffer_row_text(buffer: &Buffer, row: usize) -> String {

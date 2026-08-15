@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "f"
 path = "src/bin/f.rs"
 
+[[bin]]
+name = "fw"
+path = "src/bin/fw.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.1", features = ["derive"] }

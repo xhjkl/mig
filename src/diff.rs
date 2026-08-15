@@ -91,6 +91,8 @@ pub enum DiffRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Hunk {
     pub coverage: LineCoverage,
+    /// Whether the displayed source side reaches its revision's final line.
+    pub ends_at_eof: bool,
     pub rows: Vec<DiffRow>,
 }
 
@@ -113,6 +115,34 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     diff_rust(path, before, after)
 }
 
+/// File boundary metadata retained after the planners discard full source lengths.
+fn mark_eof_hunks(hunks: &mut [Hunk], before_lines: usize, after_lines: usize) {
+    for hunk in hunks {
+        let endpoint = hunk
+            .coverage
+            .after
+            .as_ref()
+            .map(|coverage| (coverage, after_lines));
+        let endpoint = endpoint.or_else(|| {
+            hunk.coverage
+                .before
+                .as_ref()
+                .map(|coverage| (coverage, before_lines))
+        });
+        let Some((coverage, line_count)) = endpoint else {
+            continue;
+        };
+
+        let coverage_reaches_eof = coverage.end == line_count.saturating_add(1);
+        // Structural frames may add one blank source row beyond semantic coverage.
+        let visible_frame_reaches_eof = matches!(
+            hunk.rows.last(),
+            Some(DiffRow::Code { line, .. }) if line.number == line_count
+        );
+        hunk.ends_at_eof = coverage_reaches_eof || visible_frame_reaches_eof;
+    }
+}
+
 /// Parse Rust, establish one-to-one syntax correspondence, and plan a unified review.
 fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     let before_file = parse_rust(before)?;
@@ -122,7 +152,7 @@ fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     }
 
     let matches = correspond(&before_file.definitions, &after_file.definitions);
-    let hunks = plan_structural_hunks(&before_file, &after_file, &matches);
+    let mut hunks = plan_structural_hunks(&before_file, &after_file, &matches);
     // Unknown top-level forms must not disappear beside recognized structural edits.
     if before != after
         && (hunks.is_empty()
@@ -135,6 +165,7 @@ fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     {
         return Ok(diff_plain(path, before, after, false));
     }
+    mark_eof_hunks(&mut hunks, before_file.lines.len(), after_file.lines.len());
 
     Ok(FileDiff {
         path: path.to_owned(),
@@ -214,6 +245,12 @@ fn is_rust_path(path: &str) -> bool {
         .is_some_and(|extension| extension == "rs")
 }
 
+fn is_html_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "html" || extension == "htm")
+}
+
 /// Conventional marker search is deliberately header-bounded and case-sensitive.
 fn has_generated_marker(source: &str) -> bool {
     source.lines().take(20).any(is_generated_marker_line)
@@ -255,6 +292,15 @@ struct PlainLine<'source> {
     number: usize,
     text: &'source str,
     ending: LineEnding,
+    html_preserves_whitespace: bool,
+}
+
+/// Exact source keys plus side-local sentinels that keep wrapper blocks atomic.
+#[derive(Eq, Hash, PartialEq)]
+enum PlainKey<'source> {
+    Exact(&'source str, LineEnding),
+    ReservedBefore,
+    ReservedAfter,
 }
 
 /// Ordered exact-line correspondence before presentation expands changed gaps.
@@ -269,21 +315,46 @@ enum PlainEvent {
     },
 }
 
-/// Exact-line fallback for generated Rust and every syntax Mig does not understand.
+/// Literal line fallback; new authored-HTML div wrappers get secondary child anchors.
 fn diff_plain(path: &str, before: &str, after: &str, generated: bool) -> FileDiff {
-    let before = plain_lines(before);
-    let after = plain_lines(after);
+    let mut before = plain_lines(before);
+    let mut after = plain_lines(after);
+    let align_html_indentation = !generated && is_html_path(path);
+    if align_html_indentation {
+        mark_html_whitespace_sensitive_lines(&mut before);
+        mark_html_whitespace_sensitive_lines(&mut after);
+    }
+    let (reserved_before, reserved_after) = if align_html_indentation {
+        html_wrapper_reservations(&before, &after)
+    } else {
+        (vec![false; before.len()], vec![false; after.len()])
+    };
     let before_keys = before
         .iter()
-        .map(|line| (line.text, line.ending))
+        .enumerate()
+        .map(|(index, line)| {
+            if reserved_before[index] {
+                PlainKey::ReservedBefore
+            } else {
+                PlainKey::Exact(line.text, line.ending)
+            }
+        })
         .collect::<Vec<_>>();
     let after_keys = after
         .iter()
-        .map(|line| (line.text, line.ending))
+        .enumerate()
+        .map(|(index, line)| {
+            if reserved_after[index] {
+                PlainKey::ReservedAfter
+            } else {
+                PlainKey::Exact(line.text, line.ending)
+            }
+        })
         .collect::<Vec<_>>();
     let matches = local_matches(&before_keys, &after_keys);
     let events = plain_events(before.len(), after.len(), matches);
-    let hunks = plan_plain_hunks(&before, &after, &events);
+    let mut hunks = plan_plain_hunks(&before, &after, &events, align_html_indentation);
+    mark_eof_hunks(&mut hunks, before.len(), after.len());
 
     FileDiff {
         path: path.to_owned(),
@@ -313,6 +384,7 @@ fn plain_lines(source: &str) -> Vec<PlainLine<'_>> {
             number: lines.len() + 1,
             text: &source[start..text_end],
             ending,
+            html_preserves_whitespace: false,
         });
         start = index + 1;
     }
@@ -321,6 +393,7 @@ fn plain_lines(source: &str) -> Vec<PlainLine<'_>> {
             number: lines.len() + 1,
             text: &source[start..],
             ending: LineEnding::Missing,
+            html_preserves_whitespace: false,
         });
     }
     lines
@@ -361,6 +434,7 @@ fn plan_plain_hunks(
     before: &[PlainLine<'_>],
     after: &[PlainLine<'_>],
     events: &[PlainEvent],
+    align_html_indentation: bool,
 ) -> Vec<Hunk> {
     let changes = events
         .iter()
@@ -388,6 +462,7 @@ fn plan_plain_hunks(
             events,
             group_start,
             group_end,
+            align_html_indentation,
         ));
         group_start = change;
         group_end = change;
@@ -398,6 +473,7 @@ fn plan_plain_hunks(
         events,
         group_start,
         group_end,
+        align_html_indentation,
     ));
     hunks
 }
@@ -408,6 +484,7 @@ fn plan_plain_hunk(
     events: &[PlainEvent],
     first_change: usize,
     last_change: usize,
+    align_html_indentation: bool,
 ) -> Hunk {
     let start = first_change.saturating_sub(PLAIN_CONTEXT_LINES);
     let end = (last_change + PLAIN_CONTEXT_LINES + 1).min(events.len());
@@ -449,12 +526,17 @@ fn plan_plain_hunk(
                     &mut rows,
                     &before[before_range.clone()],
                     &after[after_range.clone()],
+                    align_html_indentation,
                 );
             }
         }
     }
 
-    Hunk { coverage, rows }
+    Hunk {
+        coverage,
+        ends_at_eof: false,
+        rows,
+    }
 }
 
 fn include_plain_coverage(
@@ -481,7 +563,541 @@ fn include_plain_coverage(
     coverage.end = coverage.end.max(covered.end);
 }
 
-fn render_plain_change(rows: &mut Vec<DiffRow>, before: &[PlainLine<'_>], after: &[PlainLine<'_>]) {
+/// Preserve reindented HTML descendants before ordinal pairing fills unmatched gaps.
+fn render_plain_change(
+    rows: &mut Vec<DiffRow>,
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+    align_html_indentation: bool,
+) {
+    if !align_html_indentation {
+        render_plain_change_segment(rows, before, after);
+        return;
+    }
+
+    let matches = html_indentation_matches(before, after);
+    if matches.is_empty() {
+        render_plain_change_segment(rows, before, after);
+        return;
+    }
+
+    let mut before_start = 0;
+    let mut after_start = 0;
+    for (before_index, after_index) in matches {
+        render_plain_change_segment(
+            rows,
+            &before[before_start..before_index],
+            &after[after_start..after_index],
+        );
+
+        let before_line = before[before_index];
+        let after_line = after[after_index];
+        let role = if before_line.text == after_line.text {
+            CodeRole::Context
+        } else {
+            CodeRole::Reflow
+        };
+        rows.push(DiffRow::Code {
+            line: plain_code_line(after_line, DiffMark::Context),
+            role,
+        });
+        before_start = before_index + 1;
+        after_start = after_index + 1;
+    }
+    render_plain_change_segment(rows, &before[before_start..], &after[after_start..]);
+}
+
+/// One complete HTML tag whose lines can move together beneath a new parent.
+struct HtmlTagBlock<'source> {
+    lines: Range<usize>,
+    key: Vec<(&'source str, LineEnding)>,
+}
+
+/// Complete tag blocks inside a new div wrapper supply HTML reflow anchors.
+fn html_indentation_matches(
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+) -> Vec<(usize, usize)> {
+    html_wrapper_block_matches(before, after)
+        .into_iter()
+        .flat_map(|(before, after)| before.zip(after))
+        .collect()
+}
+
+/// A wrapper and child stay atomic until indentation-insensitive correspondence.
+fn html_wrapper_reservations(
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+) -> (Vec<bool>, Vec<bool>) {
+    let mut reserved_before = vec![false; before.len()];
+    let mut reserved_after = vec![false; after.len()];
+    for (before_block, after_block) in html_wrapper_block_matches(before, after) {
+        let Some(opening) = after_block.start.checked_sub(1) else {
+            continue;
+        };
+        if opening >= reserved_after.len() || after_block.end >= reserved_after.len() {
+            continue;
+        }
+
+        reserved_before[before_block].fill(true);
+        reserved_after[opening..=after_block.end].fill(true);
+    }
+    (reserved_before, reserved_after)
+}
+
+fn html_wrapper_block_matches(
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+) -> Vec<(Range<usize>, Range<usize>)> {
+    let before_blocks = html_tag_blocks(before);
+    let after_blocks = html_tag_blocks(after);
+    let before_values = before_blocks
+        .iter()
+        .map(|block| block.key.as_slice())
+        .collect::<Vec<_>>();
+    let after_values = after_blocks
+        .iter()
+        .map(|block| block.key.as_slice())
+        .collect::<Vec<_>>();
+    let matches = local_matches(&before_values, &after_values);
+
+    matches
+        .into_iter()
+        .filter(|(before_index, after_index)| {
+            !html_div_wraps(before, &before_blocks[*before_index].lines)
+                && html_div_wraps(after, &after_blocks[*after_index].lines)
+        })
+        .map(|(before_index, after_index)| {
+            (
+                before_blocks[before_index].lines.clone(),
+                after_blocks[after_index].lines.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Tokenization rule for a context where indentation can be source data.
+#[derive(Clone, Copy)]
+enum HtmlWhitespaceMode {
+    Normal,
+    Raw,
+    Plaintext,
+}
+
+/// Named HTML context intentionally excluded from indentation correspondence.
+#[derive(Clone, Copy)]
+struct HtmlWhitespaceElement {
+    name: &'static str,
+    mode: HtmlWhitespaceMode,
+}
+
+/// Conservative HTML contexts whose leading whitespace may affect source meaning.
+const HTML_WHITESPACE_SENSITIVE_ELEMENTS: &[HtmlWhitespaceElement] = &[
+    HtmlWhitespaceElement {
+        name: "iframe",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "listing",
+        mode: HtmlWhitespaceMode::Normal,
+    },
+    HtmlWhitespaceElement {
+        name: "noembed",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "noframes",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "noscript",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "plaintext",
+        mode: HtmlWhitespaceMode::Plaintext,
+    },
+    HtmlWhitespaceElement {
+        name: "pre",
+        mode: HtmlWhitespaceMode::Normal,
+    },
+    HtmlWhitespaceElement {
+        name: "script",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "style",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "textarea",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "title",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+    HtmlWhitespaceElement {
+        name: "xmp",
+        mode: HtmlWhitespaceMode::Raw,
+    },
+];
+
+/// Normal-markup tokenizer state retained across preformatted source lines.
+#[derive(Clone, Copy, Default)]
+struct HtmlMarkupState {
+    in_comment: bool,
+    in_tag: bool,
+    quote: Option<u8>,
+    raw_child: Option<HtmlRawChildState>,
+}
+
+/// Raw child nested inside otherwise normal preformatted markup.
+#[derive(Clone, Copy)]
+enum HtmlRawChildState {
+    Opening {
+        element: HtmlWhitespaceElement,
+        quote: Option<u8>,
+    },
+    Content(HtmlWhitespaceElement),
+}
+
+/// Whitespace-sensitive scanner state retained across source lines.
+#[derive(Clone, Copy)]
+enum HtmlWhitespaceState {
+    Opening {
+        element: HtmlWhitespaceElement,
+        quote: Option<u8>,
+    },
+    Content {
+        element: HtmlWhitespaceElement,
+        markup: HtmlMarkupState,
+    },
+}
+
+/// Raw and preformatted bodies must keep literal indentation semantics.
+fn mark_html_whitespace_sensitive_lines(lines: &mut [PlainLine<'_>]) {
+    let mut active = None;
+    for line in lines {
+        let mut cursor = 0;
+        loop {
+            let Some(state) = active else {
+                let opening = HTML_WHITESPACE_SENSITIVE_ELEMENTS
+                    .iter()
+                    .filter_map(|element| {
+                        html_tag_position(line.text, element.name, false, cursor)
+                            .map(|position| (position, *element))
+                    })
+                    .min_by_key(|(position, _)| *position);
+                let Some((position, element)) = opening else {
+                    break;
+                };
+
+                line.html_preserves_whitespace = true;
+                cursor = position + element.name.len() + 1;
+                active = Some(HtmlWhitespaceState::Opening {
+                    element,
+                    quote: None,
+                });
+                continue;
+            };
+
+            line.html_preserves_whitespace = true;
+            match state {
+                HtmlWhitespaceState::Opening { element, mut quote } => {
+                    let end = html_opening_tag_end(line.text, cursor, &mut quote);
+                    let Some(end) = end else {
+                        active = Some(HtmlWhitespaceState::Opening { element, quote });
+                        break;
+                    };
+                    active = Some(HtmlWhitespaceState::Content {
+                        element,
+                        markup: HtmlMarkupState::default(),
+                    });
+                    cursor = end + 1;
+                }
+                HtmlWhitespaceState::Content {
+                    element,
+                    mut markup,
+                } => {
+                    if matches!(element.mode, HtmlWhitespaceMode::Plaintext) {
+                        active = Some(state);
+                        break;
+                    }
+                    let closing = match element.mode {
+                        HtmlWhitespaceMode::Normal => html_normal_closing_tag_position(
+                            line.text,
+                            element.name,
+                            cursor,
+                            &mut markup,
+                        ),
+                        HtmlWhitespaceMode::Raw => {
+                            html_tag_position(line.text, element.name, true, cursor)
+                        }
+                        HtmlWhitespaceMode::Plaintext => unreachable!(),
+                    };
+                    let Some(closing) = closing else {
+                        active = Some(HtmlWhitespaceState::Content { element, markup });
+                        break;
+                    };
+                    active = None;
+                    cursor = closing + element.name.len() + 2;
+                }
+            }
+        }
+    }
+}
+
+/// End of an opening tag, excluding greater-than signs inside quoted attributes.
+fn html_opening_tag_end(text: &str, start: usize, quote: &mut Option<u8>) -> Option<usize> {
+    for (index, byte) in text.bytes().enumerate().skip(start) {
+        if let Some(active_quote) = quote {
+            if byte == *active_quote {
+                *quote = None;
+            }
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            *quote = Some(byte);
+            continue;
+        }
+        if byte == b'>' {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Real normal-element close, excluding attributes, comments, and raw children.
+fn html_normal_closing_tag_position(
+    text: &str,
+    name: &str,
+    start: usize,
+    state: &mut HtmlMarkupState,
+) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while index < bytes.len() {
+        if let Some(raw_child) = state.raw_child {
+            match raw_child {
+                HtmlRawChildState::Opening { element, mut quote } => {
+                    let end = html_opening_tag_end(text, index, &mut quote);
+                    let Some(end) = end else {
+                        state.raw_child = Some(HtmlRawChildState::Opening { element, quote });
+                        return None;
+                    };
+                    state.raw_child = Some(HtmlRawChildState::Content(element));
+                    index = end + 1;
+                    continue;
+                }
+                HtmlRawChildState::Content(element) => {
+                    if matches!(element.mode, HtmlWhitespaceMode::Plaintext) {
+                        return None;
+                    }
+                    let closing = html_tag_position(text, element.name, true, index);
+                    let closing = closing?;
+                    state.raw_child = None;
+                    index = closing + element.name.len() + 2;
+                    continue;
+                }
+            }
+        }
+        if state.in_comment {
+            if bytes[index..].starts_with(b"-->") {
+                state.in_comment = false;
+                index += 3;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if state.in_tag {
+            if let Some(quote) = state.quote {
+                if bytes[index] == quote {
+                    state.quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            if matches!(bytes[index], b'\'' | b'"') {
+                state.quote = Some(bytes[index]);
+                index += 1;
+                continue;
+            }
+            if bytes[index] == b'>' {
+                state.in_tag = false;
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index..].starts_with(b"<!--") {
+            state.in_comment = true;
+            index += 4;
+            continue;
+        }
+        if html_tag_at(text, name, true, index) {
+            return Some(index);
+        }
+        let raw_child = HTML_WHITESPACE_SENSITIVE_ELEMENTS
+            .iter()
+            .copied()
+            .find(|element| {
+                !matches!(element.mode, HtmlWhitespaceMode::Normal)
+                    && html_tag_at(text, element.name, false, index)
+            });
+        if let Some(element) = raw_child {
+            state.raw_child = Some(HtmlRawChildState::Opening {
+                element,
+                quote: None,
+            });
+            index += element.name.len() + 1;
+            continue;
+        }
+        if bytes[index] == b'<'
+            && bytes.get(index + 1).is_some_and(|byte| {
+                byte.is_ascii_alphabetic() || matches!(byte, b'/' | b'!' | b'?')
+            })
+        {
+            state.in_tag = true;
+        }
+        index += 1;
+    }
+    None
+}
+
+fn html_tag_position(text: &str, name: &str, closing: bool, start: usize) -> Option<usize> {
+    let text = text.get(start..)?;
+    for (relative, _) in text.match_indices('<') {
+        let position = start + relative;
+        if html_tag_at(text, name, closing, relative) {
+            return Some(position);
+        }
+    }
+    None
+}
+
+fn html_tag_at(text: &str, name: &str, closing: bool, position: usize) -> bool {
+    if text.as_bytes().get(position) != Some(&b'<') {
+        return false;
+    }
+    let slash = usize::from(closing);
+    if closing && text.as_bytes().get(position + 1) != Some(&b'/') {
+        return false;
+    }
+    if !closing && text.as_bytes().get(position + 1) == Some(&b'/') {
+        return false;
+    }
+
+    let name_start = position + 1 + slash;
+    let name_end = name_start + name.len();
+    let Some(candidate) = text.get(name_start..name_end) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case(name) {
+        return false;
+    }
+    let boundary = text.get(name_end..).and_then(|tail| tail.chars().next());
+    boundary.is_none_or(|character| {
+        character == '>' || character == '/' || character.is_ascii_whitespace()
+    })
+}
+
+fn html_tag_blocks<'source>(lines: &[PlainLine<'source>]) -> Vec<HtmlTagBlock<'source>> {
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].html_preserves_whitespace {
+            index += 1;
+            continue;
+        }
+        let text = lines[index].text.trim_start_matches([' ', '\t']);
+        if !text.starts_with('<') {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        let mut key = Vec::new();
+        let mut quote = None;
+        let mut quote_crossed_line = false;
+        let mut opening_count = 0;
+        let complete = loop {
+            let line = lines[index];
+            if line.html_preserves_whitespace {
+                index += 1;
+                break false;
+            }
+            let text = line.text.trim_start_matches([' ', '\t']);
+            // Raw/preformatted contexts were excluded, so edge space is formatting here.
+            let key_text = text.trim_end_matches([' ', '\t']);
+            key.push((key_text, line.ending));
+            let mut last_unquoted = None;
+            for character in text.chars() {
+                if let Some(active_quote) = quote {
+                    if character == active_quote {
+                        quote = None;
+                    }
+                    continue;
+                }
+                if matches!(character, '\'' | '"') {
+                    quote = Some(character);
+                    continue;
+                }
+                if character == '<' {
+                    opening_count += 1;
+                }
+                if !matches!(character, ' ' | '\t') {
+                    last_unquoted = Some(character);
+                }
+            }
+            if quote.is_some() {
+                quote_crossed_line = true;
+            }
+            let complete = quote.is_none() && last_unquoted == Some('>');
+            index += 1;
+            if complete || index == lines.len() {
+                break complete;
+            }
+        };
+        if !complete || quote_crossed_line || opening_count != 1 {
+            continue;
+        }
+
+        blocks.push(HtmlTagBlock {
+            lines: start..index,
+            key,
+        });
+    }
+    blocks
+}
+
+fn html_div_wraps(lines: &[PlainLine<'_>], block: &Range<usize>) -> bool {
+    let Some(opening_index) = block.start.checked_sub(1) else {
+        return false;
+    };
+    let Some(opening) = lines.get(opening_index) else {
+        return false;
+    };
+    let Some(closing) = lines.get(block.end) else {
+        return false;
+    };
+    let opening = opening.text.trim_start_matches([' ', '\t']);
+    let closing = closing.text.trim_start_matches([' ', '\t']);
+    let Some(name) = opening.get(1..4) else {
+        return false;
+    };
+    let boundary = opening[4..].chars().next();
+
+    name.eq_ignore_ascii_case("div")
+        && boundary.is_some_and(|character| character == '>' || character.is_ascii_whitespace())
+        && closing.eq_ignore_ascii_case("</div>")
+}
+
+fn render_plain_change_segment(
+    rows: &mut Vec<DiffRow>,
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+) {
     let paired = before.len().min(after.len());
     for index in 0..paired {
         let before_line = before[index];
@@ -777,6 +1393,7 @@ fn plan_definition_hunk(
 
     Hunk {
         coverage,
+        ends_at_eof: false,
         rows: abbreviate_rows(rows),
     }
 }
@@ -793,6 +1410,7 @@ fn plan_comment_hunk(change: CommentEdit) -> Hunk {
                 .as_ref()
                 .map(|line| line.number..line.number + 1),
         },
+        ends_at_eof: false,
         rows: vec![DiffRow::Linewise {
             before: change.before,
             after: change.after,
@@ -815,6 +1433,7 @@ fn plan_move_hunk(
     let Some(first) = preview.next() else {
         return Hunk {
             coverage,
+            ends_at_eof: false,
             rows: Vec::new(),
         };
     };
@@ -846,7 +1465,11 @@ fn plan_move_hunk(
             after: last,
         });
     }
-    Hunk { coverage, rows }
+    Hunk {
+        coverage,
+        ends_at_eof: false,
+        rows,
+    }
 }
 
 fn plan_import_hunks(before: &[Import<'_>], after: &[Import<'_>]) -> Vec<Hunk> {
@@ -875,6 +1498,7 @@ fn plan_import_hunks(before: &[Import<'_>], after: &[Import<'_>]) -> Vec<Hunk> {
                 before: word.before_line.map(|line| line..line + 1),
                 after: word.after_line.map(|line| line..line + 1),
             },
+            ends_at_eof: false,
             rows: vec![DiffRow::Wordwise(word)],
         })
         .collect()
@@ -1004,6 +1628,7 @@ fn plan_reflow_hunks(
                     before: Some(before.lines.clone()),
                     after: Some(after.lines.clone()),
                 },
+                ends_at_eof: false,
                 rows,
             })
         })
@@ -1652,7 +2277,7 @@ fn lcs_values<T: Eq>(before: &[T], after: &[T]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{AFTER, BEFORE, LABEL};
+    use crate::fixture::{AFTER, BEFORE, LABEL, web};
 
     #[test]
     fn fixture_becomes_an_ordered_stream_of_hunks() {
@@ -1722,6 +2347,37 @@ mod tests {
                 .iter()
                 .any(|span| { span.text.contains("and_then") && span.mark == DiffMark::Added })
         );
+    }
+
+    #[test]
+    fn structural_frame_can_carry_a_hunk_to_eof() {
+        let before = "fn run() { old(); }\n\n";
+        let after = "fn run() { new(); }\n\n";
+
+        let diff = diff_file("src/run.rs", before, after).expect("source must parse");
+        let hunk = &diff.hunks[0];
+
+        assert_eq!(hunk.coverage.after, Some(1..2));
+        assert!(matches!(
+            hunk.rows.last(),
+            Some(DiffRow::Code { line, .. }) if line.number == 2 && line_text(line).is_empty()
+        ));
+        assert!(hunk.ends_at_eof);
+    }
+
+    #[test]
+    fn two_sided_hunk_uses_the_current_file_boundary() {
+        let before = "fn run() { old(); }\n";
+        let after = "fn run() { new(); }\n\nfn later() {}\n";
+
+        let diff = diff_file("src/run.rs", before, after).expect("source must parse");
+        let run = hunk_containing(&diff, "fn run");
+        let later = hunk_containing(&diff, "fn later");
+
+        assert_eq!(run.coverage.before, Some(1..2));
+        assert_eq!(run.coverage.after, Some(1..2));
+        assert!(!run.ends_at_eof);
+        assert!(later.ends_at_eof);
     }
 
     #[test]
@@ -2005,6 +2661,294 @@ mod tests {
     }
 
     #[test]
+    fn html_wrapper_preserves_the_reindented_image_subtree() {
+        let fixture = web::HTML;
+        let diff = diff_file(fixture.path, fixture.before, fixture.after)
+            .expect("HTML uses the plain planner");
+        let rows = diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .collect::<Vec<_>>();
+
+        for needle in [
+            "<img",
+            "class=\"profile-card__avatar\"",
+            "src=\"/avatars/ada.webp\"",
+            "alt=\"Ada Lovelace\"",
+            "/>",
+        ] {
+            let retained = rows
+                .iter()
+                .filter_map(|row| {
+                    let DiffRow::Code { line, role } = row else {
+                        return None;
+                    };
+                    line_text(line).contains(needle).then_some((line, role))
+                })
+                .collect::<Vec<_>>();
+            let [(line, role)] = retained.as_slice() else {
+                panic!("{needle:?} must appear once as retained current content");
+            };
+            assert_eq!(**role, CodeRole::Reflow);
+            assert!(line.spans.iter().all(|span| span.mark == DiffMark::Context));
+            assert!(!rows.iter().any(|row| {
+                let DiffRow::Linewise { before, after } = row else {
+                    return false;
+                };
+                before
+                    .iter()
+                    .chain(after)
+                    .any(|line| line_text(line).contains(needle))
+            }));
+        }
+
+        for wrapper in ["<div class=\"profile-card__portrait\">", "</div>"] {
+            assert!(rows.iter().any(|row| {
+                let DiffRow::Linewise {
+                    before: None,
+                    after: Some(line),
+                } = row
+                else {
+                    return false;
+                };
+                line_text(line).trim() == wrapper
+                    && line.spans.iter().all(|span| span.mark == DiffMark::Added)
+            }));
+        }
+    }
+
+    #[test]
+    fn bare_html_wrapper_does_not_steal_an_existing_div_anchor() {
+        let before = "<section>\n  <img src=\"avatar.webp\">\n  <div>\n    <p>Existing</p>\n  </div>\n</section>\n";
+        let after = "<section>\n  <div>\n    <img src=\"avatar.webp\">\n  </div>\n  <div>\n    <p>Existing</p>\n  </div>\n</section>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+        let retained = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    DiffRow::Code {
+                        line,
+                        role: CodeRole::Reflow,
+                    } if line_text(line).contains("<img")
+                )
+            })
+            .count();
+
+        assert_eq!(retained, 1);
+        assert!(!rows.iter().any(|row| {
+            let DiffRow::Linewise { before, after } = row else {
+                return false;
+            };
+            before
+                .iter()
+                .chain(after)
+                .any(|line| line_text(line).contains("<img"))
+        }));
+    }
+
+    #[test]
+    fn multiline_html_wrapper_keeps_mixed_indentation_atomic() {
+        let before = "<img\nfixed=\"yes\"\n  src=\"avatar.webp\"\n/>\n";
+        let after = "<div>\n  <img\nfixed=\"yes\"\n    src=\"avatar.webp\"\n  />\n</div>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        for needle in ["<img", "fixed=\"yes\"", "src=\"avatar.webp\"", "/>"] {
+            let retained = rows
+                .iter()
+                .filter_map(|row| {
+                    let DiffRow::Code { line, role } = row else {
+                        return None;
+                    };
+                    line_text(line).contains(needle).then_some(*role)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(retained.len(), 1, "{needle:?} must stay in one tag block");
+        }
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    line,
+                    role: CodeRole::Context,
+                } if line_text(line).contains("fixed=\"yes\"")
+            )
+        }));
+        assert!(!rows.iter().any(|row| {
+            let DiffRow::Linewise { before, after } = row else {
+                return false;
+            };
+            before.iter().chain(after).any(|line| {
+                ["<img", "fixed=\"yes\"", "src=\"avatar.webp\"", "/>"]
+                    .iter()
+                    .any(|needle| line_text(line).contains(needle))
+            })
+        }));
+    }
+
+    #[test]
+    fn html_raw_text_wrapper_remains_a_literal_change() {
+        let before = "<textarea>\n  <img>\n</textarea>\n";
+        let after = "<textarea>\n  <div>\n    <img>\n  </div>\n</textarea>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        assert_html_line_is_literal(rows, "<img>");
+    }
+
+    #[test]
+    fn quoted_pre_closing_text_does_not_end_literal_treatment() {
+        let before = "<pre>\n  <span title=\"</pre>\">\n  <img>\n</pre>\n";
+        let after = "<pre>\n  <span title=\"</pre>\">\n  <div>\n    <img>\n  </div>\n</pre>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        assert_html_line_is_literal(rows, "<img>");
+    }
+
+    #[test]
+    fn raw_child_does_not_close_its_preformatted_parent() {
+        let before = "<pre>\n<textarea>\n</pre>\n  <img>\n</textarea>\n</pre>\n";
+        let after =
+            "<pre>\n<textarea>\n</pre>\n  <div>\n    <img>\n  </div>\n</textarea>\n</pre>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        assert_html_line_is_literal(rows, "<img>");
+    }
+
+    #[test]
+    fn noscript_content_keeps_literal_correspondence() {
+        let before = "<noscript>\n  <img>\n</noscript>\n";
+        let after = "<noscript>\n  <div>\n    <img>\n  </div>\n</noscript>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        assert_html_line_is_literal(rows, "<img>");
+    }
+
+    #[test]
+    fn plaintext_never_resumes_html_correspondence() {
+        let before = "<plaintext>\n</plaintext>\n  <img>\n";
+        let after = "<plaintext>\n</plaintext>\n  <div>\n    <img>\n  </div>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        assert_html_line_is_literal(rows, "<img>");
+    }
+
+    #[test]
+    fn html_multiline_attribute_values_remain_literal_changes() {
+        let before = "<img\n  title=\"first line\n    second line\"\n/>\n";
+        let after = "<div>\n  <img\n    title=\"first line\n      second line\"\n  />\n</div>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+        let rows = &diff.hunks[0].rows;
+
+        assert!(rows.iter().any(|row| {
+            let DiffRow::Linewise { before, .. } = row else {
+                return false;
+            };
+            before
+                .as_ref()
+                .is_some_and(|line| line_text(line).contains("second line"))
+        }));
+        assert!(rows.iter().any(|row| {
+            let DiffRow::Linewise { after, .. } = row else {
+                return false;
+            };
+            after
+                .as_ref()
+                .is_some_and(|line| line_text(line).contains("second line"))
+        }));
+        assert!(!rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    role: CodeRole::Reflow,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn generated_html_keeps_exact_correspondence() {
+        let before = "<!-- @generated -->\n  <img src=\"avatar.webp\" />\n";
+        let after = "<!-- @generated -->\n    <img src=\"avatar.webp\" />\n";
+
+        let diff = diff_file("index.html", before, after).expect("generated HTML uses line diff");
+        let rows = &diff.hunks[0].rows;
+
+        assert!(diff.generated);
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: Some(before),
+                    after: Some(after),
+                } if line_text(before).contains("<img") && line_text(after).contains("<img")
+            )
+        }));
+        assert!(!rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    role: CodeRole::Reflow,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn every_web_fixture_produces_review_work() {
+        let paths = web::ALL
+            .iter()
+            .map(|fixture| fixture.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "web/profile-card.css",
+                "web/profile-card.html",
+                "web/profile-card.ts",
+            ]
+        );
+
+        for fixture in web::ALL {
+            let diff = diff_file(fixture.path, fixture.before, fixture.after)
+                .expect("web fixture uses a supported fallback");
+
+            assert!(
+                !diff.hunks.is_empty(),
+                "{} needs a visible diff",
+                fixture.path
+            );
+        }
+    }
+
+    #[test]
+    fn one_sided_plain_hunks_end_at_eof() {
+        for (before, after) in [("only line\n", ""), ("", "only line\n")] {
+            let diff = diff_file("notes.txt", before, after).expect("plain diff cannot fail");
+
+            assert_eq!(diff.hunks.len(), 1);
+            assert!(diff.hunks[0].ends_at_eof);
+        }
+    }
+
+    #[test]
     fn distant_plain_changes_become_focused_hunks() {
         let before = "one\nold two\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nold twelve\nthirteen\nfourteen\n";
         let after = "one\nnew two\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nnew twelve\nthirteen\nfourteen\n";
@@ -2016,6 +2960,8 @@ mod tests {
         assert_eq!(diff.hunks[0].coverage.after, Some(1..6));
         assert_eq!(diff.hunks[1].coverage.before, Some(9..15));
         assert_eq!(diff.hunks[1].coverage.after, Some(9..15));
+        assert!(!diff.hunks[0].ends_at_eof);
+        assert!(diff.hunks[1].ends_at_eof);
     }
 
     #[test]
@@ -2153,6 +3099,34 @@ mod tests {
 
     fn line_text(line: &CodeLine) -> String {
         line.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    fn assert_html_line_is_literal(rows: &[DiffRow], needle: &str) {
+        assert!(rows.iter().any(|row| {
+            let DiffRow::Linewise { before, .. } = row else {
+                return false;
+            };
+            before
+                .as_ref()
+                .is_some_and(|line| line_text(line).contains(needle))
+        }));
+        assert!(rows.iter().any(|row| {
+            let DiffRow::Linewise { after, .. } = row else {
+                return false;
+            };
+            after
+                .as_ref()
+                .is_some_and(|line| line_text(line).contains(needle))
+        }));
+        assert!(!rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    line,
+                    role: CodeRole::Reflow,
+                } if line_text(line).contains(needle)
+            )
+        }));
     }
 
     fn hunk_containing<'a>(diff: &'a FileDiff, needle: &str) -> &'a Hunk {
