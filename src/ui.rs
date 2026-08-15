@@ -1,7 +1,8 @@
 use crate::diff::{
-    CodeLine, CodeRole, CodeSpan, DiffMark, DiffRow, FileDiff, SyntaxClass, WordDiff,
+    CodeLine, CodeRole, CodeSpan, DiffMark, DiffRow, FileDiff, LineEnding, SyntaxClass, WordDiff,
 };
-use anyhow::{Context, Result};
+use crate::review::{FileNotice, FileReview};
+use anyhow::{Context, Result, ensure};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -28,6 +29,10 @@ const HEADER_ROWS: u16 = 2;
 const MIN_BODY_ROWS: u16 = 16;
 const MIN_TERMINAL_HEIGHT: u16 = HEADER_ROWS + MIN_BODY_ROWS;
 const VERTICAL_ELLIPSIS: &str = "⋮";
+const RIBBON_MARGIN: &str = "  ";
+const RIBBON_SEPARATOR: &str = " │ ";
+const RIBBON_OMISSION: &str = "…";
+const GENERATED_BADGE: &str = " @generated";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceSide {
@@ -36,9 +41,16 @@ enum SourceSide {
 }
 
 /// File-wide prefix geometry shared by every unified row treatment.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct GutterLayout {
     label_columns: usize,
+}
+
+/// Minimal review projection needed to lay out the file ribbon.
+#[derive(Clone, Copy, Debug)]
+struct RibbonItem<'a> {
+    path: &'a str,
+    generated: bool,
 }
 
 impl GutterLayout {
@@ -84,6 +96,7 @@ fn row_label_columns(row: &DiffRow) -> usize {
                 .unwrap_or(0);
             before.max(after)
         }
+        DiffRow::LineEnding { .. } => 0,
         DiffRow::Moved { before, after } => {
             UnicodeWidthStr::width(moved_label(*before, after.number).as_str())
         }
@@ -111,12 +124,13 @@ fn moved_label(before: Option<usize>, after: usize) -> String {
     format!("{before} → {after}")
 }
 
-/// Opens one planned unified review in the terminal.
-pub fn run(diff: FileDiff) -> Result<()> {
+/// Opens one or more planned file reviews or retained input notices.
+pub fn run(reviews: Vec<FileReview>) -> Result<()> {
+    ensure!(!reviews.is_empty(), "cannot open an empty review");
     let mut session = TerminalSession::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
-    let mut app = App::new(diff);
+    let mut app = App::new(reviews);
 
     let event_result = run_event_loop(&mut terminal, &mut app);
 
@@ -195,23 +209,52 @@ impl Drop for TerminalSession {
     }
 }
 
-/// Viewport over one file's inline review stream.
+/// Viewport over one file inside a path-ordered review.
 #[derive(Debug)]
 struct App {
-    diff: FileDiff,
+    reviews: Vec<FileReview>,
+    file_index: usize,
     scroll: usize,
     viewport_rows: usize,
     total_rows: usize,
 }
 
 impl App {
-    fn new(diff: FileDiff) -> Self {
+    fn new<T>(reviews: Vec<T>) -> Self
+    where
+        T: Into<FileReview>,
+    {
+        assert!(!reviews.is_empty(), "review needs at least one file");
+        let reviews = reviews.into_iter().map(Into::into).collect();
         Self {
-            diff,
+            reviews,
+            file_index: 0,
             scroll: 0,
             viewport_rows: 1,
             total_rows: 0,
         }
+    }
+
+    fn current_review(&self) -> &FileReview {
+        &self.reviews[self.file_index]
+    }
+
+    #[cfg(test)]
+    fn current_diff(&self) -> &FileDiff {
+        let FileReview::Diff(diff) = self.current_review() else {
+            panic!("current review is not a diff");
+        };
+        diff
+    }
+
+    fn ribbon_items(&self) -> Vec<RibbonItem<'_>> {
+        self.reviews
+            .iter()
+            .map(|review| RibbonItem {
+                path: review.path(),
+                generated: review.is_generated(),
+            })
+            .collect()
     }
 
     fn max_scroll(&self) -> usize {
@@ -232,6 +275,24 @@ impl App {
 
     fn page_size(&self) -> usize {
         self.viewport_rows.max(1)
+    }
+
+    fn previous_file(&mut self) {
+        if self.file_index == 0 {
+            return;
+        }
+
+        self.file_index -= 1;
+        self.scroll = 0;
+    }
+
+    fn next_file(&mut self) {
+        if self.file_index + 1 >= self.reviews.len() {
+            return;
+        }
+
+        self.file_index += 1;
+        self.scroll = 0;
     }
 }
 
@@ -278,10 +339,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyOutcome {
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => return KeyOutcome::Exit,
+        KeyCode::Left | KeyCode::Char('h' | '[') => app.previous_file(),
+        KeyCode::Right | KeyCode::Char('l' | ']') => app.next_file(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
-        KeyCode::PageUp => app.scroll_up(app.page_size()),
-        KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_down(app.page_size()),
+        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_up(app.page_size()),
+        KeyCode::PageDown | KeyCode::Char(' ' | 'd') => app.scroll_down(app.page_size()),
         KeyCode::Home => app.scroll = 0,
         KeyCode::End => app.scroll = app.max_scroll(),
         _ => {}
@@ -293,7 +356,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
 
-    let gutter = GutterLayout::new(&app.diff);
+    let gutter = match app.current_review() {
+        FileReview::Diff(diff) => GutterLayout::new(diff),
+        FileReview::Notice(_) => GutterLayout::default(),
+    };
     let required_width = gutter.width() + MIN_SOURCE_COLUMNS;
     if usize::from(area.width) < required_width || area.height < MIN_TERMINAL_HEIGHT {
         render_too_small(frame, area, required_width);
@@ -306,12 +372,13 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         area.width,
         area.height.saturating_sub(HEADER_ROWS),
     );
-    let rows = compose_review(&app.diff, gutter, body.width as usize);
+    let rows = compose_file_review(app.current_review(), gutter, body.width as usize);
     app.total_rows = rows.len();
     app.viewport_rows = body.height as usize;
     app.clamp_scroll();
 
-    render_file_header(frame, area, &app.diff.path);
+    let ribbon_items = app.ribbon_items();
+    render_file_ribbon(frame, area, &ribbon_items, app.file_index);
     let visible = rows
         .into_iter()
         .skip(app.scroll)
@@ -320,19 +387,155 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Paragraph::new(visible), body);
 }
 
-fn render_file_header(frame: &mut Frame<'_>, area: Rect, path: &str) {
+fn render_file_ribbon(frame: &mut Frame<'_>, area: Rect, items: &[RibbonItem<'_>], active: usize) {
+    let line = file_ribbon(items, active, usize::from(area.width));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                path.to_owned(),
-                Style::default()
-                    .fg(Palette::PATH)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])),
+        Paragraph::new(line),
         Rect::new(area.x, area.y, area.width, 1),
     );
+}
+
+/// Contiguous ribbon window around the active review, with explicit hidden edges.
+fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'static> {
+    if items.is_empty() || active >= items.len() || width == 0 {
+        return Line::from("");
+    }
+
+    let margin_width = UnicodeWidthStr::width(RIBBON_MARGIN).min(width.saturating_sub(1));
+    let available = width.saturating_sub(margin_width);
+    let mut start = active;
+    let mut end = active + 1;
+
+    // Grow evenly from the active item. A contiguous window keeps ordering legible.
+    loop {
+        let left_first = active - start < end - active;
+        let sides = if left_first {
+            [RibbonSide::Left, RibbonSide::Right]
+        } else {
+            [RibbonSide::Right, RibbonSide::Left]
+        };
+        let mut grew = false;
+        for side in sides {
+            let candidate = match side {
+                RibbonSide::Left if start > 0 => Some((start - 1, end)),
+                RibbonSide::Right if end < items.len() => Some((start, end + 1)),
+                RibbonSide::Left | RibbonSide::Right => None,
+            };
+            let Some((candidate_start, candidate_end)) = candidate else {
+                continue;
+            };
+            let candidate_width = ribbon_window_width(items, candidate_start, candidate_end);
+            if candidate_width > available {
+                continue;
+            }
+
+            start = candidate_start;
+            end = candidate_end;
+            grew = true;
+            break;
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut spans = vec![Span::raw(" ".repeat(margin_width))];
+    let hidden_left = start > 0;
+    let hidden_right = end < items.len();
+    if hidden_left {
+        spans.push(Span::styled(RIBBON_OMISSION, muted()));
+        spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
+    }
+
+    let edge_width = ribbon_edge_width(hidden_left) + ribbon_edge_width(hidden_right);
+    let item_widths = (start..end)
+        .map(|index| ribbon_item_width(items[index]))
+        .collect::<Vec<_>>();
+    let separator_width = UnicodeWidthStr::width(RIBBON_SEPARATOR);
+    let separators_width = separator_width * item_widths.len().saturating_sub(1);
+    let items_width = available.saturating_sub(edge_width + separators_width);
+    let full_items_width = item_widths.iter().sum::<usize>();
+
+    for (offset, index) in (start..end).enumerate() {
+        if offset > 0 {
+            spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
+        }
+        let budget = if full_items_width <= items_width || index != active {
+            item_widths[offset]
+        } else {
+            // Only the active-only fallback can overflow: keep its tail and badge visible.
+            items_width
+        };
+        spans.extend(ribbon_item_spans(items[index], index == active, budget));
+    }
+
+    if hidden_right {
+        spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
+        spans.push(Span::styled(RIBBON_OMISSION, muted()));
+    }
+    clip_line(spans, width)
+}
+
+#[derive(Clone, Copy)]
+enum RibbonSide {
+    Left,
+    Right,
+}
+
+fn ribbon_window_width(items: &[RibbonItem<'_>], start: usize, end: usize) -> usize {
+    let item_width = (start..end)
+        .map(|index| ribbon_item_width(items[index]))
+        .sum::<usize>();
+    let separators =
+        end.saturating_sub(start + 1) + usize::from(start > 0) + usize::from(end < items.len());
+    item_width
+        + separators * UnicodeWidthStr::width(RIBBON_SEPARATOR)
+        + usize::from(start > 0) * UnicodeWidthStr::width(RIBBON_OMISSION)
+        + usize::from(end < items.len()) * UnicodeWidthStr::width(RIBBON_OMISSION)
+}
+
+fn ribbon_edge_width(hidden: bool) -> usize {
+    usize::from(hidden)
+        * (UnicodeWidthStr::width(RIBBON_OMISSION) + UnicodeWidthStr::width(RIBBON_SEPARATOR))
+}
+
+fn ribbon_item_width(item: RibbonItem<'_>) -> usize {
+    UnicodeWidthStr::width(item.path)
+        + usize::from(item.generated) * UnicodeWidthStr::width(GENERATED_BADGE)
+}
+
+fn ribbon_item_spans(item: RibbonItem<'_>, active: bool, width: usize) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let active_style = Style::default()
+        .fg(Palette::PATH)
+        .add_modifier(Modifier::BOLD);
+    let path_style = if active { active_style } else { muted() };
+    let badge = if item.generated { GENERATED_BADGE } else { "" };
+    let reserved = UnicodeWidthStr::width(badge);
+    if reserved > width {
+        let label = format!("{}{badge}", item.path);
+        let label = clip_text_start(&label, width);
+        return vec![Span::styled(label, path_style)];
+    }
+
+    let mut spans = Vec::new();
+    let path = clip_text_start(item.path, width - reserved);
+    if !path.is_empty() {
+        spans.push(Span::styled(path, path_style));
+    }
+    if !badge.is_empty() {
+        let badge_style = Style::default().fg(Palette::WARNING);
+        let badge_style = if active {
+            badge_style.add_modifier(Modifier::BOLD)
+        } else {
+            badge_style
+        };
+        spans.push(Span::styled(badge, badge_style));
+    }
+    spans
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect, required_width: usize) {
@@ -402,6 +605,9 @@ fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Li
                         ));
                     }
                 }
+                DiffRow::LineEnding { before, after } => {
+                    rows.push(line_ending_diff(*before, *after, gutter, width));
+                }
                 DiffRow::Moved { before, after } => {
                     rows.push(moved_source_line(after, *before, gutter, width));
                 }
@@ -411,6 +617,119 @@ fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Li
         }
     }
     rows
+}
+
+fn compose_file_review(
+    review: &FileReview,
+    gutter: GutterLayout,
+    width: usize,
+) -> Vec<Line<'static>> {
+    match review {
+        FileReview::Diff(diff) => compose_review(diff, gutter, width),
+        FileReview::Notice(notice) => compose_notice(notice, width),
+    }
+}
+
+fn compose_notice(notice: &FileNotice, width: usize) -> Vec<Line<'static>> {
+    match notice {
+        FileNotice::TooLarge {
+            before_bytes,
+            after_bytes,
+            limit_bytes,
+            ..
+        } => {
+            let heading = format!(
+                "  file not shown — exceeds the {} per-revision limit",
+                format_bytes(*limit_bytes)
+            );
+            let mut details = vec![Span::raw("  ")];
+            if let Some(bytes) = before_bytes {
+                details.push(Span::styled("before ", muted()));
+                details.push(Span::styled(format_bytes(*bytes), surrounding_style()));
+            }
+            if let Some(bytes) = after_bytes {
+                if before_bytes.is_some() {
+                    details.push(Span::styled("  ·  ", muted()));
+                }
+                details.push(Span::styled("current ", muted()));
+                details.push(Span::styled(format_bytes(*bytes), surrounding_style()));
+            }
+
+            vec![
+                Line::from(""),
+                clip_line(
+                    vec![Span::styled(heading, Style::default().fg(Palette::WARNING))],
+                    width,
+                ),
+                clip_line(details, width),
+            ]
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+
+    for (unit, scale) in [("GiB", GIB), ("MiB", MIB), ("KiB", KIB)] {
+        if bytes < scale {
+            continue;
+        }
+        if bytes.is_multiple_of(scale) {
+            return format!("{} {unit}", bytes / scale);
+        }
+        return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+    }
+
+    format!("{bytes} B")
+}
+
+fn line_ending_diff(
+    before: Option<LineEnding>,
+    after: Option<LineEnding>,
+    gutter: GutterLayout,
+    width: usize,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(gutter.width()))];
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            spans.push(Span::styled("line ending: ", muted()));
+            spans.push(Span::styled(
+                line_ending_label(before),
+                word_diff_style(Palette::BEFORE),
+            ));
+            spans.push(Span::styled(" → ", Style::default().fg(Palette::MOVE)));
+            spans.push(Span::styled(
+                line_ending_label(after),
+                word_diff_style(Palette::CURRENT),
+            ));
+        }
+        (Some(before), None) => {
+            spans.push(Span::styled("before: ", muted()));
+            spans.push(Span::styled(
+                line_ending_label(before),
+                word_diff_style(Palette::BEFORE),
+            ));
+        }
+        (None, Some(after)) => {
+            spans.push(Span::styled("after: ", muted()));
+            spans.push(Span::styled(
+                line_ending_label(after),
+                word_diff_style(Palette::CURRENT),
+            ));
+        }
+        (None, None) => unreachable!("a line-ending row always has a source side"),
+    }
+    clip_line(spans, width)
+}
+
+fn line_ending_label(ending: LineEnding) -> &'static str {
+    match ending {
+        LineEnding::Missing => "no newline at end of file",
+        LineEnding::Lf => "LF",
+        LineEnding::CrLf => "CRLF",
+    }
 }
 
 fn source_line(
@@ -604,6 +923,37 @@ fn clip_text(text: &str, width: usize) -> String {
     output
 }
 
+/// Tail-preserving path clipping keeps the distinguishing file name on screen.
+fn clip_text_start(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let omission_width = UnicodeWidthStr::width(RIBBON_OMISSION);
+    if width <= omission_width {
+        return clip_text(RIBBON_OMISSION, width);
+    }
+
+    let mut suffix = Vec::new();
+    let mut used = omission_width;
+    for character in text.chars().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        suffix.push(character);
+        used += character_width;
+    }
+    suffix.reverse();
+
+    let mut output = String::from(RIBBON_OMISSION);
+    output.extend(suffix);
+    output
+}
+
 fn syntax_foreground(class: SyntaxClass) -> Color {
     match class {
         SyntaxClass::Plain | SyntaxClass::Punctuation | SyntaxClass::Identifier => Palette::TEXT,
@@ -695,7 +1045,7 @@ mod tests {
         assert_eq!(gutter.width(), 10);
         assert_eq!(gutter.width() + MIN_SOURCE_COLUMNS, 72);
 
-        let mut app = App::new(diff);
+        let mut app = App::new(vec![diff]);
         let backend = TestBackend::new(100, 50);
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
@@ -873,7 +1223,7 @@ mod tests {
     #[test]
     fn narrow_terminal_uses_a_plain_size_message() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-        let mut app = App::new(diff);
+        let mut app = App::new(vec![diff]);
         let backend = TestBackend::new(60, 14);
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
@@ -901,6 +1251,7 @@ mod tests {
         };
         let diff = FileDiff {
             path: "src/large.rs".to_owned(),
+            generated: false,
             windows: vec![DiffWindow {
                 mapping: LineMapping {
                     before: Some(1..2),
@@ -943,9 +1294,9 @@ mod tests {
     #[test]
     fn navigation_stays_inside_the_composed_review() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-        let mut app = App::new(diff);
-        let gutter = GutterLayout::new(&app.diff);
-        app.total_rows = compose_review(&app.diff, gutter, 80).len();
+        let mut app = App::new(vec![diff]);
+        let gutter = GutterLayout::new(app.current_diff());
+        app.total_rows = compose_review(app.current_diff(), gutter, 80).len();
         app.viewport_rows = 8;
 
         assert_eq!(
@@ -967,6 +1318,214 @@ mod tests {
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
         );
         assert_eq!(app.scroll, 8.min(end));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.scroll, 0);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.scroll, 8.min(end));
+    }
+
+    #[test]
+    fn generated_marker_survives_a_long_file_header() {
+        let mut diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
+        diff.generated = true;
+        diff.path = format!("{}generated.rs", "very-long-directory/".repeat(8));
+        let mut app = App::new(vec![diff]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render generated file");
+
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("@generated"));
+    }
+
+    #[test]
+    fn file_ribbon_lists_reviews_and_moves_the_bold_active_style() {
+        let first = diff_file("src/first.rs", "before\n", "after\n").expect("first diff");
+        let second = diff_file("notes.txt", "before\n", "after\n").expect("second diff");
+        let mut generated =
+            diff_file("build/generated.rs", "before\n", "after\n").expect("generated diff");
+        generated.generated = true;
+        let mut app = App::new(vec![first, second, generated]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render first file");
+
+        let buffer = terminal.backend().buffer();
+        let header = buffer_row_text(buffer, 0);
+        assert!(
+            header
+                .contains("src/first.rs \u{2502} notes.txt \u{2502} build/generated.rs @generated"),
+            "unexpected ribbon: {header:?}"
+        );
+        assert!(run_on_line_matches(
+            buffer,
+            "src/first.rs",
+            "src/first.rs",
+            |cell| cell.fg == Palette::PATH && cell.modifier.contains(Modifier::BOLD)
+        ));
+        assert!(run_on_line_matches(
+            buffer,
+            "notes.txt",
+            "notes.txt",
+            |cell| cell.fg == Palette::MUTED && !cell.modifier.contains(Modifier::BOLD)
+        ));
+        assert!(run_on_line_matches(
+            buffer,
+            "build/generated.rs",
+            "@generated",
+            |cell| cell.fg == Palette::WARNING && !cell.modifier.contains(Modifier::BOLD)
+        ));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render second file");
+
+        let buffer = terminal.backend().buffer();
+        assert!(run_on_line_matches(
+            buffer,
+            "notes.txt",
+            "notes.txt",
+            |cell| cell.fg == Palette::PATH && cell.modifier.contains(Modifier::BOLD)
+        ));
+        assert!(run_on_line_matches(
+            buffer,
+            "src/first.rs",
+            "src/first.rs",
+            |cell| cell.fg == Palette::MUTED && !cell.modifier.contains(Modifier::BOLD)
+        ));
+    }
+
+    #[test]
+    fn oversized_review_stays_in_the_ribbon_and_explains_the_limit() {
+        let first = diff_file("src/first.rs", "before\n", "after\n").expect("first diff");
+        let notice = FileNotice::too_large(
+            "assets/large.txt",
+            Some(2 * 1024 * 1024),
+            Some(42 * 1024 * 1024),
+            16 * 1024 * 1024,
+        );
+        let reviews = vec![FileReview::from(first), FileReview::Notice(notice)];
+        let mut app = App::new(reviews);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render oversized review");
+
+        let buffer = terminal.backend().buffer();
+        let screen = buffer_text(buffer);
+        assert!(screen.contains("src/first.rs │ assets/large.txt"));
+        assert!(screen.contains("file not shown — exceeds the 16 MiB per-revision limit"));
+        assert!(screen.contains("before 2 MiB  ·  current 42 MiB"));
+        assert!(!screen.contains("no changes"));
+        assert!(run_on_line_matches(
+            buffer,
+            "assets/large.txt",
+            "assets/large.txt",
+            |cell| cell.fg == Palette::PATH && cell.modifier.contains(Modifier::BOLD)
+        ));
+    }
+
+    #[test]
+    fn narrow_ribbon_keeps_a_long_generated_active_path_visible() {
+        let first = diff_file("src/before.rs", "before\n", "after\n").expect("first diff");
+        let active_path = format!("{}active-generated.rs", "deep-directory/".repeat(12));
+        let mut active = diff_file(&active_path, "before\n", "after\n").expect("active diff");
+        active.generated = true;
+        let last = diff_file("src/after.rs", "before\n", "after\n").expect("last diff");
+        let mut app = App::new(vec![first, active, last]);
+        app.file_index = 1;
+        let backend = TestBackend::new(72, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render fitted ribbon");
+
+        let buffer = terminal.backend().buffer();
+        let header = buffer_row_text(buffer, 0);
+        assert!(
+            header.contains("active-generated.rs @generated"),
+            "active tail and badge were clipped: {header:?}"
+        );
+        assert_eq!(header.matches(RIBBON_OMISSION).count(), 3);
+        assert!(!header.contains("src/before.rs"));
+        assert!(!header.contains("src/after.rs"));
+        assert!(UnicodeWidthStr::width(header.trim_end()) <= 72);
+        assert!(run_on_line_matches(
+            buffer,
+            "active-generated.rs",
+            "active-generated.rs",
+            |cell| cell.fg == Palette::PATH && cell.modifier.contains(Modifier::BOLD)
+        ));
+    }
+
+    #[test]
+    fn plain_diff_explains_a_missing_final_newline() {
+        let diff = diff_file("notes.txt", "same\n", "same").expect("plain diff");
+        let mut app = App::new(vec![diff]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render line-ending change");
+
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("line ending: LF → no newline at end of file"));
+    }
+
+    #[test]
+    fn file_navigation_clamps_and_resets_the_viewport() {
+        let first = diff_file(
+            "src/first.rs",
+            "fn value() -> u8 { 1 }\n",
+            "fn value() -> u8 { 2 }\n",
+        )
+        .expect("first diff");
+        let second = diff_file(
+            "src/second.rs",
+            "fn value() -> u8 { 2 }\n",
+            "fn value() -> u8 { 3 }\n",
+        )
+        .expect("second diff");
+        let mut app = App::new(vec![first, second]);
+        app.scroll = 4;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current_diff().path, "src/second.rs");
+        assert_eq!(app.scroll, 0);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current_diff().path, "src/second.rs");
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render second file");
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("src/first.rs \u{2502} src/second.rs"));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.current_diff().path, "src/first.rs");
     }
 
     fn buffer_text(buffer: &Buffer) -> String {
@@ -976,6 +1535,13 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn buffer_row_text(buffer: &Buffer, row: usize) -> String {
+        buffer.content[row * buffer.area.width as usize..(row + 1) * buffer.area.width as usize]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     fn ascii_run_has_modifier(buffer: &Buffer, text: &str, modifier: Modifier) -> bool {

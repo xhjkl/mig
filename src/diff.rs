@@ -3,6 +3,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::ops::Range;
+use std::path::Path;
 
 pub use crate::syntax::SyntaxClass;
 
@@ -12,6 +13,14 @@ pub enum DiffMark {
     Context,
     Removed,
     Added,
+}
+
+/// Concrete terminator shown when a literal line's ending itself changed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LineEnding {
+    Missing,
+    Lf,
+    CrLf,
 }
 
 /// Smallest independently styled slice of one displayed source line.
@@ -66,6 +75,10 @@ pub enum DiffRow {
         before: Option<CodeLine>,
         after: Option<CodeLine>,
     },
+    LineEnding {
+        before: Option<LineEnding>,
+        after: Option<LineEnding>,
+    },
     Moved {
         before: Option<usize>,
         after: CodeLine,
@@ -85,19 +98,453 @@ pub struct DiffWindow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileDiff {
     pub path: String,
+    /// Whether either source revision declares itself generated near its header.
+    pub generated: bool,
     pub windows: Vec<DiffWindow>,
 }
 
-/// Parse Rust, establish one-to-one syntax correspondence, and plan a unified review.
+/// Select syntax-aware Rust review when safe, otherwise plan an exact line review.
 pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
-    let before = parse_rust(before)?;
-    let after = parse_rust(after)?;
-    let matches = correspond(&before.definitions, &after.definitions);
-    let windows = plan_unified(&before, &after, &matches);
+    let generated = has_generated_marker(before) || has_generated_marker(after);
+    if generated || !is_rust_path(path) {
+        return Ok(diff_plain(path, before, after, generated));
+    }
+
+    diff_rust(path, before, after)
+}
+
+/// Parse Rust, establish one-to-one syntax correspondence, and plan a unified review.
+fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
+    let before_file = parse_rust(before)?;
+    let after_file = parse_rust(after)?;
+    if before_file.tree.root_node().has_error() || after_file.tree.root_node().has_error() {
+        return Ok(diff_plain(path, before, after, false));
+    }
+
+    let matches = correspond(&before_file.definitions, &after_file.definitions);
+    let windows = plan_unified(&before_file, &after_file, &matches);
+    // Unknown top-level forms must not disappear beside recognized structural edits.
+    if before != after
+        && (windows.is_empty()
+            || !structural_projection_covers_plain_changes(
+                before,
+                after,
+                &before_file,
+                &after_file,
+            ))
+    {
+        return Ok(diff_plain(path, before, after, false));
+    }
+
     Ok(FileDiff {
         path: path.to_owned(),
+        generated: false,
         windows,
     })
+}
+
+fn structural_projection_covers_plain_changes(
+    before: &str,
+    after: &str,
+    before_file: &SyntaxFile<'_>,
+    after_file: &SyntaxFile<'_>,
+) -> bool {
+    let before_lines = plain_lines(before);
+    let after_lines = plain_lines(after);
+    let before_keys = before_lines
+        .iter()
+        .map(|line| (line.text, line.ending))
+        .collect::<Vec<_>>();
+    let after_keys = after_lines
+        .iter()
+        .map(|line| (line.text, line.ending))
+        .collect::<Vec<_>>();
+    let matches = local_matches(&before_keys, &after_keys);
+    let events = plain_events(before_lines.len(), after_lines.len(), matches);
+
+    events.into_iter().all(|event| {
+        let PlainEvent::Change { before, after } = event else {
+            return true;
+        };
+        if plain_ranges_change_endings(&before, &after, &before_lines, &after_lines) {
+            return false;
+        }
+        plain_range_is_projected(before, &before_lines, before_file)
+            && plain_range_is_projected(after, &after_lines, after_file)
+    })
+}
+
+fn plain_ranges_change_endings(
+    before: &Range<usize>,
+    after: &Range<usize>,
+    before_lines: &[PlainLine<'_>],
+    after_lines: &[PlainLine<'_>],
+) -> bool {
+    let paired = before.len().min(after.len());
+    for index in 0..paired {
+        if before_lines[before.start + index].ending != after_lines[after.start + index].ending {
+            return true;
+        }
+    }
+    before_lines[before.start + paired..before.end]
+        .iter()
+        .chain(&after_lines[after.start + paired..after.end])
+        .any(|line| line.ending == LineEnding::Missing)
+}
+
+fn plain_range_is_projected(
+    indices: Range<usize>,
+    lines: &[PlainLine<'_>],
+    file: &SyntaxFile<'_>,
+) -> bool {
+    indices.into_iter().all(|index| {
+        let line = &lines[index];
+        line.text.trim().is_empty()
+            || file
+                .definitions
+                .iter()
+                .any(|definition| definition.lines.contains(&line.number))
+            || file.imports.iter().any(|import| import.line == line.number)
+    })
+}
+
+fn is_rust_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "rs")
+}
+
+/// Conventional marker search is deliberately header-bounded and case-sensitive.
+fn has_generated_marker(source: &str) -> bool {
+    source.lines().take(20).any(is_generated_marker_line)
+}
+
+fn is_generated_marker_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let marker_line = line.starts_with("@generated")
+        || line.starts_with("//")
+        || line.starts_with('#')
+        || line.starts_with("/*")
+        || line.starts_with('*')
+        || line.starts_with("<!--")
+        || line.starts_with("--")
+        || line.starts_with(';');
+    if !marker_line {
+        return false;
+    }
+
+    line.match_indices("@generated").any(|(marker, _)| {
+        let before = &line[..marker];
+        let after = &line[marker + "@generated".len()..];
+        let bounded_before = before
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+        let bounded_after = after.chars().next().is_none_or(|character| {
+            !character.is_alphanumeric() && !matches!(character, '_' | '/' | '-')
+        });
+        bounded_before && bounded_after
+    })
+}
+
+const PLAIN_CONTEXT_LINES: usize = 3;
+
+/// One exact text record; terminators participate in matching and surface only when changed.
+#[derive(Clone, Copy)]
+struct PlainLine<'source> {
+    number: usize,
+    text: &'source str,
+    ending: LineEnding,
+}
+
+/// Ordered exact-line correspondence before presentation expands changed gaps.
+enum PlainEvent {
+    Context {
+        before: usize,
+        after: usize,
+    },
+    Change {
+        before: Range<usize>,
+        after: Range<usize>,
+    },
+}
+
+/// Exact-line fallback for generated Rust and every syntax Mig does not understand.
+fn diff_plain(path: &str, before: &str, after: &str, generated: bool) -> FileDiff {
+    let before = plain_lines(before);
+    let after = plain_lines(after);
+    let before_keys = before
+        .iter()
+        .map(|line| (line.text, line.ending))
+        .collect::<Vec<_>>();
+    let after_keys = after
+        .iter()
+        .map(|line| (line.text, line.ending))
+        .collect::<Vec<_>>();
+    let matches = local_matches(&before_keys, &after_keys);
+    let events = plain_events(before.len(), after.len(), matches);
+    let windows = plan_plain_windows(&before, &after, &events);
+
+    FileDiff {
+        path: path.to_owned(),
+        generated,
+        windows,
+    }
+}
+
+fn plain_lines(source: &str) -> Vec<PlainLine<'_>> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, byte) in source.bytes().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+
+        let (text_end, ending) = if index > start && source.as_bytes()[index - 1] == b'\r' {
+            (index - 1, LineEnding::CrLf)
+        } else {
+            (index, LineEnding::Lf)
+        };
+        lines.push(PlainLine {
+            number: lines.len() + 1,
+            text: &source[start..text_end],
+            ending,
+        });
+        start = index + 1;
+    }
+    if start < source.len() {
+        lines.push(PlainLine {
+            number: lines.len() + 1,
+            text: &source[start..],
+            ending: LineEnding::Missing,
+        });
+    }
+    lines
+}
+
+fn plain_events(
+    before_len: usize,
+    after_len: usize,
+    matches: Vec<(usize, usize)>,
+) -> Vec<PlainEvent> {
+    let mut events = Vec::new();
+    let mut before_start = 0;
+    let mut after_start = 0;
+    for (before_end, after_end) in matches
+        .into_iter()
+        .chain(std::iter::once((before_len, after_len)))
+    {
+        if before_start < before_end || after_start < after_end {
+            events.push(PlainEvent::Change {
+                before: before_start..before_end,
+                after: after_start..after_end,
+            });
+        }
+        if before_end < before_len && after_end < after_len {
+            events.push(PlainEvent::Context {
+                before: before_end,
+                after: after_end,
+            });
+        }
+        before_start = before_end.saturating_add(1);
+        after_start = after_end.saturating_add(1);
+    }
+    events
+}
+
+/// Merge nearby changes using the same context radius on both sides.
+fn plan_plain_windows(
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+    events: &[PlainEvent],
+) -> Vec<DiffWindow> {
+    let changes = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| matches!(event, PlainEvent::Change { .. }).then_some(index))
+        .collect::<Vec<_>>();
+    let Some(first) = changes.first().copied() else {
+        return Vec::new();
+    };
+
+    let mut windows = Vec::new();
+    let mut group_start = first;
+    let mut group_end = first;
+    for change in changes.into_iter().skip(1) {
+        let separating_context = change.saturating_sub(group_end + 1);
+        // Keeping one otherwise-hidden line costs the same row as separating hunks.
+        if separating_context <= PLAIN_CONTEXT_LINES * 2 + 1 {
+            group_end = change;
+            continue;
+        }
+
+        windows.push(plan_plain_window(
+            before,
+            after,
+            events,
+            group_start,
+            group_end,
+        ));
+        group_start = change;
+        group_end = change;
+    }
+    windows.push(plan_plain_window(
+        before,
+        after,
+        events,
+        group_start,
+        group_end,
+    ));
+    windows
+}
+
+fn plan_plain_window(
+    before: &[PlainLine<'_>],
+    after: &[PlainLine<'_>],
+    events: &[PlainEvent],
+    first_change: usize,
+    last_change: usize,
+) -> DiffWindow {
+    let start = first_change.saturating_sub(PLAIN_CONTEXT_LINES);
+    let end = (last_change + PLAIN_CONTEXT_LINES + 1).min(events.len());
+    let events = &events[start..end];
+    let mut mapping = LineMapping {
+        before: None,
+        after: None,
+    };
+    let mut rows = Vec::new();
+
+    for event in events {
+        match event {
+            PlainEvent::Context {
+                before: before_index,
+                after: after_index,
+            } => {
+                include_plain_mapping(
+                    &mut mapping.before,
+                    before,
+                    &(*before_index..*before_index + 1),
+                );
+                include_plain_mapping(&mut mapping.after, after, &(*after_index..*after_index + 1));
+                rows.push(DiffRow::Code {
+                    line: plain_code_line(after[*after_index], DiffMark::Context),
+                    role: CodeRole::Context,
+                });
+            }
+            PlainEvent::Change {
+                before: before_range,
+                after: after_range,
+            } => {
+                include_plain_mapping(&mut mapping.before, before, before_range);
+                include_plain_mapping(&mut mapping.after, after, after_range);
+                render_plain_change(
+                    &mut rows,
+                    &before[before_range.clone()],
+                    &after[after_range.clone()],
+                );
+            }
+        }
+    }
+
+    DiffWindow { mapping, rows }
+}
+
+fn include_plain_mapping(
+    mapping: &mut Option<Range<usize>>,
+    lines: &[PlainLine<'_>],
+    indices: &Range<usize>,
+) {
+    let Some(first) = lines.get(indices.start) else {
+        return;
+    };
+    let Some(last_index) = indices.end.checked_sub(1) else {
+        return;
+    };
+    let Some(last) = lines.get(last_index) else {
+        return;
+    };
+    let covered = first.number..last.number + 1;
+
+    let Some(mapping) = mapping else {
+        *mapping = Some(covered);
+        return;
+    };
+    mapping.start = mapping.start.min(covered.start);
+    mapping.end = mapping.end.max(covered.end);
+}
+
+fn render_plain_change(rows: &mut Vec<DiffRow>, before: &[PlainLine<'_>], after: &[PlainLine<'_>]) {
+    let paired = before.len().min(after.len());
+    for index in 0..paired {
+        let before_line = before[index];
+        let after_line = after[index];
+        let (before, after) = if before_line.text == after_line.text {
+            (
+                plain_code_line(before_line, DiffMark::Removed),
+                plain_code_line(after_line, DiffMark::Added),
+            )
+        } else {
+            let (before_spans, after_spans) =
+                aligned_text_spans(before_line.text, after_line.text, SyntaxClass::Plain);
+            (
+                CodeLine {
+                    number: before_line.number,
+                    spans: before_spans,
+                },
+                CodeLine {
+                    number: after_line.number,
+                    spans: after_spans,
+                },
+            )
+        };
+        rows.push(DiffRow::Linewise {
+            before: Some(before),
+            after: Some(after),
+        });
+        if before_line.ending != after_line.ending {
+            rows.push(DiffRow::LineEnding {
+                before: Some(before_line.ending),
+                after: Some(after_line.ending),
+            });
+        }
+    }
+    for line in &before[paired..] {
+        rows.push(DiffRow::Linewise {
+            before: Some(plain_code_line(*line, DiffMark::Removed)),
+            after: None,
+        });
+        if line.ending == LineEnding::Missing {
+            rows.push(DiffRow::LineEnding {
+                before: Some(line.ending),
+                after: None,
+            });
+        }
+    }
+    for line in &after[paired..] {
+        rows.push(DiffRow::Linewise {
+            before: None,
+            after: Some(plain_code_line(*line, DiffMark::Added)),
+        });
+        if line.ending == LineEnding::Missing {
+            rows.push(DiffRow::LineEnding {
+                before: None,
+                after: Some(line.ending),
+            });
+        }
+    }
+}
+
+fn plain_code_line(line: PlainLine<'_>, mark: DiffMark) -> CodeLine {
+    let mut spans = Vec::new();
+    push_code_span(&mut spans, line.text, SyntaxClass::Plain, mark);
+    CodeLine {
+        number: line.number,
+        spans,
+    }
 }
 
 /// One-to-one top-level syntax correspondence; impossible empty pairs are unrepresentable.
@@ -380,15 +827,20 @@ fn plan_move_window(
         before: Some(before.lines.start),
         after: first,
     }];
-    if !preview.is_empty() || last.is_some() {
-        let before_range = before.lines.start + 1..before.lines.end.saturating_sub(1);
-        let after_range = after.lines.start + 1..after.lines.end.saturating_sub(1);
-        if !before_range.is_empty() || !after_range.is_empty() {
-            rows.push(DiffRow::Elision(LineMapping {
-                before: Some(before_range),
-                after: Some(after_range),
-            }));
-        }
+    let before_range = before.lines.start + 1..before.lines.end.saturating_sub(1);
+    let after_range = after.lines.start + 1..after.lines.end.saturating_sub(1);
+    // A one-line fold saves no space; keep its present-world context instead.
+    if preview.len() == 1 {
+        let line = preview.pop().expect("one preview line remains");
+        rows.push(DiffRow::Code {
+            line,
+            role: CodeRole::Context,
+        });
+    } else if !preview.is_empty() {
+        rows.push(DiffRow::Elision(LineMapping {
+            before: Some(before_range),
+            after: Some(after_range),
+        }));
     }
     if let Some(last) = last {
         rows.push(DiffRow::Moved {
@@ -751,6 +1203,12 @@ fn abbreviate_rows(rows: Vec<DiffRow>) -> Vec<DiffRow> {
             index += 1;
         }
         let omitted = &rows[start..index];
+        // The ellipsis would occupy the same row while hiding useful context.
+        if omitted.len() == 1 {
+            abbreviated.push(omitted[0].clone());
+            continue;
+        }
+
         let after_start = omitted.iter().filter_map(row_after_line).min();
         let after_end = omitted
             .iter()
@@ -771,6 +1229,7 @@ fn row_after_line(row: &DiffRow) -> Option<usize> {
         DiffRow::Linewise { before, after } => {
             after.as_ref().or(before.as_ref()).map(|line| line.number)
         }
+        DiffRow::LineEnding { .. } => None,
         DiffRow::Moved { after, .. } => Some(after.number),
         DiffRow::Wordwise(word) => word.after_line,
         DiffRow::Elision(mapping) => mapping.after.as_ref().map(|range| range.start),
@@ -1269,6 +1728,30 @@ mod tests {
     }
 
     #[test]
+    fn one_context_line_between_edits_stays_visible() {
+        let before = "fn run() {\n    before_one();\n\n    before_two();\n}\n";
+        let after = "fn run() {\n    after_one();\n\n    after_two();\n}\n";
+        let diff = diff_file("src/run.rs", before, after).expect("source must parse");
+        let window = window_containing(&diff, "fn run");
+
+        assert!(
+            window
+                .rows
+                .iter()
+                .all(|row| !matches!(row, DiffRow::Elision(_)))
+        );
+        assert!(window.rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    line,
+                    role: CodeRole::Context,
+                } if line.number == 3 && line_text(line).is_empty()
+            )
+        }));
+    }
+
+    #[test]
     fn move_window_lives_in_the_present_and_elides_its_unchanged_body() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
         let window = window_containing(&diff, "fn cache_key");
@@ -1302,6 +1785,30 @@ mod tests {
         };
         assert_eq!(after.number, 43);
         assert_eq!(line_text(after), "}");
+    }
+
+    #[test]
+    fn moved_definition_keeps_its_single_body_line_visible() {
+        let before = "fn first() {\n    first_body();\n}\n\nfn second() {\n    second_body();\n}\n";
+        let after = "fn second() {\n    second_body();\n}\n\nfn first() {\n    first_body();\n}\n";
+        let diff = diff_file("src/run.rs", before, after).expect("source must parse");
+        let moved = diff
+            .windows
+            .iter()
+            .find(|window| matches!(window.rows.first(), Some(DiffRow::Moved { .. })))
+            .expect("one definition must be presented as moved");
+
+        assert!(matches!(
+            moved.rows.as_slice(),
+            [
+                DiffRow::Moved { .. },
+                DiffRow::Code {
+                    role: CodeRole::Context,
+                    ..
+                },
+                DiffRow::Moved { .. }
+            ]
+        ));
     }
 
     #[test]
@@ -1429,6 +1936,214 @@ mod tests {
     }
 
     #[test]
+    fn unknown_syntax_uses_aligned_plain_lines() {
+        let before = "alpha\nold value\nomega\n";
+        let after = "alpha\nnew value\nomega\n";
+
+        let diff = diff_file("notes.txt", before, after).expect("plain diff cannot fail");
+
+        assert!(!diff.generated);
+        assert_eq!(diff.windows.len(), 1);
+        assert_eq!(diff.windows[0].mapping.before, Some(1..4));
+        assert_eq!(diff.windows[0].mapping.after, Some(1..4));
+        let changed = diff.windows[0].rows.iter().find_map(|row| {
+            let DiffRow::Linewise {
+                before: Some(before),
+                after: Some(after),
+            } = row
+            else {
+                return None;
+            };
+            Some((before, after))
+        });
+        let Some((before, after)) = changed else {
+            panic!("plain replacement needs both source sides");
+        };
+        assert_eq!((before.number, after.number), (2, 2));
+        assert!(
+            before
+                .spans
+                .iter()
+                .all(|span| span.syntax == SyntaxClass::Plain)
+        );
+        assert!(
+            before
+                .spans
+                .iter()
+                .any(|span| span.text == "old" && span.mark == DiffMark::Removed)
+        );
+        assert!(
+            after
+                .spans
+                .iter()
+                .any(|span| span.text == "new" && span.mark == DiffMark::Added)
+        );
+    }
+
+    #[test]
+    fn plain_insertions_and_deletions_keep_their_source_numbers() {
+        let before = "one\nremove\ntwo\nthree\n";
+        let after = "one\ntwo\nadd\nthree\n";
+
+        let diff = diff_file("notes", before, after).expect("plain diff cannot fail");
+        let rows = &diff.windows[0].rows;
+
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: Some(line),
+                    after: None,
+                } if line.number == 2 && line_text(line) == "remove"
+            )
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: None,
+                    after: Some(line),
+                } if line.number == 3 && line_text(line) == "add"
+            )
+        }));
+    }
+
+    #[test]
+    fn distant_plain_changes_become_focused_windows() {
+        let before = "one\nold two\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nold twelve\nthirteen\nfourteen\n";
+        let after = "one\nnew two\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nnew twelve\nthirteen\nfourteen\n";
+
+        let diff = diff_file("notes.md", before, after).expect("plain diff cannot fail");
+
+        assert_eq!(diff.windows.len(), 2);
+        assert_eq!(diff.windows[0].mapping.before, Some(1..6));
+        assert_eq!(diff.windows[0].mapping.after, Some(1..6));
+        assert_eq!(diff.windows[1].mapping.before, Some(9..15));
+        assert_eq!(diff.windows[1].mapping.after, Some(9..15));
+    }
+
+    #[test]
+    fn plain_hunks_do_not_hide_one_context_line() {
+        let before = "old first\none\ntwo\nthree\nfour\nfive\nsix\nseven\nold last\n";
+        let after = "new first\none\ntwo\nthree\nfour\nfive\nsix\nseven\nnew last\n";
+
+        let diff = diff_file("notes.txt", before, after).expect("plain diff cannot fail");
+
+        assert_eq!(diff.windows.len(), 1);
+        assert!(diff.windows[0].rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    line,
+                    role: CodeRole::Context,
+                } if line.number == 5 && line_text(line) == "four"
+            )
+        }));
+    }
+
+    #[test]
+    fn plain_diff_retains_end_of_file_newline_changes() {
+        let diff = diff_file("notes.txt", "same\n", "same").expect("plain diff cannot fail");
+
+        assert!(matches!(
+            diff.windows[0].rows.as_slice(),
+            [
+                DiffRow::Linewise {
+                    before: Some(before),
+                    after: Some(after),
+                },
+                DiffRow::LineEnding {
+                    before: Some(LineEnding::Lf),
+                    after: Some(LineEnding::Missing),
+                }
+            ] if before.number == 1
+                && after.number == 1
+                && before.spans.iter().all(|span| span.mark == DiffMark::Removed)
+                && after.spans.iter().all(|span| span.mark == DiffMark::Added)
+        ));
+    }
+
+    #[test]
+    fn generated_rust_is_flagged_and_forced_through_plain_diff() {
+        let before = "// @generated by build.rs\nuse crate::old;\n";
+        let after = "use crate::new;\n";
+
+        let diff = diff_file("src/bindings.rs", before, after).expect("plain diff cannot fail");
+        let marker_added =
+            diff_file("src/bindings.rs", after, before).expect("plain diff cannot fail");
+
+        assert!(diff.generated);
+        assert!(marker_added.generated);
+        assert!(
+            diff.windows[0]
+                .rows
+                .iter()
+                .any(|row| matches!(row, DiffRow::Linewise { .. }))
+        );
+        assert!(
+            diff.windows[0]
+                .rows
+                .iter()
+                .all(|row| !matches!(row, DiffRow::Wordwise(_)))
+        );
+    }
+
+    #[test]
+    fn generated_marker_is_exact_and_header_bounded() {
+        let mut below_header = "ordinary\n".repeat(20);
+        below_header.push_str("// @generated\n");
+
+        assert!(has_generated_marker("// @generated\ncontent\n"));
+        assert!(has_generated_marker(
+            "# This file is automatically @generated by Cargo.\n"
+        ));
+        assert!(has_generated_marker(
+            "// package @generated/client; file @generated\n"
+        ));
+        assert!(!has_generated_marker("// @Generated\ncontent\n"));
+        assert!(!has_generated_marker("// contact foo@generated.example\n"));
+        assert!(!has_generated_marker(
+            "import client from \"@generated/client\";\n"
+        ));
+        assert!(!has_generated_marker(
+            "const PACKAGE: &str = \"@generated\";\n"
+        ));
+        assert!(!has_generated_marker(&below_header));
+    }
+
+    #[test]
+    fn malformed_or_unprojected_rust_falls_back_to_plain_rows() {
+        for (before, after) in [
+            ("fn broken(value: u32 {}\n", "fn broken(value: u64 {}\n"),
+            ("// old license\n", "// new license\n"),
+            (
+                "// old license\nfn run() { old(); }\n",
+                "// new license\nfn run() { new(); }\n",
+            ),
+            ("fn run() { old(); }\n", "fn run() { new(); }"),
+        ] {
+            let diff = diff_file("src/lib.rs", before, after).expect("plain fallback cannot fail");
+
+            assert!(!diff.windows.is_empty());
+            assert!(
+                diff.windows
+                    .iter()
+                    .flat_map(|window| &window.rows)
+                    .any(|row| matches!(row, DiffRow::Linewise { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn identical_plain_source_has_no_review_work() {
+        let source = "plain text\nwith no grammar\n";
+
+        let diff = diff_file("README", source, source).expect("plain diff cannot fail");
+
+        assert!(diff.windows.is_empty());
+    }
+
+    #[test]
     fn large_anchorless_alignment_uses_the_bounded_fallback() {
         let before = vec!["same"; 200];
         let after = vec!["same"; 200];
@@ -1472,6 +2187,7 @@ mod tests {
             ]
             .concat()
             .contains(needle),
+            DiffRow::LineEnding { .. } => false,
             DiffRow::Elision(_) => false,
         })
     }
@@ -1489,6 +2205,7 @@ mod tests {
                     .any(|span| span.mark == DiffMark::Added && span.text.contains(needle))
             }),
             DiffRow::Wordwise(diff) => diff.added.contains(needle),
+            DiffRow::LineEnding { .. } => false,
             DiffRow::Elision(_) => false,
         })
     }
