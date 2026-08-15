@@ -1,4 +1,5 @@
 use crate::diff::FileDiff;
+pub use crate::diff::{MAX_REVISION_LINES, revision_line_count};
 
 /// Largest source revision Mig will load and expand into review rows.
 pub const MAX_REVISION_BYTES: u64 = 16 * 1024 * 1024;
@@ -42,6 +43,12 @@ pub enum FileNotice {
         after_bytes: Option<u64>,
         limit_bytes: u64,
     },
+    TooManyLines {
+        path: String,
+        before_lines: Option<usize>,
+        after_lines: Option<usize>,
+        limit_lines: usize,
+    },
 }
 
 impl FileNotice {
@@ -59,9 +66,23 @@ impl FileNotice {
         }
     }
 
+    pub fn too_many_lines(
+        path: impl Into<String>,
+        before_lines: Option<usize>,
+        after_lines: Option<usize>,
+        limit_lines: usize,
+    ) -> Self {
+        Self::TooManyLines {
+            path: path.into(),
+            before_lines,
+            after_lines,
+            limit_lines,
+        }
+    }
+
     pub fn path(&self) -> &str {
         match self {
-            Self::TooLarge { path, .. } => path,
+            Self::TooLarge { path, .. } | Self::TooManyLines { path, .. } => path,
         }
     }
 }

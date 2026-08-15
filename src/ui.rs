@@ -98,7 +98,7 @@ fn row_label_columns(row: &DiffRow) -> usize {
                 .unwrap_or(0);
             before.max(after)
         }
-        DiffRow::LineEnding { .. } => 0,
+        DiffRow::LineEnding { .. } | DiffRow::FileBoundary => 0,
         DiffRow::Moved { before, after } => {
             UnicodeWidthStr::width(moved_label(*before, after.number).as_str())
         }
@@ -615,10 +615,8 @@ fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Li
                 }
                 DiffRow::Wordwise(word) => rows.push(word_diff_line(word, gutter, width)),
                 DiffRow::Elision(_) => rows.push(elision_line(gutter, width)),
+                DiffRow::FileBoundary => rows.push(eof_guardian_line(gutter)),
             }
-        }
-        if hunk.ends_at_eof {
-            rows.push(eof_guardian_line(gutter));
         }
     }
     rows
@@ -658,6 +656,36 @@ fn compose_notice(notice: &FileNotice, width: usize) -> Vec<Line<'static>> {
                 }
                 details.push(Span::styled("current ", muted()));
                 details.push(Span::styled(format_bytes(*bytes), surrounding_style()));
+            }
+
+            vec![
+                Line::from(""),
+                clip_line(
+                    vec![Span::styled(heading, Style::default().fg(Palette::WARNING))],
+                    width,
+                ),
+                clip_line(details, width),
+            ]
+        }
+        FileNotice::TooManyLines {
+            before_lines,
+            after_lines,
+            limit_lines,
+            ..
+        } => {
+            let heading =
+                format!("  file not shown — exceeds the {limit_lines}-line per-revision limit");
+            let mut details = vec![Span::raw("  ")];
+            if let Some(lines) = before_lines {
+                details.push(Span::styled("before ", muted()));
+                details.push(Span::styled(format!("{lines} lines"), surrounding_style()));
+            }
+            if let Some(lines) = after_lines {
+                if before_lines.is_some() {
+                    details.push(Span::styled("  ·  ", muted()));
+                }
+                details.push(Span::styled("current ", muted()));
+                details.push(Span::styled(format!("{lines} lines"), surrounding_style()));
             }
 
             vec![
@@ -1236,7 +1264,7 @@ mod tests {
             "Response::new",
             "Response",
             |cell| {
-                cell.fg == softened_syntax_foreground(SyntaxClass::Identifier)
+                cell.fg == softened_syntax_foreground(SyntaxClass::Type)
                     && !cell.modifier.contains(Modifier::DIM)
             }
         ));
@@ -1301,7 +1329,6 @@ mod tests {
                     before: Some(1..2),
                     after: Some(1..2),
                 },
-                ends_at_eof: false,
                 rows: vec![
                     DiffRow::Code {
                         line: line(2),
@@ -1624,6 +1651,23 @@ mod tests {
             "assets/large.txt",
             |cell| cell.fg == Palette::PATH && cell.modifier.contains(Modifier::BOLD)
         ));
+    }
+
+    #[test]
+    fn line_dense_review_explains_the_projection_limit() {
+        let notice =
+            FileNotice::too_many_lines("generated/dense.txt", Some(1), Some(100_001), 100_000);
+        let mut app = App::new(vec![FileReview::Notice(notice)]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render line-dense notice");
+
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("exceeds the 100000-line per-revision limit"));
+        assert!(screen.contains("before 1 lines  ·  current 100001 lines"));
     }
 
     #[test]

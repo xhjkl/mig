@@ -4,7 +4,9 @@ mod worktree;
 use crate::input::{BoundedBytes, OpenFile};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use mig::review::{FileNotice, FileReview, MAX_REVISION_BYTES};
+use mig::review::{
+    FileNotice, FileReview, MAX_REVISION_BYTES, MAX_REVISION_LINES, revision_line_count,
+};
 use mig::{diff::diff_file, ui};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "m",
     version,
-    about = "Review source changes with structural Rust diffs"
+    about = "Review source changes with syntax-aware diffs"
 )]
 struct Cli {
     /// Previous version; omit both paths to scan the current directory.
@@ -101,6 +103,17 @@ fn plan_file_pair(
         .with_context(|| format!("file is not UTF-8: {}", before.display()))?;
     let after_source = String::from_utf8(after_source)
         .with_context(|| format!("file is not UTF-8: {}", after.display()))?;
+    let before_lines = revision_line_count(&before_source);
+    let after_lines = revision_line_count(&after_source);
+    if before_lines > MAX_REVISION_LINES || after_lines > MAX_REVISION_LINES {
+        let notice = FileNotice::too_many_lines(
+            path,
+            Some(before_lines),
+            Some(after_lines),
+            MAX_REVISION_LINES,
+        );
+        return Ok(Some(FileReview::Notice(notice)));
+    }
     let diff = diff_file(&path, &before_source, &after_source)?;
     if diff.hunks.is_empty() {
         return Ok(None);
@@ -206,6 +219,35 @@ mod tests {
     }
 
     #[test]
+    fn line_dense_pair_stays_visible_as_a_notice() {
+        let directory = TempDir::new().expect("temporary directory");
+        let before = directory.path().join("before.txt");
+        let after = directory.path().join("after.txt");
+        fs::write(&before, b"before\n").expect("write before input");
+        fs::write(&after, "\n".repeat(MAX_REVISION_LINES + 1))
+            .expect("write line-dense after input");
+
+        let review = plan_file_pair(
+            &before,
+            &after,
+            Some(Path::new("dense.txt")),
+            MAX_REVISION_BYTES,
+        )
+        .expect("plan line-dense pair")
+        .expect("line-dense pair stays visible");
+
+        assert!(matches!(
+            review,
+            FileReview::Notice(FileNotice::TooManyLines {
+                path,
+                before_lines: Some(1),
+                after_lines: Some(lines),
+                limit_lines: MAX_REVISION_LINES,
+            }) if path == "dense.txt" && lines == MAX_REVISION_LINES + 1
+        ));
+    }
+
+    #[test]
     fn explicit_html_pair_keeps_a_whitespace_noisy_wrapped_tag_atomic() {
         let directory = TempDir::new().expect("temporary directory");
         let before_path = directory.path().join("before.html");
@@ -275,7 +317,12 @@ mod tests {
                         DiffRow::Code {
                             line,
                             role: CodeRole::Reflow,
-                        } if line.spans.iter().any(|span| span.text.contains(needle))
+                        } if line
+                            .spans
+                            .iter()
+                            .map(|span| span.text.as_str())
+                            .collect::<String>()
+                            .contains(needle)
                     )
                 })
                 .count();
@@ -284,10 +331,13 @@ mod tests {
                 let DiffRow::Linewise { before, after } = row else {
                     return false;
                 };
-                before
-                    .iter()
-                    .chain(after)
-                    .any(|line| line.spans.iter().any(|span| span.text.contains(needle)))
+                before.iter().chain(after).any(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        .contains(needle)
+                })
             }));
         }
     }

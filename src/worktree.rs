@@ -3,7 +3,9 @@ use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use gix::bstr::{BStr, BString, ByteSlice};
 use mig::diff::diff_file;
-use mig::review::{FileNotice, FileReview, MAX_REVISION_BYTES};
+use mig::review::{
+    FileNotice, FileReview, MAX_REVISION_BYTES, MAX_REVISION_LINES, revision_line_count,
+};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,6 +98,14 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
         if before == after {
             continue;
         }
+        let before_lines = before_bytes.map(|_| revision_line_count(&before));
+        let after_lines = after_bytes.map(|_| revision_line_count(&after));
+        if before_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
+            || after_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
+        {
+            reviews.push(complexity_review(&path, before_lines, after_lines));
+            continue;
+        }
 
         let label = path.to_string_lossy();
         let diff = diff_file(&label, &before, &after)?;
@@ -119,6 +129,16 @@ fn oversized_review(
 ) -> FileReview {
     let path = path.to_string_lossy().into_owned();
     let notice = FileNotice::too_large(path, before_bytes, after_bytes, limit);
+    FileReview::Notice(notice)
+}
+
+fn complexity_review(
+    path: &Path,
+    before_lines: Option<usize>,
+    after_lines: Option<usize>,
+) -> FileReview {
+    let path = path.to_string_lossy().into_owned();
+    let notice = FileNotice::too_many_lines(path, before_lines, after_lines, MAX_REVISION_LINES);
     FileReview::Notice(notice)
 }
 

@@ -1,11 +1,34 @@
-use crate::syntax::{Comment, Definition, Import, SourceLine, SyntaxFile, Token, parse_rust};
-use anyhow::Result;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::Hash;
+mod correspondence;
+mod plan;
+mod projection;
+mod source;
+
+use anyhow::{Result, bail};
 use std::ops::Range;
 use std::path::Path;
 
-pub use crate::syntax::SyntaxClass;
+pub use source::LineEnding;
+
+/// Largest physical-line arena expanded for one revision.
+pub const MAX_REVISION_LINES: usize = 100_000;
+
+/// Physical lines without allocating the source geometry they will later own.
+pub fn revision_line_count(source: &str) -> usize {
+    source.lines().count()
+}
+
+/// Coarse language syntax category understood by the terminal palette.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyntaxClass {
+    Plain,
+    Keyword,
+    Identifier,
+    Type,
+    Literal,
+    String,
+    Comment,
+    Punctuation,
+}
 
 /// Diff role layered over syntax styling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,14 +36,6 @@ pub enum DiffMark {
     Context,
     Removed,
     Added,
-}
-
-/// Concrete terminator shown when a literal line's ending itself changed.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum LineEnding {
-    Missing,
-    Lf,
-    CrLf,
 }
 
 /// Smallest independently styled slice of one displayed source line.
@@ -85,14 +100,14 @@ pub enum DiffRow {
     },
     Wordwise(WordDiff),
     Elision(LineCoverage),
+    /// Ordered sentinel that makes the displayed file boundary part of the row stream.
+    FileBoundary,
 }
 
 /// Bounded view into a file containing related, presentation-ready rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Hunk {
     pub coverage: LineCoverage,
-    /// Whether the displayed source side reaches its revision's final line.
-    pub ends_at_eof: bool,
     pub rows: Vec<DiffRow>,
 }
 
@@ -105,150 +120,41 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
 }
 
-/// Select syntax-aware Rust review when safe, otherwise plan an exact line review.
+/// Project both revisions, find graph correspondence, then plan a bounded review.
 pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     let generated = has_generated_marker(before) || has_generated_marker(after);
-    if generated || !is_rust_path(path) {
-        return Ok(diff_plain(path, before, after, generated));
-    }
-
-    diff_rust(path, before, after)
-}
-
-/// File boundary metadata retained after the planners discard full source lengths.
-fn mark_eof_hunks(hunks: &mut [Hunk], before_lines: usize, after_lines: usize) {
-    for hunk in hunks {
-        let endpoint = hunk
-            .coverage
-            .after
-            .as_ref()
-            .map(|coverage| (coverage, after_lines));
-        let endpoint = endpoint.or_else(|| {
-            hunk.coverage
-                .before
-                .as_ref()
-                .map(|coverage| (coverage, before_lines))
+    if before == after {
+        return Ok(FileDiff {
+            path: path.to_owned(),
+            generated,
+            hunks: Vec::new(),
         });
-        let Some((coverage, line_count)) = endpoint else {
-            continue;
-        };
-
-        let coverage_reaches_eof = coverage.end == line_count.saturating_add(1);
-        // Structural frames may add one blank source row beyond semantic coverage.
-        let visible_frame_reaches_eof = matches!(
-            hunk.rows.last(),
-            Some(DiffRow::Code { line, .. }) if line.number == line_count
-        );
-        hunk.ends_at_eof = coverage_reaches_eof || visible_frame_reaches_eof;
     }
-}
-
-/// Parse Rust, establish one-to-one syntax correspondence, and plan a unified review.
-fn diff_rust(path: &str, before: &str, after: &str) -> Result<FileDiff> {
-    let before_file = parse_rust(before)?;
-    let after_file = parse_rust(after)?;
-    if before_file.tree.root_node().has_error() || after_file.tree.root_node().has_error() {
-        return Ok(diff_plain(path, before, after, false));
+    let before_lines = revision_line_count(before);
+    let after_lines = revision_line_count(after);
+    if before_lines > MAX_REVISION_LINES || after_lines > MAX_REVISION_LINES {
+        bail!("source exceeds the {MAX_REVISION_LINES}-line per-revision projection limit");
     }
 
-    let matches = correspond(&before_file.definitions, &after_file.definitions);
-    let mut hunks = plan_structural_hunks(&before_file, &after_file, &matches);
-    // Unknown top-level forms must not disappear beside recognized structural edits.
-    if before != after
-        && (hunks.is_empty()
-            || !structural_projection_covers_plain_changes(
-                before,
-                after,
-                &before_file,
-                &after_file,
-            ))
+    let pair = projection::project_pair(Path::new(path), before, after, generated)?;
+    let correspondence = correspondence::correspond(&pair);
+    let (pair, correspondence) = if correspondence.requires_line_fallback
+        && pair.before.language != projection::Language::Lines
     {
-        return Ok(diff_plain(path, before, after, false));
-    }
-    mark_eof_hunks(&mut hunks, before_file.lines.len(), after_file.lines.len());
+        let pair =
+            projection::line_pair(before, after, projection::FallbackReason::SourceExactness);
+        let correspondence = correspondence::correspond(&pair);
+        (pair, correspondence)
+    } else {
+        (pair, correspondence)
+    };
 
+    let hunks = plan::plan_hunks(&pair, &correspondence);
     Ok(FileDiff {
         path: path.to_owned(),
-        generated: false,
+        generated,
         hunks,
     })
-}
-
-fn structural_projection_covers_plain_changes(
-    before: &str,
-    after: &str,
-    before_file: &SyntaxFile<'_>,
-    after_file: &SyntaxFile<'_>,
-) -> bool {
-    let before_lines = plain_lines(before);
-    let after_lines = plain_lines(after);
-    let before_keys = before_lines
-        .iter()
-        .map(|line| (line.text, line.ending))
-        .collect::<Vec<_>>();
-    let after_keys = after_lines
-        .iter()
-        .map(|line| (line.text, line.ending))
-        .collect::<Vec<_>>();
-    let matches = local_matches(&before_keys, &after_keys);
-    let events = plain_events(before_lines.len(), after_lines.len(), matches);
-
-    events.into_iter().all(|event| {
-        let PlainEvent::Change { before, after } = event else {
-            return true;
-        };
-        if plain_ranges_change_endings(&before, &after, &before_lines, &after_lines) {
-            return false;
-        }
-        plain_range_is_projected(before, &before_lines, before_file)
-            && plain_range_is_projected(after, &after_lines, after_file)
-    })
-}
-
-fn plain_ranges_change_endings(
-    before: &Range<usize>,
-    after: &Range<usize>,
-    before_lines: &[PlainLine<'_>],
-    after_lines: &[PlainLine<'_>],
-) -> bool {
-    let paired = before.len().min(after.len());
-    for index in 0..paired {
-        if before_lines[before.start + index].ending != after_lines[after.start + index].ending {
-            return true;
-        }
-    }
-    before_lines[before.start + paired..before.end]
-        .iter()
-        .chain(&after_lines[after.start + paired..after.end])
-        .any(|line| line.ending == LineEnding::Missing)
-}
-
-fn plain_range_is_projected(
-    indices: Range<usize>,
-    lines: &[PlainLine<'_>],
-    file: &SyntaxFile<'_>,
-) -> bool {
-    indices.into_iter().all(|index| {
-        let line = &lines[index];
-        line.text.trim().is_empty()
-            || file
-                .definitions
-                .iter()
-                .any(|definition| definition.lines.contains(&line.number))
-            || file.imports.iter().any(|import| import.line == line.number)
-    })
-}
-
-fn is_rust_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .is_some_and(|extension| extension == "rs")
-}
-
-fn is_html_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .is_some_and(|extension| extension == "html" || extension == "htm")
 }
 
 /// Conventional marker search is deliberately header-bounded and case-sensitive.
@@ -282,1996 +188,6 @@ fn is_generated_marker_line(line: &str) -> bool {
         });
         bounded_before && bounded_after
     })
-}
-
-const PLAIN_CONTEXT_LINES: usize = 3;
-
-/// One exact text record; terminators participate in matching and surface only when changed.
-#[derive(Clone, Copy)]
-struct PlainLine<'source> {
-    number: usize,
-    text: &'source str,
-    ending: LineEnding,
-    html_preserves_whitespace: bool,
-}
-
-/// Exact source keys plus side-local sentinels that keep wrapper blocks atomic.
-#[derive(Eq, Hash, PartialEq)]
-enum PlainKey<'source> {
-    Exact(&'source str, LineEnding),
-    ReservedBefore,
-    ReservedAfter,
-}
-
-/// Ordered exact-line correspondence before presentation expands changed gaps.
-enum PlainEvent {
-    Context {
-        before: usize,
-        after: usize,
-    },
-    Change {
-        before: Range<usize>,
-        after: Range<usize>,
-    },
-}
-
-/// Literal line fallback; new authored-HTML div wrappers get secondary child anchors.
-fn diff_plain(path: &str, before: &str, after: &str, generated: bool) -> FileDiff {
-    let mut before = plain_lines(before);
-    let mut after = plain_lines(after);
-    let align_html_indentation = !generated && is_html_path(path);
-    if align_html_indentation {
-        mark_html_whitespace_sensitive_lines(&mut before);
-        mark_html_whitespace_sensitive_lines(&mut after);
-    }
-    let (reserved_before, reserved_after) = if align_html_indentation {
-        html_wrapper_reservations(&before, &after)
-    } else {
-        (vec![false; before.len()], vec![false; after.len()])
-    };
-    let before_keys = before
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            if reserved_before[index] {
-                PlainKey::ReservedBefore
-            } else {
-                PlainKey::Exact(line.text, line.ending)
-            }
-        })
-        .collect::<Vec<_>>();
-    let after_keys = after
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            if reserved_after[index] {
-                PlainKey::ReservedAfter
-            } else {
-                PlainKey::Exact(line.text, line.ending)
-            }
-        })
-        .collect::<Vec<_>>();
-    let matches = local_matches(&before_keys, &after_keys);
-    let events = plain_events(before.len(), after.len(), matches);
-    let mut hunks = plan_plain_hunks(&before, &after, &events, align_html_indentation);
-    mark_eof_hunks(&mut hunks, before.len(), after.len());
-
-    FileDiff {
-        path: path.to_owned(),
-        generated,
-        hunks,
-    }
-}
-
-fn plain_lines(source: &str) -> Vec<PlainLine<'_>> {
-    if source.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for (index, byte) in source.bytes().enumerate() {
-        if byte != b'\n' {
-            continue;
-        }
-
-        let (text_end, ending) = if index > start && source.as_bytes()[index - 1] == b'\r' {
-            (index - 1, LineEnding::CrLf)
-        } else {
-            (index, LineEnding::Lf)
-        };
-        lines.push(PlainLine {
-            number: lines.len() + 1,
-            text: &source[start..text_end],
-            ending,
-            html_preserves_whitespace: false,
-        });
-        start = index + 1;
-    }
-    if start < source.len() {
-        lines.push(PlainLine {
-            number: lines.len() + 1,
-            text: &source[start..],
-            ending: LineEnding::Missing,
-            html_preserves_whitespace: false,
-        });
-    }
-    lines
-}
-
-fn plain_events(
-    before_len: usize,
-    after_len: usize,
-    matches: Vec<(usize, usize)>,
-) -> Vec<PlainEvent> {
-    let mut events = Vec::new();
-    let mut before_start = 0;
-    let mut after_start = 0;
-    for (before_end, after_end) in matches
-        .into_iter()
-        .chain(std::iter::once((before_len, after_len)))
-    {
-        if before_start < before_end || after_start < after_end {
-            events.push(PlainEvent::Change {
-                before: before_start..before_end,
-                after: after_start..after_end,
-            });
-        }
-        if before_end < before_len && after_end < after_len {
-            events.push(PlainEvent::Context {
-                before: before_end,
-                after: after_end,
-            });
-        }
-        before_start = before_end.saturating_add(1);
-        after_start = after_end.saturating_add(1);
-    }
-    events
-}
-
-/// Merge nearby changes using the same context radius on both sides.
-fn plan_plain_hunks(
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-    events: &[PlainEvent],
-    align_html_indentation: bool,
-) -> Vec<Hunk> {
-    let changes = events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, event)| matches!(event, PlainEvent::Change { .. }).then_some(index))
-        .collect::<Vec<_>>();
-    let Some(first) = changes.first().copied() else {
-        return Vec::new();
-    };
-
-    let mut hunks = Vec::new();
-    let mut group_start = first;
-    let mut group_end = first;
-    for change in changes.into_iter().skip(1) {
-        let separating_context = change.saturating_sub(group_end + 1);
-        // Keeping one otherwise-hidden line costs the same row as separating hunks.
-        if separating_context <= PLAIN_CONTEXT_LINES * 2 + 1 {
-            group_end = change;
-            continue;
-        }
-
-        hunks.push(plan_plain_hunk(
-            before,
-            after,
-            events,
-            group_start,
-            group_end,
-            align_html_indentation,
-        ));
-        group_start = change;
-        group_end = change;
-    }
-    hunks.push(plan_plain_hunk(
-        before,
-        after,
-        events,
-        group_start,
-        group_end,
-        align_html_indentation,
-    ));
-    hunks
-}
-
-fn plan_plain_hunk(
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-    events: &[PlainEvent],
-    first_change: usize,
-    last_change: usize,
-    align_html_indentation: bool,
-) -> Hunk {
-    let start = first_change.saturating_sub(PLAIN_CONTEXT_LINES);
-    let end = (last_change + PLAIN_CONTEXT_LINES + 1).min(events.len());
-    let events = &events[start..end];
-    let mut coverage = LineCoverage {
-        before: None,
-        after: None,
-    };
-    let mut rows = Vec::new();
-
-    for event in events {
-        match event {
-            PlainEvent::Context {
-                before: before_index,
-                after: after_index,
-            } => {
-                include_plain_coverage(
-                    &mut coverage.before,
-                    before,
-                    &(*before_index..*before_index + 1),
-                );
-                include_plain_coverage(
-                    &mut coverage.after,
-                    after,
-                    &(*after_index..*after_index + 1),
-                );
-                rows.push(DiffRow::Code {
-                    line: plain_code_line(after[*after_index], DiffMark::Context),
-                    role: CodeRole::Context,
-                });
-            }
-            PlainEvent::Change {
-                before: before_range,
-                after: after_range,
-            } => {
-                include_plain_coverage(&mut coverage.before, before, before_range);
-                include_plain_coverage(&mut coverage.after, after, after_range);
-                render_plain_change(
-                    &mut rows,
-                    &before[before_range.clone()],
-                    &after[after_range.clone()],
-                    align_html_indentation,
-                );
-            }
-        }
-    }
-
-    Hunk {
-        coverage,
-        ends_at_eof: false,
-        rows,
-    }
-}
-
-fn include_plain_coverage(
-    coverage: &mut Option<Range<usize>>,
-    lines: &[PlainLine<'_>],
-    indices: &Range<usize>,
-) {
-    let Some(first) = lines.get(indices.start) else {
-        return;
-    };
-    let Some(last_index) = indices.end.checked_sub(1) else {
-        return;
-    };
-    let Some(last) = lines.get(last_index) else {
-        return;
-    };
-    let covered = first.number..last.number + 1;
-
-    let Some(coverage) = coverage else {
-        *coverage = Some(covered);
-        return;
-    };
-    coverage.start = coverage.start.min(covered.start);
-    coverage.end = coverage.end.max(covered.end);
-}
-
-/// Preserve reindented HTML descendants before ordinal pairing fills unmatched gaps.
-fn render_plain_change(
-    rows: &mut Vec<DiffRow>,
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-    align_html_indentation: bool,
-) {
-    if !align_html_indentation {
-        render_plain_change_segment(rows, before, after);
-        return;
-    }
-
-    let matches = html_indentation_matches(before, after);
-    if matches.is_empty() {
-        render_plain_change_segment(rows, before, after);
-        return;
-    }
-
-    let mut before_start = 0;
-    let mut after_start = 0;
-    for (before_index, after_index) in matches {
-        render_plain_change_segment(
-            rows,
-            &before[before_start..before_index],
-            &after[after_start..after_index],
-        );
-
-        let before_line = before[before_index];
-        let after_line = after[after_index];
-        let role = if before_line.text == after_line.text {
-            CodeRole::Context
-        } else {
-            CodeRole::Reflow
-        };
-        rows.push(DiffRow::Code {
-            line: plain_code_line(after_line, DiffMark::Context),
-            role,
-        });
-        before_start = before_index + 1;
-        after_start = after_index + 1;
-    }
-    render_plain_change_segment(rows, &before[before_start..], &after[after_start..]);
-}
-
-/// One complete HTML tag whose lines can move together beneath a new parent.
-struct HtmlTagBlock<'source> {
-    lines: Range<usize>,
-    key: Vec<(&'source str, LineEnding)>,
-}
-
-/// Complete tag blocks inside a new div wrapper supply HTML reflow anchors.
-fn html_indentation_matches(
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-) -> Vec<(usize, usize)> {
-    html_wrapper_block_matches(before, after)
-        .into_iter()
-        .flat_map(|(before, after)| before.zip(after))
-        .collect()
-}
-
-/// A wrapper and child stay atomic until indentation-insensitive correspondence.
-fn html_wrapper_reservations(
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-) -> (Vec<bool>, Vec<bool>) {
-    let mut reserved_before = vec![false; before.len()];
-    let mut reserved_after = vec![false; after.len()];
-    for (before_block, after_block) in html_wrapper_block_matches(before, after) {
-        let Some(opening) = after_block.start.checked_sub(1) else {
-            continue;
-        };
-        if opening >= reserved_after.len() || after_block.end >= reserved_after.len() {
-            continue;
-        }
-
-        reserved_before[before_block].fill(true);
-        reserved_after[opening..=after_block.end].fill(true);
-    }
-    (reserved_before, reserved_after)
-}
-
-fn html_wrapper_block_matches(
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-) -> Vec<(Range<usize>, Range<usize>)> {
-    let before_blocks = html_tag_blocks(before);
-    let after_blocks = html_tag_blocks(after);
-    let before_values = before_blocks
-        .iter()
-        .map(|block| block.key.as_slice())
-        .collect::<Vec<_>>();
-    let after_values = after_blocks
-        .iter()
-        .map(|block| block.key.as_slice())
-        .collect::<Vec<_>>();
-    let matches = local_matches(&before_values, &after_values);
-
-    matches
-        .into_iter()
-        .filter(|(before_index, after_index)| {
-            !html_div_wraps(before, &before_blocks[*before_index].lines)
-                && html_div_wraps(after, &after_blocks[*after_index].lines)
-        })
-        .map(|(before_index, after_index)| {
-            (
-                before_blocks[before_index].lines.clone(),
-                after_blocks[after_index].lines.clone(),
-            )
-        })
-        .collect()
-}
-
-/// Tokenization rule for a context where indentation can be source data.
-#[derive(Clone, Copy)]
-enum HtmlWhitespaceMode {
-    Normal,
-    Raw,
-    Plaintext,
-}
-
-/// Named HTML context intentionally excluded from indentation correspondence.
-#[derive(Clone, Copy)]
-struct HtmlWhitespaceElement {
-    name: &'static str,
-    mode: HtmlWhitespaceMode,
-}
-
-/// Conservative HTML contexts whose leading whitespace may affect source meaning.
-const HTML_WHITESPACE_SENSITIVE_ELEMENTS: &[HtmlWhitespaceElement] = &[
-    HtmlWhitespaceElement {
-        name: "iframe",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "listing",
-        mode: HtmlWhitespaceMode::Normal,
-    },
-    HtmlWhitespaceElement {
-        name: "noembed",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "noframes",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "noscript",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "plaintext",
-        mode: HtmlWhitespaceMode::Plaintext,
-    },
-    HtmlWhitespaceElement {
-        name: "pre",
-        mode: HtmlWhitespaceMode::Normal,
-    },
-    HtmlWhitespaceElement {
-        name: "script",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "style",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "textarea",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "title",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-    HtmlWhitespaceElement {
-        name: "xmp",
-        mode: HtmlWhitespaceMode::Raw,
-    },
-];
-
-/// Normal-markup tokenizer state retained across preformatted source lines.
-#[derive(Clone, Copy, Default)]
-struct HtmlMarkupState {
-    in_comment: bool,
-    in_tag: bool,
-    quote: Option<u8>,
-    raw_child: Option<HtmlRawChildState>,
-}
-
-/// Raw child nested inside otherwise normal preformatted markup.
-#[derive(Clone, Copy)]
-enum HtmlRawChildState {
-    Opening {
-        element: HtmlWhitespaceElement,
-        quote: Option<u8>,
-    },
-    Content(HtmlWhitespaceElement),
-}
-
-/// Whitespace-sensitive scanner state retained across source lines.
-#[derive(Clone, Copy)]
-enum HtmlWhitespaceState {
-    Opening {
-        element: HtmlWhitespaceElement,
-        quote: Option<u8>,
-    },
-    Content {
-        element: HtmlWhitespaceElement,
-        markup: HtmlMarkupState,
-    },
-}
-
-/// Raw and preformatted bodies must keep literal indentation semantics.
-fn mark_html_whitespace_sensitive_lines(lines: &mut [PlainLine<'_>]) {
-    let mut active = None;
-    for line in lines {
-        let mut cursor = 0;
-        loop {
-            let Some(state) = active else {
-                let opening = HTML_WHITESPACE_SENSITIVE_ELEMENTS
-                    .iter()
-                    .filter_map(|element| {
-                        html_tag_position(line.text, element.name, false, cursor)
-                            .map(|position| (position, *element))
-                    })
-                    .min_by_key(|(position, _)| *position);
-                let Some((position, element)) = opening else {
-                    break;
-                };
-
-                line.html_preserves_whitespace = true;
-                cursor = position + element.name.len() + 1;
-                active = Some(HtmlWhitespaceState::Opening {
-                    element,
-                    quote: None,
-                });
-                continue;
-            };
-
-            line.html_preserves_whitespace = true;
-            match state {
-                HtmlWhitespaceState::Opening { element, mut quote } => {
-                    let end = html_opening_tag_end(line.text, cursor, &mut quote);
-                    let Some(end) = end else {
-                        active = Some(HtmlWhitespaceState::Opening { element, quote });
-                        break;
-                    };
-                    active = Some(HtmlWhitespaceState::Content {
-                        element,
-                        markup: HtmlMarkupState::default(),
-                    });
-                    cursor = end + 1;
-                }
-                HtmlWhitespaceState::Content {
-                    element,
-                    mut markup,
-                } => {
-                    if matches!(element.mode, HtmlWhitespaceMode::Plaintext) {
-                        active = Some(state);
-                        break;
-                    }
-                    let closing = match element.mode {
-                        HtmlWhitespaceMode::Normal => html_normal_closing_tag_position(
-                            line.text,
-                            element.name,
-                            cursor,
-                            &mut markup,
-                        ),
-                        HtmlWhitespaceMode::Raw => {
-                            html_tag_position(line.text, element.name, true, cursor)
-                        }
-                        HtmlWhitespaceMode::Plaintext => unreachable!(),
-                    };
-                    let Some(closing) = closing else {
-                        active = Some(HtmlWhitespaceState::Content { element, markup });
-                        break;
-                    };
-                    active = None;
-                    cursor = closing + element.name.len() + 2;
-                }
-            }
-        }
-    }
-}
-
-/// End of an opening tag, excluding greater-than signs inside quoted attributes.
-fn html_opening_tag_end(text: &str, start: usize, quote: &mut Option<u8>) -> Option<usize> {
-    for (index, byte) in text.bytes().enumerate().skip(start) {
-        if let Some(active_quote) = quote {
-            if byte == *active_quote {
-                *quote = None;
-            }
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            *quote = Some(byte);
-            continue;
-        }
-        if byte == b'>' {
-            return Some(index);
-        }
-    }
-    None
-}
-
-/// Real normal-element close, excluding attributes, comments, and raw children.
-fn html_normal_closing_tag_position(
-    text: &str,
-    name: &str,
-    start: usize,
-    state: &mut HtmlMarkupState,
-) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut index = start;
-    while index < bytes.len() {
-        if let Some(raw_child) = state.raw_child {
-            match raw_child {
-                HtmlRawChildState::Opening { element, mut quote } => {
-                    let end = html_opening_tag_end(text, index, &mut quote);
-                    let Some(end) = end else {
-                        state.raw_child = Some(HtmlRawChildState::Opening { element, quote });
-                        return None;
-                    };
-                    state.raw_child = Some(HtmlRawChildState::Content(element));
-                    index = end + 1;
-                    continue;
-                }
-                HtmlRawChildState::Content(element) => {
-                    if matches!(element.mode, HtmlWhitespaceMode::Plaintext) {
-                        return None;
-                    }
-                    let closing = html_tag_position(text, element.name, true, index);
-                    let closing = closing?;
-                    state.raw_child = None;
-                    index = closing + element.name.len() + 2;
-                    continue;
-                }
-            }
-        }
-        if state.in_comment {
-            if bytes[index..].starts_with(b"-->") {
-                state.in_comment = false;
-                index += 3;
-                continue;
-            }
-            index += 1;
-            continue;
-        }
-        if state.in_tag {
-            if let Some(quote) = state.quote {
-                if bytes[index] == quote {
-                    state.quote = None;
-                }
-                index += 1;
-                continue;
-            }
-            if matches!(bytes[index], b'\'' | b'"') {
-                state.quote = Some(bytes[index]);
-                index += 1;
-                continue;
-            }
-            if bytes[index] == b'>' {
-                state.in_tag = false;
-            }
-            index += 1;
-            continue;
-        }
-        if bytes[index..].starts_with(b"<!--") {
-            state.in_comment = true;
-            index += 4;
-            continue;
-        }
-        if html_tag_at(text, name, true, index) {
-            return Some(index);
-        }
-        let raw_child = HTML_WHITESPACE_SENSITIVE_ELEMENTS
-            .iter()
-            .copied()
-            .find(|element| {
-                !matches!(element.mode, HtmlWhitespaceMode::Normal)
-                    && html_tag_at(text, element.name, false, index)
-            });
-        if let Some(element) = raw_child {
-            state.raw_child = Some(HtmlRawChildState::Opening {
-                element,
-                quote: None,
-            });
-            index += element.name.len() + 1;
-            continue;
-        }
-        if bytes[index] == b'<'
-            && bytes.get(index + 1).is_some_and(|byte| {
-                byte.is_ascii_alphabetic() || matches!(byte, b'/' | b'!' | b'?')
-            })
-        {
-            state.in_tag = true;
-        }
-        index += 1;
-    }
-    None
-}
-
-fn html_tag_position(text: &str, name: &str, closing: bool, start: usize) -> Option<usize> {
-    let text = text.get(start..)?;
-    for (relative, _) in text.match_indices('<') {
-        let position = start + relative;
-        if html_tag_at(text, name, closing, relative) {
-            return Some(position);
-        }
-    }
-    None
-}
-
-fn html_tag_at(text: &str, name: &str, closing: bool, position: usize) -> bool {
-    if text.as_bytes().get(position) != Some(&b'<') {
-        return false;
-    }
-    let slash = usize::from(closing);
-    if closing && text.as_bytes().get(position + 1) != Some(&b'/') {
-        return false;
-    }
-    if !closing && text.as_bytes().get(position + 1) == Some(&b'/') {
-        return false;
-    }
-
-    let name_start = position + 1 + slash;
-    let name_end = name_start + name.len();
-    let Some(candidate) = text.get(name_start..name_end) else {
-        return false;
-    };
-    if !candidate.eq_ignore_ascii_case(name) {
-        return false;
-    }
-    let boundary = text.get(name_end..).and_then(|tail| tail.chars().next());
-    boundary.is_none_or(|character| {
-        character == '>' || character == '/' || character.is_ascii_whitespace()
-    })
-}
-
-fn html_tag_blocks<'source>(lines: &[PlainLine<'source>]) -> Vec<HtmlTagBlock<'source>> {
-    let mut blocks = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        if lines[index].html_preserves_whitespace {
-            index += 1;
-            continue;
-        }
-        let text = lines[index].text.trim_start_matches([' ', '\t']);
-        if !text.starts_with('<') {
-            index += 1;
-            continue;
-        }
-
-        let start = index;
-        let mut key = Vec::new();
-        let mut quote = None;
-        let mut quote_crossed_line = false;
-        let mut opening_count = 0;
-        let complete = loop {
-            let line = lines[index];
-            if line.html_preserves_whitespace {
-                index += 1;
-                break false;
-            }
-            let text = line.text.trim_start_matches([' ', '\t']);
-            // Raw/preformatted contexts were excluded, so edge space is formatting here.
-            let key_text = text.trim_end_matches([' ', '\t']);
-            key.push((key_text, line.ending));
-            let mut last_unquoted = None;
-            for character in text.chars() {
-                if let Some(active_quote) = quote {
-                    if character == active_quote {
-                        quote = None;
-                    }
-                    continue;
-                }
-                if matches!(character, '\'' | '"') {
-                    quote = Some(character);
-                    continue;
-                }
-                if character == '<' {
-                    opening_count += 1;
-                }
-                if !matches!(character, ' ' | '\t') {
-                    last_unquoted = Some(character);
-                }
-            }
-            if quote.is_some() {
-                quote_crossed_line = true;
-            }
-            let complete = quote.is_none() && last_unquoted == Some('>');
-            index += 1;
-            if complete || index == lines.len() {
-                break complete;
-            }
-        };
-        if !complete || quote_crossed_line || opening_count != 1 {
-            continue;
-        }
-
-        blocks.push(HtmlTagBlock {
-            lines: start..index,
-            key,
-        });
-    }
-    blocks
-}
-
-fn html_div_wraps(lines: &[PlainLine<'_>], block: &Range<usize>) -> bool {
-    let Some(opening_index) = block.start.checked_sub(1) else {
-        return false;
-    };
-    let Some(opening) = lines.get(opening_index) else {
-        return false;
-    };
-    let Some(closing) = lines.get(block.end) else {
-        return false;
-    };
-    let opening = opening.text.trim_start_matches([' ', '\t']);
-    let closing = closing.text.trim_start_matches([' ', '\t']);
-    let Some(name) = opening.get(1..4) else {
-        return false;
-    };
-    let boundary = opening[4..].chars().next();
-
-    name.eq_ignore_ascii_case("div")
-        && boundary.is_some_and(|character| character == '>' || character.is_ascii_whitespace())
-        && closing.eq_ignore_ascii_case("</div>")
-}
-
-fn render_plain_change_segment(
-    rows: &mut Vec<DiffRow>,
-    before: &[PlainLine<'_>],
-    after: &[PlainLine<'_>],
-) {
-    let paired = before.len().min(after.len());
-    for index in 0..paired {
-        let before_line = before[index];
-        let after_line = after[index];
-        let (before, after) = if before_line.text == after_line.text {
-            (
-                plain_code_line(before_line, DiffMark::Removed),
-                plain_code_line(after_line, DiffMark::Added),
-            )
-        } else {
-            let (before_spans, after_spans) =
-                aligned_text_spans(before_line.text, after_line.text, SyntaxClass::Plain);
-            (
-                CodeLine {
-                    number: before_line.number,
-                    spans: before_spans,
-                },
-                CodeLine {
-                    number: after_line.number,
-                    spans: after_spans,
-                },
-            )
-        };
-        rows.push(DiffRow::Linewise {
-            before: Some(before),
-            after: Some(after),
-        });
-        if before_line.ending != after_line.ending {
-            rows.push(DiffRow::LineEnding {
-                before: Some(before_line.ending),
-                after: Some(after_line.ending),
-            });
-        }
-    }
-    for line in &before[paired..] {
-        rows.push(DiffRow::Linewise {
-            before: Some(plain_code_line(*line, DiffMark::Removed)),
-            after: None,
-        });
-        if line.ending == LineEnding::Missing {
-            rows.push(DiffRow::LineEnding {
-                before: Some(line.ending),
-                after: None,
-            });
-        }
-    }
-    for line in &after[paired..] {
-        rows.push(DiffRow::Linewise {
-            before: None,
-            after: Some(plain_code_line(*line, DiffMark::Added)),
-        });
-        if line.ending == LineEnding::Missing {
-            rows.push(DiffRow::LineEnding {
-                before: None,
-                after: Some(line.ending),
-            });
-        }
-    }
-}
-
-fn plain_code_line(line: PlainLine<'_>, mark: DiffMark) -> CodeLine {
-    let mut spans = Vec::new();
-    push_code_span(&mut spans, line.text, SyntaxClass::Plain, mark);
-    CodeLine {
-        number: line.number,
-        spans,
-    }
-}
-
-/// One-to-one top-level syntax correspondence; impossible empty pairs are unrepresentable.
-#[derive(Clone, Copy)]
-enum DefinitionMatch<'a> {
-    Matched {
-        before: &'a Definition<'a>,
-        after: &'a Definition<'a>,
-    },
-    Removed(&'a Definition<'a>),
-    Added(&'a Definition<'a>),
-}
-
-fn correspond<'a>(
-    before: &'a [Definition<'a>],
-    after: &'a [Definition<'a>],
-) -> Vec<DefinitionMatch<'a>> {
-    let mut after_by_key = HashMap::<(&str, &str), VecDeque<usize>>::new();
-    for (index, definition) in after.iter().enumerate() {
-        after_by_key
-            .entry((definition.kind, definition.name))
-            .or_default()
-            .push_back(index);
-    }
-
-    let mut matched_after = vec![false; after.len()];
-    let mut matches = Vec::with_capacity(before.len().max(after.len()));
-    for definition in before {
-        let candidates = after_by_key.get_mut(&(definition.kind, definition.name));
-        let index = candidates.and_then(|candidates| {
-            // Exact occurrences anchor duplicate names before local order breaks ties.
-            let exact = candidates
-                .iter()
-                .position(|index| after[*index].full_fingerprint == definition.full_fingerprint);
-            exact
-                .and_then(|position| candidates.remove(position))
-                .or_else(|| candidates.pop_front())
-        });
-        let Some(index) = index else {
-            matches.push(DefinitionMatch::Removed(definition));
-            continue;
-        };
-
-        matched_after[index] = true;
-        matches.push(DefinitionMatch::Matched {
-            before: definition,
-            after: &after[index],
-        });
-    }
-    matches.extend(
-        after
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !matched_after[*index])
-            .map(|(_, definition)| DefinitionMatch::Added(definition)),
-    );
-    matches
-}
-
-/// Sole owner of review grouping, ordering, row treatments, and elision.
-fn plan_structural_hunks(
-    before: &SyntaxFile<'_>,
-    after: &SyntaxFile<'_>,
-    matches: &[DefinitionMatch<'_>],
-) -> Vec<Hunk> {
-    let moves = moved_definitions(matches);
-    let moved_starts = moves
-        .iter()
-        .map(|(before, _)| before.lines.start)
-        .collect::<HashSet<_>>();
-
-    let mut definitions = plan_definition_hunks(before, after, matches);
-    definitions.sort_by_key(|(line, _)| *line);
-
-    let mut hunks = definitions
-        .into_iter()
-        .map(|(_, hunk)| hunk)
-        .collect::<Vec<_>>();
-    hunks.extend(
-        moves
-            .into_iter()
-            .map(|(before_definition, after_definition)| {
-                plan_move_hunk(after, before_definition, after_definition)
-            }),
-    );
-    hunks.extend(plan_import_hunks(&before.imports, &after.imports));
-    hunks.extend(plan_reflow_hunks(before, after, matches, &moved_starts));
-    hunks
-}
-
-fn plan_definition_hunks(
-    before_file: &SyntaxFile<'_>,
-    after_file: &SyntaxFile<'_>,
-    matches: &[DefinitionMatch<'_>],
-) -> Vec<(usize, Hunk)> {
-    let mut hunks = Vec::new();
-    for matched in matches {
-        match *matched {
-            DefinitionMatch::Matched { before, after } => {
-                let comments = comment_edits(before, after);
-                if definition_source(before_file, before) == definition_source(after_file, after) {
-                    continue;
-                }
-                if !before.has_error
-                    && !after.has_error
-                    && before.code_fingerprint == after.code_fingerprint
-                {
-                    hunks.extend(comments.into_iter().map(|comment| {
-                        let line = comment_line(&comment);
-                        (line, plan_comment_hunk(comment))
-                    }));
-                    continue;
-                }
-
-                let correspondence =
-                    align_tokens(&before.tokens, &after.tokens, |token| !token.is_comment);
-                let before_context = correspondence.before_indices();
-                let after_context = correspondence.after_indices();
-                let before_lines = render_definition(
-                    before_file,
-                    before,
-                    &before_context,
-                    DiffMark::Removed,
-                    true,
-                );
-                let after_lines =
-                    render_definition(after_file, after, &after_context, DiffMark::Added, true);
-                let boundaries = blank_boundaries(after_file, after);
-                let coverage = LineCoverage {
-                    before: Some(before.lines.clone()),
-                    after: Some(after.lines.clone()),
-                };
-                hunks.push((
-                    before.lines.start,
-                    plan_definition_hunk(coverage, before_lines, after_lines, boundaries, comments),
-                ));
-            }
-            DefinitionMatch::Removed(definition) => {
-                let lines = render_definition(
-                    before_file,
-                    definition,
-                    &HashSet::new(),
-                    DiffMark::Removed,
-                    false,
-                );
-                let boundaries = blank_boundaries(before_file, definition);
-                let coverage = LineCoverage {
-                    before: Some(definition.lines.clone()),
-                    after: None,
-                };
-                hunks.push((
-                    definition.lines.start,
-                    plan_definition_hunk(coverage, lines, Vec::new(), boundaries, Vec::new()),
-                ));
-            }
-            DefinitionMatch::Added(definition) => {
-                let lines = render_definition(
-                    after_file,
-                    definition,
-                    &HashSet::new(),
-                    DiffMark::Added,
-                    false,
-                );
-                let boundaries = blank_boundaries(after_file, definition);
-                let coverage = LineCoverage {
-                    before: None,
-                    after: Some(definition.lines.clone()),
-                };
-                hunks.push((
-                    definition.lines.start,
-                    plan_definition_hunk(coverage, Vec::new(), lines, boundaries, Vec::new()),
-                ));
-            }
-        }
-    }
-    hunks
-}
-
-fn plan_definition_hunk(
-    coverage: LineCoverage,
-    before: Vec<CodeLine>,
-    after: Vec<CodeLine>,
-    boundaries: (Option<CodeLine>, Option<CodeLine>),
-    commentary: Vec<CommentEdit>,
-) -> Hunk {
-    let mut rows = Vec::new();
-    if let Some(line) = boundaries.0 {
-        rows.push(DiffRow::Code {
-            line,
-            role: CodeRole::Context,
-        });
-    }
-
-    let present = if after.is_empty() { before } else { after };
-    let mut commentary = commentary.into_iter().peekable();
-    for line in present {
-        while commentary
-            .peek()
-            .is_some_and(|commentary| comment_line(commentary) < line.number)
-        {
-            let commentary = commentary.next().expect("peeked commentary");
-            rows.push(DiffRow::Linewise {
-                before: commentary.before,
-                after: commentary.after,
-            });
-        }
-        let role = if line.spans.iter().any(|span| span.mark != DiffMark::Context) {
-            CodeRole::Inline
-        } else {
-            CodeRole::Context
-        };
-        rows.push(DiffRow::Code { line, role });
-    }
-    for commentary in commentary {
-        rows.push(DiffRow::Linewise {
-            before: commentary.before,
-            after: commentary.after,
-        });
-    }
-    if let Some(line) = boundaries.1 {
-        rows.push(DiffRow::Code {
-            line,
-            role: CodeRole::Context,
-        });
-    }
-
-    Hunk {
-        coverage,
-        ends_at_eof: false,
-        rows: abbreviate_rows(rows),
-    }
-}
-
-fn plan_comment_hunk(change: CommentEdit) -> Hunk {
-    Hunk {
-        coverage: LineCoverage {
-            before: change
-                .before
-                .as_ref()
-                .map(|line| line.number..line.number + 1),
-            after: change
-                .after
-                .as_ref()
-                .map(|line| line.number..line.number + 1),
-        },
-        ends_at_eof: false,
-        rows: vec![DiffRow::Linewise {
-            before: change.before,
-            after: change.after,
-        }],
-    }
-}
-
-fn plan_move_hunk(
-    after_file: &SyntaxFile<'_>,
-    before: &Definition<'_>,
-    after: &Definition<'_>,
-) -> Hunk {
-    let coverage = LineCoverage {
-        before: Some(before.lines.clone()),
-        after: Some(after.lines.clone()),
-    };
-    let context = (0..after.tokens.len()).collect::<HashSet<_>>();
-    let preview = render_definition(after_file, after, &context, DiffMark::Context, false);
-    let mut preview = preview.into_iter();
-    let Some(first) = preview.next() else {
-        return Hunk {
-            coverage,
-            ends_at_eof: false,
-            rows: Vec::new(),
-        };
-    };
-    let mut preview = preview.collect::<Vec<_>>();
-    let last = preview.pop();
-    // Establish the before-to-after correspondence once, then remain on the after side.
-    let mut rows = vec![DiffRow::Moved {
-        before: Some(before.lines.start),
-        after: first,
-    }];
-    let before_range = before.lines.start + 1..before.lines.end.saturating_sub(1);
-    let after_range = after.lines.start + 1..after.lines.end.saturating_sub(1);
-    // A one-line fold saves no space; keep its present-world context instead.
-    if preview.len() == 1 {
-        let line = preview.pop().expect("one preview line remains");
-        rows.push(DiffRow::Code {
-            line,
-            role: CodeRole::Context,
-        });
-    } else if !preview.is_empty() {
-        rows.push(DiffRow::Elision(LineCoverage {
-            before: Some(before_range),
-            after: Some(after_range),
-        }));
-    }
-    if let Some(last) = last {
-        rows.push(DiffRow::Moved {
-            before: None,
-            after: last,
-        });
-    }
-    Hunk {
-        coverage,
-        ends_at_eof: false,
-        rows,
-    }
-}
-
-fn plan_import_hunks(before: &[Import<'_>], after: &[Import<'_>]) -> Vec<Hunk> {
-    let before_text = before
-        .iter()
-        .map(|import| import.text)
-        .collect::<HashSet<_>>();
-    let after_text = after
-        .iter()
-        .map(|import| import.text)
-        .collect::<HashSet<_>>();
-    let removed = before
-        .iter()
-        .filter(|import| !after_text.contains(import.text))
-        .collect::<Vec<_>>();
-    let added = after
-        .iter()
-        .filter(|import| !before_text.contains(import.text))
-        .collect::<Vec<_>>();
-    let count = removed.len().max(added.len());
-
-    (0..count)
-        .map(|index| word_diff(removed.get(index), added.get(index)))
-        .map(|word| Hunk {
-            coverage: LineCoverage {
-                before: word.before_line.map(|line| line..line + 1),
-                after: word.after_line.map(|line| line..line + 1),
-            },
-            ends_at_eof: false,
-            rows: vec![DiffRow::Wordwise(word)],
-        })
-        .collect()
-}
-
-fn moved_definitions<'a>(
-    matches: &[DefinitionMatch<'a>],
-) -> Vec<(&'a Definition<'a>, &'a Definition<'a>)> {
-    let paired = matches
-        .iter()
-        .filter_map(|matched| {
-            let DefinitionMatch::Matched { before, after } = *matched else {
-                return None;
-            };
-            Some((before, after))
-        })
-        .collect::<Vec<_>>();
-
-    // Every matched occurrence votes on stable order; otherwise one reflow can
-    // make the actually moved definition win an arbitrary LIS tie.
-    let mut after_order = (0..paired.len()).collect::<Vec<_>>();
-    after_order.sort_by_key(|index| paired[*index].1.lines.start);
-    let stable = increasing_subsequence(&after_order);
-
-    paired
-        .into_iter()
-        .enumerate()
-        .filter(|(index, (before, after))| {
-            !before.has_error
-                && !after.has_error
-                && before.full_fingerprint == after.full_fingerprint
-                && !stable.contains(index)
-                && before.lines.start != after.lines.start
-        })
-        .map(|(_, definitions)| definitions)
-        .collect()
-}
-
-fn increasing_subsequence(values: &[usize]) -> HashSet<usize> {
-    let mut tails = Vec::<usize>::new();
-    let mut previous = vec![None; values.len()];
-    for (index, value) in values.iter().copied().enumerate() {
-        let slot = tails.partition_point(|tail| values[*tail] < value);
-        if slot > 0 {
-            previous[index] = Some(tails[slot - 1]);
-        }
-        if slot == tails.len() {
-            tails.push(index);
-        } else {
-            tails[slot] = index;
-        }
-    }
-
-    let Some(mut index) = tails.last().copied() else {
-        return HashSet::new();
-    };
-    let mut stable = HashSet::new();
-    loop {
-        stable.insert(values[index]);
-        let Some(parent) = previous[index] else {
-            break;
-        };
-        index = parent;
-    }
-    stable
-}
-
-fn plan_reflow_hunks(
-    before_file: &SyntaxFile<'_>,
-    after_file: &SyntaxFile<'_>,
-    matches: &[DefinitionMatch<'_>],
-    moved_starts: &HashSet<usize>,
-) -> Vec<Hunk> {
-    // Reflow is a semantic claim, so parser recovery anywhere makes us conservative.
-    if before_file.tree.root_node().has_error() || after_file.tree.root_node().has_error() {
-        return Vec::new();
-    }
-
-    matches
-        .iter()
-        .filter_map(|matched| {
-            let DefinitionMatch::Matched { before, after } = *matched else {
-                return None;
-            };
-            if before.has_error
-                || after.has_error
-                || moved_starts.contains(&before.lines.start)
-                || before.full_fingerprint != after.full_fingerprint
-            {
-                return None;
-            }
-            if definition_source(before_file, before) == definition_source(after_file, after) {
-                return None;
-            }
-
-            let before_context = (0..before.tokens.len()).collect::<HashSet<_>>();
-            let after_context = (0..after.tokens.len()).collect::<HashSet<_>>();
-            let before_lines = render_definition(
-                before_file,
-                before,
-                &before_context,
-                DiffMark::Context,
-                false,
-            );
-            let after_lines =
-                render_definition(after_file, after, &after_context, DiffMark::Context, false);
-            let before_text = before_lines.iter().map(code_line_text).collect::<Vec<_>>();
-            let after_text = after_lines.iter().map(code_line_text).collect::<Vec<_>>();
-            let unchanged_after = local_matches(&before_text, &after_text)
-                .into_iter()
-                .map(|(_, after_index)| after_index)
-                .collect::<HashSet<_>>();
-            let rows = after_lines
-                .into_iter()
-                .enumerate()
-                .map(|(index, line)| DiffRow::Code {
-                    line,
-                    role: if unchanged_after.contains(&index) {
-                        CodeRole::Context
-                    } else {
-                        CodeRole::Reflow
-                    },
-                })
-                .collect();
-            Some(Hunk {
-                coverage: LineCoverage {
-                    before: Some(before.lines.clone()),
-                    after: Some(after.lines.clone()),
-                },
-                ends_at_eof: false,
-                rows,
-            })
-        })
-        .collect()
-}
-
-fn definition_source<'source>(
-    file: &SyntaxFile<'source>,
-    definition: &Definition<'_>,
-) -> &'source str {
-    &file.source[definition.bytes.clone()]
-}
-
-fn blank_boundaries(
-    file: &SyntaxFile<'_>,
-    definition: &Definition<'_>,
-) -> (Option<CodeLine>, Option<CodeLine>) {
-    let leading = definition
-        .lines
-        .start
-        .checked_sub(1)
-        .and_then(|number| blank_line(file, number));
-    let trailing = blank_line(file, definition.lines.end);
-    (leading, trailing)
-}
-
-fn blank_line(file: &SyntaxFile<'_>, number: usize) -> Option<CodeLine> {
-    let line = number
-        .checked_sub(1)
-        .and_then(|index| file.lines.get(index))?;
-    let text = &file.source[line.bytes.clone()];
-    if !text.trim().is_empty() {
-        return None;
-    }
-    Some(CodeLine {
-        number,
-        spans: vec![context_span(text)],
-    })
-}
-
-/// One changed comment occurrence, including pure insertion or deletion.
-struct CommentEdit {
-    before: Option<CodeLine>,
-    after: Option<CodeLine>,
-}
-
-fn comment_edits(before: &Definition<'_>, after: &Definition<'_>) -> Vec<CommentEdit> {
-    let before_text = before
-        .comments
-        .iter()
-        .map(|comment| comment.text)
-        .collect::<Vec<_>>();
-    let after_text = after
-        .comments
-        .iter()
-        .map(|comment| comment.text)
-        .collect::<Vec<_>>();
-    let matches = local_matches(&before_text, &after_text);
-
-    let mut edits = Vec::new();
-    let mut before_start = 0;
-    let mut after_start = 0;
-    for (before_end, after_end) in matches.into_iter().chain(std::iter::once((
-        before.comments.len(),
-        after.comments.len(),
-    ))) {
-        push_comment_gap(
-            &mut edits,
-            &before.comments[before_start..before_end],
-            &after.comments[after_start..after_end],
-        );
-        before_start = before_end.saturating_add(1);
-        after_start = after_end.saturating_add(1);
-    }
-    edits.sort_by_key(comment_line);
-    edits
-}
-
-fn push_comment_gap(edits: &mut Vec<CommentEdit>, before: &[Comment<'_>], after: &[Comment<'_>]) {
-    let paired = before.len().min(after.len());
-    for index in 0..paired {
-        edits.push(render_comment_edit(
-            Some(&before[index]),
-            Some(&after[index]),
-        ));
-    }
-    edits.extend(
-        before[paired..]
-            .iter()
-            .map(|comment| render_comment_edit(Some(comment), None)),
-    );
-    edits.extend(
-        after[paired..]
-            .iter()
-            .map(|comment| render_comment_edit(None, Some(comment))),
-    );
-}
-
-fn render_comment_edit(before: Option<&Comment<'_>>, after: Option<&Comment<'_>>) -> CommentEdit {
-    let (before_spans, after_spans) = match (before, after) {
-        (Some(before), Some(after)) => {
-            let (mut before_spans, mut after_spans) =
-                aligned_text_spans(before.text, after.text, SyntaxClass::Comment);
-            before_spans.insert(0, context_span(before.indent));
-            after_spans.insert(0, context_span(after.indent));
-            (Some(before_spans), Some(after_spans))
-        }
-        (Some(before), None) => (
-            Some(vec![
-                context_span(before.indent),
-                CodeSpan {
-                    text: before.text.to_owned(),
-                    syntax: SyntaxClass::Comment,
-                    mark: DiffMark::Removed,
-                },
-            ]),
-            None,
-        ),
-        (None, Some(after)) => (
-            None,
-            Some(vec![
-                context_span(after.indent),
-                CodeSpan {
-                    text: after.text.to_owned(),
-                    syntax: SyntaxClass::Comment,
-                    mark: DiffMark::Added,
-                },
-            ]),
-        ),
-        (None, None) => unreachable!("a comment edit always has a source side"),
-    };
-
-    CommentEdit {
-        before: before.zip(before_spans).map(|(comment, spans)| CodeLine {
-            number: comment.line,
-            spans,
-        }),
-        after: after.zip(after_spans).map(|(comment, spans)| CodeLine {
-            number: comment.line,
-            spans,
-        }),
-    }
-}
-
-fn comment_line(edit: &CommentEdit) -> usize {
-    edit.after
-        .as_ref()
-        .or(edit.before.as_ref())
-        .map(|line| line.number)
-        .expect("a comment edit always has a source side")
-}
-
-fn context_span(text: &str) -> CodeSpan {
-    CodeSpan {
-        text: text.to_owned(),
-        syntax: SyntaxClass::Plain,
-        mark: DiffMark::Context,
-    }
-}
-
-/// Preserve the hunk frame and every signal row; fold only distant context.
-fn abbreviate_rows(rows: Vec<DiffRow>) -> Vec<DiffRow> {
-    if rows.len() <= 4 {
-        return rows;
-    }
-    let mut keep = vec![false; rows.len()];
-    for keep in keep.iter_mut().take(2) {
-        *keep = true;
-    }
-    for keep in keep.iter_mut().rev().take(2) {
-        *keep = true;
-    }
-    for (index, row) in rows.iter().enumerate() {
-        if !matches!(
-            row,
-            DiffRow::Code {
-                role: CodeRole::Context,
-                ..
-            }
-        ) {
-            keep[index] = true;
-        }
-    }
-
-    let mut abbreviated = Vec::new();
-    let mut index = 0;
-    while index < rows.len() {
-        if keep[index] {
-            abbreviated.push(rows[index].clone());
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < rows.len() && !keep[index] {
-            index += 1;
-        }
-        let omitted = &rows[start..index];
-        // The ellipsis would occupy the same row while hiding useful context.
-        if omitted.len() == 1 {
-            abbreviated.push(omitted[0].clone());
-            continue;
-        }
-
-        let after_start = omitted.iter().filter_map(row_after_line).min();
-        let after_end = omitted
-            .iter()
-            .filter_map(row_after_line)
-            .max()
-            .map(|line| line + 1);
-        abbreviated.push(DiffRow::Elision(LineCoverage {
-            before: None,
-            after: after_start.zip(after_end).map(|(start, end)| start..end),
-        }));
-    }
-    abbreviated
-}
-
-fn row_after_line(row: &DiffRow) -> Option<usize> {
-    match row {
-        DiffRow::Code { line, .. } => Some(line.number),
-        DiffRow::Linewise { before, after } => {
-            after.as_ref().or(before.as_ref()).map(|line| line.number)
-        }
-        DiffRow::LineEnding { .. } => None,
-        DiffRow::Moved { after, .. } => Some(after.number),
-        DiffRow::Wordwise(word) => word.after_line,
-        DiffRow::Elision(coverage) => coverage.after.as_ref().map(|range| range.start),
-    }
-}
-
-fn code_line_text(line: &CodeLine) -> String {
-    line.spans.iter().map(|span| span.text.as_str()).collect()
-}
-
-fn word_diff(before: Option<&&Import<'_>>, after: Option<&&Import<'_>>) -> WordDiff {
-    let before_text = before.map(|import| import.text).unwrap_or("");
-    let after_text = after.map(|import| import.text).unwrap_or("");
-    let before_characters = before_text.chars().collect::<Vec<_>>();
-    let after_characters = after_text.chars().collect::<Vec<_>>();
-    let prefix_length = before_characters
-        .iter()
-        .zip(&after_characters)
-        .take_while(|(before, after)| before == after)
-        .count();
-    let remaining = before_characters
-        .len()
-        .min(after_characters.len())
-        .saturating_sub(prefix_length);
-    let suffix_length = before_characters[prefix_length..]
-        .iter()
-        .rev()
-        .zip(after_characters[prefix_length..].iter().rev())
-        .take(remaining)
-        .take_while(|(before, after)| before == after)
-        .count();
-    let before_end = before_characters.len().saturating_sub(suffix_length);
-    let after_end = after_characters.len().saturating_sub(suffix_length);
-
-    WordDiff {
-        before_line: before.map(|import| import.line),
-        after_line: after.map(|import| import.line),
-        prefix: before_characters[..prefix_length].iter().collect(),
-        removed: before_characters[prefix_length..before_end]
-            .iter()
-            .collect(),
-        added: after_characters[prefix_length..after_end].iter().collect(),
-        suffix: before_characters[before_end..].iter().collect(),
-    }
-}
-
-/// Exact old/current token occurrence pairs inside one matched definition.
-struct TokenCorrespondence {
-    pairs: Vec<(usize, usize)>,
-}
-
-impl TokenCorrespondence {
-    fn before_indices(&self) -> HashSet<usize> {
-        self.pairs.iter().map(|(before, _)| *before).collect()
-    }
-
-    fn after_indices(&self) -> HashSet<usize> {
-        self.pairs.iter().map(|(_, after)| *after).collect()
-    }
-}
-
-fn align_tokens(
-    before: &[Token<'_>],
-    after: &[Token<'_>],
-    include: impl Fn(&Token<'_>) -> bool,
-) -> TokenCorrespondence {
-    let before_indices = before
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| include(token))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let after_indices = after
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| include(token))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let before_values = before_indices
-        .iter()
-        .map(|index| {
-            let token = &before[*index];
-            (token.kind, token.field, token.text)
-        })
-        .collect::<Vec<_>>();
-    let after_values = after_indices
-        .iter()
-        .map(|index| {
-            let token = &after[*index];
-            (token.kind, token.field, token.text)
-        })
-        .collect::<Vec<_>>();
-    let matches = local_matches(&before_values, &after_values);
-
-    let pairs = matches
-        .into_iter()
-        .map(|(before_index, after_index)| {
-            (before_indices[before_index], after_indices[after_index])
-        })
-        .collect();
-    TokenCorrespondence { pairs }
-}
-
-fn aligned_text_spans(
-    before: &str,
-    after: &str,
-    syntax: SyntaxClass,
-) -> (Vec<CodeSpan>, Vec<CodeSpan>) {
-    let before_parts = text_parts(before);
-    let after_parts = text_parts(after);
-    let before_values = before_parts
-        .iter()
-        .map(|part| part.as_str())
-        .collect::<Vec<_>>();
-    let after_values = after_parts
-        .iter()
-        .map(|part| part.as_str())
-        .collect::<Vec<_>>();
-    let matches = local_matches(&before_values, &after_values);
-    let before_context = matches
-        .iter()
-        .map(|(before_index, _)| *before_index)
-        .collect::<HashSet<_>>();
-    let after_context = matches
-        .iter()
-        .map(|(_, after_index)| *after_index)
-        .collect::<HashSet<_>>();
-
-    let before = before_parts
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| CodeSpan {
-            text,
-            syntax,
-            mark: if before_context.contains(&index) {
-                DiffMark::Context
-            } else {
-                DiffMark::Removed
-            },
-        })
-        .collect();
-    let after = after_parts
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| CodeSpan {
-            text,
-            syntax,
-            mark: if after_context.contains(&index) {
-                DiffMark::Context
-            } else {
-                DiffMark::Added
-            },
-        })
-        .collect();
-    (before, after)
-}
-
-fn text_parts(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut current_class = None;
-    for character in text.chars() {
-        let class = if character.is_whitespace() {
-            0
-        } else if character.is_alphanumeric() || character == '_' {
-            1
-        } else {
-            2
-        };
-        if current_class.is_some_and(|current_class| current_class != class) {
-            parts.push(std::mem::take(&mut current));
-        }
-        current.push(character);
-        current_class = Some(class);
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
-
-fn render_definition(
-    file: &SyntaxFile<'_>,
-    definition: &Definition<'_>,
-    context: &HashSet<usize>,
-    changed: DiffMark,
-    hide_comment_lines: bool,
-) -> Vec<CodeLine> {
-    render_source_lines(
-        file.source,
-        &file.lines,
-        definition,
-        context,
-        changed,
-        hide_comment_lines,
-    )
-}
-
-fn render_source_lines(
-    source: &str,
-    lines: &[SourceLine],
-    definition: &Definition<'_>,
-    context: &HashSet<usize>,
-    changed: DiffMark,
-    hide_comment_lines: bool,
-) -> Vec<CodeLine> {
-    let mut rendered = Vec::new();
-    for line in lines {
-        if line.bytes.end <= definition.bytes.start || line.bytes.start >= definition.bytes.end {
-            continue;
-        }
-        let text = &source[line.bytes.clone()];
-        if hide_comment_lines && is_comment_only(text) {
-            continue;
-        }
-
-        let mut spans = Vec::new();
-        let mut cursor = line.bytes.start.max(definition.bytes.start);
-        let line_end = line.bytes.end.min(definition.bytes.end);
-        for (index, token) in definition.tokens.iter().enumerate() {
-            if token.bytes.end <= cursor || token.bytes.start >= line_end {
-                continue;
-            }
-            let token_start = token.bytes.start.max(cursor);
-            let token_end = token.bytes.end.min(line_end);
-            if cursor < token_start {
-                push_code_span(
-                    &mut spans,
-                    &source[cursor..token_start],
-                    SyntaxClass::Plain,
-                    DiffMark::Context,
-                );
-            }
-            let mark = if context.contains(&index) || (hide_comment_lines && token.is_comment) {
-                DiffMark::Context
-            } else {
-                changed
-            };
-            push_code_span(
-                &mut spans,
-                &source[token_start..token_end],
-                token.syntax_class(),
-                mark,
-            );
-            cursor = token_end;
-        }
-        if cursor < line_end {
-            push_code_span(
-                &mut spans,
-                &source[cursor..line_end],
-                SyntaxClass::Plain,
-                DiffMark::Context,
-            );
-        }
-        rendered.push(CodeLine {
-            number: line.number,
-            spans,
-        });
-    }
-    rendered
-}
-
-fn push_code_span(spans: &mut Vec<CodeSpan>, text: &str, syntax: SyntaxClass, mark: DiffMark) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(previous) = spans.last_mut()
-        && previous.syntax == syntax
-        && previous.mark == mark
-    {
-        previous.text.push_str(text);
-        return;
-    }
-    spans.push(CodeSpan {
-        text: text.to_owned(),
-        syntax,
-        mark,
-    });
-}
-
-fn is_comment_only(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
-}
-
-const MAX_LOCAL_ALIGNMENT_CELLS: usize = 16_384;
-
-/// Exact unique anchors split correspondence into bounded ordered gaps.
-fn local_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<(usize, usize)> {
-    let mut before_positions = HashMap::<&T, Vec<usize>>::new();
-    for (index, value) in before.iter().enumerate() {
-        before_positions.entry(value).or_default().push(index);
-    }
-    let mut after_positions = HashMap::<&T, Vec<usize>>::new();
-    for (index, value) in after.iter().enumerate() {
-        after_positions.entry(value).or_default().push(index);
-    }
-
-    let candidates = before_positions
-        .iter()
-        .filter_map(|(value, before_indices)| {
-            let [before_index] = before_indices.as_slice() else {
-                return None;
-            };
-            let [after_index] = after_positions.get(value)?.as_slice() else {
-                return None;
-            };
-            Some((*before_index, *after_index))
-        })
-        .collect::<Vec<_>>();
-    let mut candidates = candidates;
-    candidates.sort_unstable_by_key(|(before_index, _)| *before_index);
-    let candidate_after = candidates
-        .iter()
-        .map(|(_, after_index)| *after_index)
-        .collect::<Vec<_>>();
-    let stable_after = increasing_subsequence(&candidate_after);
-    let anchors = candidates
-        .into_iter()
-        .filter(|(_, after_index)| stable_after.contains(after_index))
-        .collect::<Vec<_>>();
-
-    let mut matches = Vec::new();
-    let mut before_start = 0;
-    let mut after_start = 0;
-    for (before_anchor, after_anchor) in anchors
-        .into_iter()
-        .chain(std::iter::once((before.len(), after.len())))
-    {
-        matches.extend(
-            align_gap(
-                &before[before_start..before_anchor],
-                &after[after_start..after_anchor],
-            )
-            .into_iter()
-            .map(|(before_index, after_index)| {
-                (before_start + before_index, after_start + after_index)
-            }),
-        );
-        if before_anchor < before.len() && after_anchor < after.len() {
-            matches.push((before_anchor, after_anchor));
-        }
-        before_start = before_anchor.saturating_add(1);
-        after_start = after_anchor.saturating_add(1);
-    }
-    matches
-}
-
-fn align_gap<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<(usize, usize)> {
-    if before.is_empty() || after.is_empty() {
-        return Vec::new();
-    }
-    let cells = before.len().saturating_mul(after.len());
-    if cells > MAX_LOCAL_ALIGNMENT_CELLS {
-        return greedy_matches(before, after);
-    }
-    lcs_values(before, after)
-}
-
-/// Linear-memory fallback for an unusually large anchorless region.
-fn greedy_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<(usize, usize)> {
-    let mut after_positions = HashMap::<&T, VecDeque<usize>>::new();
-    for (index, value) in after.iter().enumerate() {
-        after_positions.entry(value).or_default().push_back(index);
-    }
-
-    let mut matches = Vec::new();
-    let mut after_floor = 0;
-    for (before_index, value) in before.iter().enumerate() {
-        let Some(positions) = after_positions.get_mut(value) else {
-            continue;
-        };
-        while positions.front().is_some_and(|index| *index < after_floor) {
-            positions.pop_front();
-        }
-        let Some(after_index) = positions.pop_front() else {
-            continue;
-        };
-        matches.push((before_index, after_index));
-        after_floor = after_index + 1;
-    }
-    matches
-}
-
-/// Quadratic alignment is reserved for small gaps between exact anchors.
-fn lcs_values<T: Eq>(before: &[T], after: &[T]) -> Vec<(usize, usize)> {
-    let width = after.len() + 1;
-    let mut lengths = vec![0_usize; (before.len() + 1) * width];
-    for before_index in (0..before.len()).rev() {
-        for after_index in (0..after.len()).rev() {
-            let value = if before[before_index] == after[after_index] {
-                1 + lengths[(before_index + 1) * width + after_index + 1]
-            } else {
-                lengths[(before_index + 1) * width + after_index]
-                    .max(lengths[before_index * width + after_index + 1])
-            };
-            lengths[before_index * width + after_index] = value;
-        }
-    }
-
-    let mut matches = Vec::new();
-    let mut before_index = 0;
-    let mut after_index = 0;
-    while before_index < before.len() && after_index < after.len() {
-        if before[before_index] == after[after_index] {
-            matches.push((before_index, after_index));
-            before_index += 1;
-            after_index += 1;
-            continue;
-        }
-        let skip_before = lengths[(before_index + 1) * width + after_index];
-        let skip_after = lengths[before_index * width + after_index + 1];
-        if skip_before >= skip_after {
-            before_index += 1;
-        } else {
-            after_index += 1;
-        }
-    }
-    matches
 }
 
 #[cfg(test)]
@@ -2359,10 +275,10 @@ mod tests {
 
         assert_eq!(hunk.coverage.after, Some(1..2));
         assert!(matches!(
-            hunk.rows.last(),
+            hunk.rows.iter().rev().nth(1),
             Some(DiffRow::Code { line, .. }) if line.number == 2 && line_text(line).is_empty()
         ));
-        assert!(hunk.ends_at_eof);
+        assert!(matches!(hunk.rows.last(), Some(DiffRow::FileBoundary)));
     }
 
     #[test]
@@ -2376,8 +292,8 @@ mod tests {
 
         assert_eq!(run.coverage.before, Some(1..2));
         assert_eq!(run.coverage.after, Some(1..2));
-        assert!(!run.ends_at_eof);
-        assert!(later.ends_at_eof);
+        assert!(!matches!(run.rows.last(), Some(DiffRow::FileBoundary)));
+        assert!(matches!(later.rows.last(), Some(DiffRow::FileBoundary)));
     }
 
     #[test]
@@ -2458,7 +374,8 @@ mod tests {
                     role: CodeRole::Context,
                     ..
                 },
-                DiffRow::Moved { .. }
+                DiffRow::Moved { .. },
+                DiffRow::FileBoundary
             ]
         ));
     }
@@ -2588,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_syntax_uses_aligned_plain_lines() {
+    fn unknown_syntax_uses_aligned_line_leaves() {
         let before = "alpha\nold value\nomega\n";
         let after = "alpha\nnew value\nomega\n";
 
@@ -2633,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_insertions_and_deletions_keep_their_source_numbers() {
+    fn line_insertions_and_deletions_keep_their_source_numbers() {
         let before = "one\nremove\ntwo\nthree\n";
         let after = "one\ntwo\nadd\nthree\n";
 
@@ -2664,7 +581,7 @@ mod tests {
     fn html_wrapper_preserves_the_reindented_image_subtree() {
         let fixture = web::HTML;
         let diff = diff_file(fixture.path, fixture.before, fixture.after)
-            .expect("HTML uses the plain planner");
+            .expect("HTML projection must plan");
         let rows = diff
             .hunks
             .iter()
@@ -2738,7 +655,7 @@ mod tests {
             })
             .count();
 
-        assert_eq!(retained, 1);
+        assert_eq!(retained, 1, "{diff:#?}");
         assert!(!rows.iter().any(|row| {
             let DiffRow::Linewise { before, after } = row else {
                 return false;
@@ -2747,6 +664,39 @@ mod tests {
                 .iter()
                 .chain(after)
                 .any(|line| line_text(line).contains("<img"))
+        }));
+    }
+
+    #[test]
+    fn inline_html_wrapper_cannot_hide_unrelated_bytes_on_the_same_line() {
+        let before = "<article><img src=\"avatar.webp\"></article>\n";
+        let after = "<article><div><img src=\"avatar.webp\"></div></article>\n";
+
+        let diff = diff_file("index.html", before, after).expect("HTML projection must plan");
+        let rows = diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .collect::<Vec<_>>();
+
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: Some(before),
+                    after: Some(after),
+                } if line_text(before).contains("<article><img")
+                    && line_text(after).contains("<article><div><img")
+            )
+        }));
+        assert!(!rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    role: CodeRole::Reflow,
+                    ..
+                }
+            )
         }));
     }
 
@@ -2939,12 +889,99 @@ mod tests {
     }
 
     #[test]
+    fn typescript_fixture_keeps_declarations_and_syntax_in_the_graph_plan() {
+        let fixture = web::TYPESCRIPT;
+        let diff = diff_file(fixture.path, fixture.before, fixture.after)
+            .expect("TypeScript fixture must parse");
+
+        for declaration in [
+            "export interface Profile",
+            "export function cardTitle",
+            "export function avatarAlt",
+            "export function avatarSource",
+        ] {
+            assert_eq!(
+                current_line_occurrences(&diff, declaration),
+                1,
+                "{declaration}"
+            );
+        }
+        assert_eq!(current_line_occurrences(&diff, "string | null"), 1);
+        assert_eq!(current_line_occurrences(&diff, " · "), 1);
+        assert_eq!(current_line_occurrences(&diff, "Portrait of"), 1);
+        assert_eq!(
+            marked_line_occurrences(&diff, "avatarSource", DiffMark::Added),
+            1
+        );
+        assert!(!has_two_sided_linewise_rows(&diff));
+
+        let syntax = displayed_syntax_classes(&diff);
+        for expected in [
+            SyntaxClass::Keyword,
+            SyntaxClass::Type,
+            SyntaxClass::String,
+            SyntaxClass::Punctuation,
+        ] {
+            assert!(syntax.contains(&expected), "missing {expected:?} styling");
+        }
+    }
+
+    #[test]
+    fn css_fixture_keeps_rules_and_declarations_in_the_graph_plan() {
+        let fixture = web::CSS;
+        let diff =
+            diff_file(fixture.path, fixture.before, fixture.after).expect("CSS fixture must parse");
+        assert_eq!(current_line_occurrences(&diff, ".profile-card {"), 1);
+        assert_eq!(
+            current_line_occurrences(&diff, "grid-template-columns: 7rem"),
+            1
+        );
+        assert_eq!(
+            current_line_occurrences(&diff, ".profile-card__portrait {"),
+            1
+        );
+        assert_eq!(
+            current_line_occurrences(&diff, ".profile-card__portrait img {"),
+            1
+        );
+        assert_eq!(marked_line_occurrences(&diff, "7rem", DiffMark::Added), 1);
+        assert_eq!(
+            marked_line_occurrences(&diff, ".profile-card__avatar {", DiffMark::Removed),
+            1,
+            "{diff:#?}"
+        );
+        assert_eq!(current_line_occurrences(&diff, "aspect-ratio: 1;"), 1);
+        assert_eq!(current_line_occurrences(&diff, "object-fit: cover;"), 1);
+        assert!(diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    line,
+                    role: CodeRole::Inline,
+                } if line_text(line).contains("grid-template-columns: 7rem")
+            )
+        }));
+
+        let syntax = displayed_syntax_classes(&diff);
+        for expected in [
+            SyntaxClass::Identifier,
+            SyntaxClass::Literal,
+            SyntaxClass::Punctuation,
+        ] {
+            assert!(syntax.contains(&expected), "missing {expected:?} styling");
+        }
+    }
+
+    #[test]
     fn one_sided_plain_hunks_end_at_eof() {
         for (before, after) in [("only line\n", ""), ("", "only line\n")] {
             let diff = diff_file("notes.txt", before, after).expect("plain diff cannot fail");
 
             assert_eq!(diff.hunks.len(), 1);
-            assert!(diff.hunks[0].ends_at_eof);
+            assert!(matches!(
+                diff.hunks[0].rows.last(),
+                Some(DiffRow::FileBoundary)
+            ));
         }
     }
 
@@ -2960,8 +997,14 @@ mod tests {
         assert_eq!(diff.hunks[0].coverage.after, Some(1..6));
         assert_eq!(diff.hunks[1].coverage.before, Some(9..15));
         assert_eq!(diff.hunks[1].coverage.after, Some(9..15));
-        assert!(!diff.hunks[0].ends_at_eof);
-        assert!(diff.hunks[1].ends_at_eof);
+        assert!(!matches!(
+            diff.hunks[0].rows.last(),
+            Some(DiffRow::FileBoundary)
+        ));
+        assert!(matches!(
+            diff.hunks[1].rows.last(),
+            Some(DiffRow::FileBoundary)
+        ));
     }
 
     #[test]
@@ -2984,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_diff_retains_end_of_file_newline_changes() {
+    fn line_projection_retains_end_of_file_newline_changes() {
         let diff = diff_file("notes.txt", "same\n", "same").expect("plain diff cannot fail");
 
         assert!(matches!(
@@ -2997,7 +1040,8 @@ mod tests {
                 DiffRow::LineEnding {
                     before: Some(LineEnding::Lf),
                     after: Some(LineEnding::Missing),
-                }
+                },
+                DiffRow::FileBoundary,
             ] if before.number == 1
                 && after.number == 1
                 && before.spans.iter().all(|span| span.mark == DiffMark::Removed)
@@ -3006,7 +1050,31 @@ mod tests {
     }
 
     #[test]
-    fn generated_rust_is_flagged_and_forced_through_plain_diff() {
+    fn rust_terminator_edits_reproject_both_revisions_as_line_leaves() {
+        for (before, after, expected_after) in [
+            ("fn same() {}\n", "fn same() {}\r\n", LineEnding::CrLf),
+            ("fn same() {}\n", "fn same() {}", LineEnding::Missing),
+        ] {
+            let diff = diff_file("src/same.rs", before, after).expect("Rust input must plan");
+
+            assert!(diff.hunks[0].rows.iter().any(|row| {
+                matches!(
+                    row,
+                    DiffRow::LineEnding {
+                        before: Some(LineEnding::Lf),
+                        after: Some(after),
+                    } if *after == expected_after
+                )
+            }));
+            assert!(matches!(
+                diff.hunks[0].rows.last(),
+                Some(DiffRow::FileBoundary)
+            ));
+        }
+    }
+
+    #[test]
+    fn generated_rust_is_flagged_and_forced_through_line_projection() {
         let before = "// @generated by build.rs\nuse crate::old;\n";
         let after = "use crate::new;\n";
 
@@ -3077,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_plain_source_has_no_review_work() {
+    fn identical_line_projected_source_has_no_review_work() {
         let source = "plain text\nwith no grammar\n";
 
         let diff = diff_file("README", source, source).expect("plain diff cannot fail");
@@ -3090,15 +1158,73 @@ mod tests {
         let before = vec!["same"; 200];
         let after = vec!["same"; 200];
 
-        let matches = local_matches(&before, &after);
+        let matches = correspondence::ordered_matches(&before, &after);
 
         assert_eq!(matches.len(), 200);
-        assert_eq!(matches.first(), Some(&(0, 0)));
-        assert_eq!(matches.last(), Some(&(199, 199)));
+        assert_eq!(
+            matches.first().map(|edge| (edge.before, edge.after)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            matches.last().map(|edge| (edge.before, edge.after)),
+            Some((199, 199))
+        );
     }
 
     fn line_text(line: &CodeLine) -> String {
         line.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    fn source_lines(diff: &FileDiff) -> Vec<&CodeLine> {
+        diff.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .flat_map(|row| match row {
+                DiffRow::Code { line, .. } | DiffRow::Moved { after: line, .. } => vec![line],
+                DiffRow::Linewise { before, after } => {
+                    before.iter().chain(after).collect::<Vec<_>>()
+                }
+                DiffRow::LineEnding { .. }
+                | DiffRow::Wordwise(_)
+                | DiffRow::Elision(_)
+                | DiffRow::FileBoundary => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn current_line_occurrences(diff: &FileDiff, needle: &str) -> usize {
+        source_lines(diff)
+            .into_iter()
+            .filter(|line| !line.spans.iter().any(|span| span.mark == DiffMark::Removed))
+            .filter(|line| line_text(line).contains(needle))
+            .count()
+    }
+
+    fn marked_line_occurrences(diff: &FileDiff, needle: &str, mark: DiffMark) -> usize {
+        source_lines(diff)
+            .into_iter()
+            .filter(|line| line_text(line).contains(needle))
+            .filter(|line| line.spans.iter().any(|span| span.mark == mark))
+            .count()
+    }
+
+    fn displayed_syntax_classes(diff: &FileDiff) -> Vec<SyntaxClass> {
+        source_lines(diff)
+            .into_iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.syntax))
+            .collect()
+    }
+
+    fn has_two_sided_linewise_rows(diff: &FileDiff) -> bool {
+        diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: Some(_),
+                    after: Some(_),
+                }
+            )
+        })
     }
 
     fn assert_html_line_is_literal(rows: &[DiffRow], needle: &str) {
@@ -3159,6 +1285,7 @@ mod tests {
             .contains(needle),
             DiffRow::LineEnding { .. } => false,
             DiffRow::Elision(_) => false,
+            DiffRow::FileBoundary => false,
         })
     }
 
@@ -3177,6 +1304,7 @@ mod tests {
             DiffRow::Wordwise(diff) => diff.added.contains(needle),
             DiffRow::LineEnding { .. } => false,
             DiffRow::Elision(_) => false,
+            DiffRow::FileBoundary => false,
         })
     }
 }
