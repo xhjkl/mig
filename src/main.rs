@@ -1,3 +1,4 @@
+mod commit;
 mod input;
 mod worktree;
 
@@ -11,7 +12,7 @@ use mig::{diff::diff_file, ui};
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Current worktree changes or two concrete text-file revisions.
+/// Current worktree changes, one commit, or two concrete text-file revisions.
 #[derive(Parser)]
 #[command(
     name = "m",
@@ -19,29 +20,27 @@ use std::path::{Path, PathBuf};
     about = "Review source changes with syntax-aware diffs"
 )]
 struct Cli {
-    /// Previous version; omit both paths to scan the current directory.
-    #[arg(requires = "after")]
-    before: Option<PathBuf>,
+    /// Commit to show, or previous file when AFTER is also provided.
+    #[arg(value_name = "COMMITISH_OR_BEFORE")]
+    commitish_or_before: Option<PathBuf>,
 
-    /// Current version of the source file.
+    /// Current file paired with BEFORE.
     after: Option<PathBuf>,
 
     /// Display path and syntax hint to use when the inputs are temporary files.
-    #[arg(long, requires = "before")]
+    #[arg(long, requires = "after")]
     path: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let Some(before) = cli.before else {
-        return review_current_directory();
-    };
-    let Some(after) = cli.after else {
-        bail!("BEFORE and AFTER must be provided together");
-    };
-
-    review_file_pair(before, after, cli.path)
+    match (cli.commitish_or_before, cli.after) {
+        (None, None) => review_current_directory(),
+        (Some(commitish), None) => review_commit(&commitish),
+        (Some(before), Some(after)) => review_file_pair(before, after, cli.path),
+        (None, Some(_)) => bail!("AFTER cannot be provided without BEFORE"),
+    }
 }
 
 /// All current Git changes rooted beneath the invocation directory.
@@ -49,6 +48,18 @@ fn review_current_directory() -> Result<()> {
     let directory = env::current_dir();
     let directory = directory.context("failed to locate the current directory")?;
     let diffs = worktree::diff_directory(&directory)?;
+    if diffs.is_empty() {
+        return Ok(());
+    }
+
+    ui::run(diffs)
+}
+
+/// One commit against its first parent, or the empty tree for a root commit.
+fn review_commit(commitish: &Path) -> Result<()> {
+    let directory = env::current_dir();
+    let directory = directory.context("failed to locate the current directory")?;
+    let diffs = commit::diff_commit(&directory, commitish)?;
     if diffs.is_empty() {
         return Ok(());
     }
@@ -148,16 +159,18 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn cli_accepts_a_directory_scan_or_a_complete_pair() {
+    fn cli_accepts_a_directory_scan_commit_or_complete_pair() {
         let scan = Cli::try_parse_from(["m"]);
+        let commit = Cli::try_parse_from(["m", "HEAD~2"]);
         let pair = Cli::try_parse_from(["m", "old.rs", "current.rs"]);
-        let incomplete = Cli::try_parse_from(["m", "old.rs"]);
         let path_without_pair = Cli::try_parse_from(["m", "--path", "src/lib.rs"]);
+        let path_with_commit = Cli::try_parse_from(["m", "HEAD", "--path", "src/lib.rs"]);
 
         assert!(scan.is_ok());
+        assert!(commit.is_ok());
         assert!(pair.is_ok());
-        assert!(incomplete.is_err());
         assert!(path_without_pair.is_err());
+        assert!(path_with_commit.is_err());
     }
 
     #[test]

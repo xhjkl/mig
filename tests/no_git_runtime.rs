@@ -31,6 +31,36 @@ fn clean_scan_does_not_require_a_git_executable() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn commitish_resolution_does_not_require_a_git_executable() {
+    let repository = TempDir::new().expect("temporary repository");
+    git(repository.path(), &["init", "--quiet"]);
+    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "mig@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_m"))
+        .arg("HEAD")
+        .current_dir(repository.path())
+        .env("PATH", "")
+        .output()
+        .expect("run commit review without Git on PATH");
+
+    assert!(
+        output.status.success(),
+        "m failed without Git on PATH: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
