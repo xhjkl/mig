@@ -1,5 +1,7 @@
+//! Language-agnostic commonality over neutral before/after projections.
+
 use super::projection::{
-    ContentChannel, Frame, Language, Movement, NodeId, Projection, ProjectionPair,
+    ContentChannel, Language, LayoutOwnership, Movement, NodeId, Projection, ProjectionPair,
 };
 use super::source::LineEnding;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -556,12 +558,12 @@ fn claim_unit_lines(projection: &Projection<'_>, unit: NodeId, claimed: &mut [bo
 fn mark_unit_lines(projection: &Projection<'_>, unit: NodeId, covered: &mut [bool]) {
     let node = projection.node(unit);
     mark_lines(covered, node.lines.clone());
-    let frame = node
+    let layout = node
         .review
         .as_ref()
         .expect("tracked node owns review metadata")
-        .frame;
-    if frame != Frame::AdjacentBlankLines {
+        .layout;
+    if layout != LayoutOwnership::AdjacentBlankLines {
         return;
     }
 
@@ -1414,22 +1416,12 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             .map(|id| self.after_fingerprints[id.index()].full)
             .collect::<Vec<_>>();
         let exact_composites = unordered_matches(&before_values, &after_values);
-        let placements = match_placements(&exact_composites);
-        for (edge, placement) in exact_composites.iter().copied().zip(placements) {
-            let before = before_composites[edge.before];
-            let after = after_composites[edge.after];
-            self.graph.composites.push(NodeLink {
-                before,
-                after,
-                reparented: !context.parents_are_linked(before, after),
-                placement,
-            });
-        }
 
-        // Recursive leaf propagation needs a non-overlapping cover even though the graph
-        // retains useful nested composite edges for later presentation choices.
-        let mut exact_composites = exact_composites;
-        exact_composites.sort_by(|left, right| {
+        // Recursive propagation chooses the authoritative non-overlapping cover. Repeated
+        // leaf-shaped composites can otherwise acquire plausible FIFO pairings that disagree
+        // with the larger exact subtrees containing them.
+        let mut cover_candidates = exact_composites.clone();
+        cover_candidates.sort_by(|left, right| {
             self.before_subtree_sizes[before_composites[right.before].index()]
                 .cmp(&self.before_subtree_sizes[before_composites[left.before].index()])
                 .then_with(|| left.before.cmp(&right.before))
@@ -1438,7 +1430,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         let mut covered_before = HashSet::new();
         let mut covered_after = HashSet::new();
         let mut maximal = Vec::new();
-        for edge in exact_composites {
+        for edge in cover_candidates {
             let before = before_composites[edge.before];
             let after = after_composites[edge.after];
             if covered_before.contains(&before) || covered_after.contains(&after) {
@@ -1450,11 +1442,34 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         }
         maximal.sort_by_key(|edge| edge.before);
         let placements = match_placements(&maximal);
+        let mut exact_cover = HashMap::new();
         for (edge, placement) in maximal.into_iter().zip(placements) {
             let before = before_composites[edge.before];
             let after = after_composites[edge.after];
             let reparented = !context.parents_are_linked(before, after);
-            self.link_exact_subtree(before, after, placement, reparented);
+            self.link_exact_subtree(before, after, placement, reparented, &mut exact_cover);
+        }
+
+        // Nested composite facts remain useful only when they agree with that exact cover.
+        // Recompute placement after discarding speculative duplicate-occurrence pairings.
+        let exact_composites = exact_composites
+            .into_iter()
+            .filter(|edge| {
+                let before = before_composites[edge.before];
+                let after = after_composites[edge.after];
+                exact_cover.get(&before).copied() == Some(after)
+            })
+            .collect::<Vec<_>>();
+        let placements = match_placements(&exact_composites);
+        for (edge, placement) in exact_composites.into_iter().zip(placements) {
+            let before = before_composites[edge.before];
+            let after = after_composites[edge.after];
+            self.graph.composites.push(NodeLink {
+                before,
+                after,
+                reparented: !context.parents_are_linked(before, after),
+                placement,
+            });
         }
 
         let before_leaves = descendant_leaves(&pair.before, before_unit)
@@ -1822,9 +1837,12 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         after: NodeId,
         placement: Placement,
         reparented: bool,
+        exact_cover: &mut HashMap<NodeId, NodeId>,
     ) {
         let mut pending = vec![(before, after)];
         while let Some((before, after)) = pending.pop() {
+            let previous = exact_cover.insert(before, after);
+            debug_assert!(previous.is_none(), "exact-cover node linked twice");
             let before_node = self.pair.before.node(before);
             let after_node = self.pair.after.node(after);
             match (before_node.leaf, after_node.leaf) {
@@ -2323,7 +2341,7 @@ mod tests {
     }
 
     #[test]
-    fn source_ownership_certificate_honors_only_the_adjacent_blank_frame() {
+    fn source_certificate_honors_adjacent_blank_layout_ownership() {
         let adjacent = project_pair(
             Path::new("lib.rs"),
             "fn run() {}\n",
@@ -2333,14 +2351,14 @@ mod tests {
         .expect("Rust projection must parse");
         assert!(!correspond(&adjacent).requires_line_fallback);
 
-        let outside_frame = project_pair(
+        let outside_layout = project_pair(
             Path::new("lib.rs"),
             "fn run() {}\n",
             "\n\nfn run() { work(); }\n",
             false,
         )
         .expect("Rust projection must parse");
-        assert!(correspond(&outside_frame).requires_line_fallback);
+        assert!(correspond(&outside_layout).requires_line_fallback);
     }
 
     #[test]

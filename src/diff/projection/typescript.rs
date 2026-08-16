@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Frame, Language, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -107,15 +107,12 @@ impl Adapter for TypeScriptAdapter {
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "program" {
-            return NodeAnnotation {
-                review: Some(ReviewUnit::ignored(ReviewTreatment::Linewise)),
-                ..NodeAnnotation::default()
-            };
+            return NodeAnnotation::default();
         }
 
         if matches!(node.kind(), "comment" | "html_comment") {
             let review = (context.parent_kind == Some("program"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, Frame::None));
+                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
@@ -130,7 +127,7 @@ impl Adapter for TypeScriptAdapter {
                 .child_by_field_name("source")
                 .map(|source| source.byte_range());
             let review = (context.parent_kind == Some("program"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, Frame::None));
+                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 identity,
@@ -148,8 +145,9 @@ impl Adapter for TypeScriptAdapter {
 
         if is_declaration(node.kind()) {
             let identity = declaration_identity(node).map(|name| name.byte_range());
-            let review = (context.parent_kind == Some("program"))
-                .then(|| ReviewUnit::movable(ReviewTreatment::Inline, Frame::AdjacentBlankLines));
+            let review = (context.parent_kind == Some("program")).then(|| {
+                ReviewUnit::movable(ReviewTreatment::Inline, LayoutOwnership::AdjacentBlankLines)
+            });
             return NodeAnnotation {
                 review,
                 identity,
@@ -161,7 +159,7 @@ impl Adapter for TypeScriptAdapter {
             return NodeAnnotation {
                 review: Some(ReviewUnit::stationary(
                     ReviewTreatment::Linewise,
-                    Frame::AdjacentBlankLines,
+                    LayoutOwnership::AdjacentBlankLines,
                 )),
                 ..NodeAnnotation::default()
             };

@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Frame, Language, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -49,7 +49,7 @@ impl Adapter for HtmlAdapter {
             return NodeAnnotation {
                 review: Some(ReviewUnit::stationary(
                     ReviewTreatment::Linewise,
-                    Frame::None,
+                    LayoutOwnership::None,
                 )),
                 ..NodeAnnotation::default()
             };

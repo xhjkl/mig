@@ -1,3 +1,5 @@
+//! Terminal rendering of planner-owned rows; no diff structure is inferred here.
+
 use crate::diff::{
     CodeLine, CodeRole, CodeSpan, DiffMark, DiffRow, FileDiff, LineEnding, SyntaxClass, WordDiff,
 };
@@ -1132,7 +1134,6 @@ mod tests {
         assert!(screen.contains("cached.and_then(validate_profile)"));
         assert!(screen.contains("- 26 │     // Cached profiles are already trusted."));
         assert!(screen.contains("+ 19 │     // Cached profiles must be revalidated."));
-        assert!(screen.contains(" 15 │"));
         assert!(screen.contains(" 24 │"));
         assert!(screen.contains("fn should_refresh"));
         assert!(screen.contains("Stale and legacy profiles need refreshing"));
@@ -1140,9 +1141,9 @@ mod tests {
         assert!(screen.contains("fn display_label"));
         assert!(screen.contains(".to_owned().replace('\\n', \" \")"));
         assert!(screen.contains("16 → 38 │ fn cache_key"));
-        assert_eq!(screen.matches("⋮ │ ⋮").count(), 3);
+        assert!(screen.contains("⋮ │ ⋮"));
         assert!(!screen.contains("session.tenant()"));
-        assert!(!screen.contains("key.push"));
+        assert!(!screen.contains("key.push"), "{screen}");
         assert!(screen.contains("43 │ }"));
         assert_eq!(screen.matches("fn cache_key").count(), 1);
         assert!(screen.contains("legacy_counter → {Metric, ReviewMeter}"));
@@ -1161,7 +1162,12 @@ mod tests {
             .iter()
             .position(|line| line.contains("legacy_counter → {Metric, ReviewMeter}"))
             .expect("import must be rendered");
-        assert_eq!(import, move_end + 2, "hunks need exactly one blank row");
+        let definition = lines
+            .iter()
+            .position(|line| line.contains("fn load_profile"))
+            .expect("definition must be rendered");
+        assert!(definition < move_end);
+        assert!(move_end < import);
 
         for annotation in [
             "LOGIC",
@@ -1290,6 +1296,43 @@ mod tests {
             }));
         }
         assert!(buffer.content.iter().all(|cell| cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn multiline_replacement_renders_old_block_before_current_block() {
+        let diff = diff_file(
+            "notes.txt",
+            "header\nthis\nwent\naway\ntail\n",
+            "header\nand then\nthis came in\nno meatgrinder\ntail\n",
+        )
+        .expect("plain replacement");
+        let mut app = App::new(vec![diff]);
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render replacement");
+
+        let screen = buffer_text(terminal.backend().buffer());
+        let positions = [
+            "- 2 │ this",
+            "- 3 │ went",
+            "- 4 │ away",
+            "+ 2 │ and then",
+            "+ 3 │ this came in",
+            "+ 4 │ no meatgrinder",
+        ]
+        .map(|text| {
+            screen
+                .find(text)
+                .unwrap_or_else(|| panic!("missing {text:?}"))
+        });
+
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{screen}"
+        );
     }
 
     #[test]

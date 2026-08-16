@@ -1,4 +1,4 @@
-//! Language-neutral source projections consumed by correspondence.
+//! Symmetric neutral CST projections; an exact line-leaf tree is the universal fallback.
 
 mod css;
 mod html;
@@ -85,13 +85,6 @@ pub(crate) enum ReviewTreatment {
     Compact,
 }
 
-/// Whether correspondence may claim this boundary independently of its parent.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum Tracking {
-    Track,
-    Ignore,
-}
-
 /// Whether stable-order analysis may classify a review boundary as moved.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum Movement {
@@ -99,9 +92,9 @@ pub(crate) enum Movement {
     Ignore,
 }
 
-/// Context outside a unit that belongs in its review hunk.
+/// Parser-omitted layout that a unit owns for source-completeness certification.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum Frame {
+pub(crate) enum LayoutOwnership {
     None,
     AdjacentBlankLines,
 }
@@ -110,36 +103,24 @@ pub(crate) enum Frame {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReviewUnit {
     pub(crate) treatment: ReviewTreatment,
-    pub(crate) tracking: Tracking,
     pub(crate) movement: Movement,
-    pub(crate) frame: Frame,
+    pub(crate) layout: LayoutOwnership,
 }
 
 impl ReviewUnit {
-    pub(super) fn movable(treatment: ReviewTreatment, frame: Frame) -> Self {
+    pub(super) fn movable(treatment: ReviewTreatment, layout: LayoutOwnership) -> Self {
         Self {
             treatment,
-            tracking: Tracking::Track,
             movement: Movement::Track,
-            frame,
+            layout,
         }
     }
 
-    pub(super) fn stationary(treatment: ReviewTreatment, frame: Frame) -> Self {
+    pub(super) fn stationary(treatment: ReviewTreatment, layout: LayoutOwnership) -> Self {
         Self {
             treatment,
-            tracking: Tracking::Track,
             movement: Movement::Ignore,
-            frame,
-        }
-    }
-
-    pub(super) fn ignored(treatment: ReviewTreatment) -> Self {
-        Self {
-            treatment,
-            tracking: Tracking::Ignore,
-            movement: Movement::Ignore,
-            frame: Frame::None,
+            layout,
         }
     }
 }
@@ -228,13 +209,18 @@ impl<'source> Projection<'source> {
 
     /// Concrete leaves overlapping one byte range, in source order.
     pub(crate) fn leaves_in(&self, bytes: Range<usize>) -> impl Iterator<Item = &SyntaxNode> {
+        self.leaf_ids_in(bytes).map(|id| self.node(id))
+    }
+
+    /// Concrete leaf handles overlapping one byte range, in source order.
+    pub(crate) fn leaf_ids_in(&self, bytes: Range<usize>) -> impl Iterator<Item = NodeId> + '_ {
         let start = self
             .leaves
             .partition_point(|id| self.node(*id).bytes.end <= bytes.start);
         self.leaves[start..]
             .iter()
-            .map(|id| self.node(*id))
-            .take_while(move |node| node.bytes.start < bytes.end)
+            .copied()
+            .take_while(move |id| self.node(*id).bytes.start < bytes.end)
     }
 
     /// Arena descendants in source preorder, excluding the supplied root.
@@ -257,8 +243,8 @@ impl<'source> Projection<'source> {
     /// Tracked boundaries in source preorder.
     pub(crate) fn tracked_units(&self) -> impl Iterator<Item = (NodeId, &SyntaxNode)> {
         self.nodes.iter().enumerate().filter_map(|(index, node)| {
-            let review = node.review.as_ref()?;
-            (review.tracking == Tracking::Track).then_some((NodeId::new(index), node))
+            node.review.as_ref()?;
+            Some((NodeId::new(index), node))
         })
     }
 }
@@ -402,9 +388,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(payloads, ["a\r\n", "\n", "last"]);
         assert!(root.children.iter().all(|id| {
-            pair.before.node(*id).review.as_ref().is_some_and(|unit| {
-                unit.treatment == ReviewTreatment::Linewise && unit.tracking == Tracking::Track
-            })
+            pair.before
+                .node(*id)
+                .review
+                .as_ref()
+                .is_some_and(|unit| unit.treatment == ReviewTreatment::Linewise)
         }));
     }
 
@@ -648,9 +636,9 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_css_digits_link_as_modified_and_render_inline() {
+    fn intrinsic_css_digits_link_as_modified_and_render_as_a_replacement() {
         use crate::diff::correspondence::{LeafRelation, correspond};
-        use crate::diff::{CodeRole, DiffMark, DiffRow};
+        use crate::diff::{DiffMark, DiffRow};
 
         let before = ".card { margin: 6rem; }\n";
         let after = ".card { margin: 7rem; }\n";
@@ -666,16 +654,21 @@ mod tests {
 
         let diff = crate::diff::diff_file("value.css", before, after).unwrap();
         assert!(diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-            let DiffRow::Code {
-                line,
-                role: CodeRole::Inline,
+            let DiffRow::Linewise {
+                before: Some(before),
+                after: Some(after),
             } = row
             else {
                 return false;
             };
-            line.spans
+            before
+                .spans
                 .iter()
-                .any(|span| span.mark == DiffMark::Added && span.text == "7")
+                .any(|span| span.mark == DiffMark::Removed && span.text == "6")
+                && after
+                    .spans
+                    .iter()
+                    .any(|span| span.mark == DiffMark::Added && span.text == "7")
         }));
     }
 

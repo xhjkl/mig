@@ -120,7 +120,7 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
 }
 
-/// Project both revisions, find graph correspondence, then plan a bounded review.
+/// Project, find language-neutral correspondence, then plan render-ready rows.
 pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     let generated = has_generated_marker(before) || has_generated_marker(after);
     if before == after {
@@ -196,39 +196,101 @@ mod tests {
     use crate::fixture::{AFTER, BEFORE, LABEL, web};
 
     #[test]
-    fn fixture_becomes_an_ordered_stream_of_hunks() {
+    fn fixture_keeps_primary_logic_ahead_of_pure_imports() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
-        assert_eq!(diff.hunks.len(), 6);
-        assert!(matches!(
-            diff.hunks[4].rows.as_slice(),
-            [DiffRow::Wordwise(_)]
-        ));
-        assert!(matches!(
-            diff.hunks[5].rows.as_slice(),
-            [
-                DiffRow::Code { .. },
-                DiffRow::Code { .. },
-                DiffRow::Code { .. }
-            ]
-        ));
+        assert_eq!(diff.hunks.len(), 2, "adjacent focus windows must coalesce");
+        let rows = diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .collect::<Vec<_>>();
+        let import = rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::Wordwise(_)))
+            .expect("fixture must include its import replacement");
+        let definition = rows
+            .iter()
+            .position(|row| {
+                matches!(row, DiffRow::Code { line, .. } if line_text(line).contains("fn load_profile"))
+            })
+            .expect("fixture must include its first changed definition");
+        let moved = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    DiffRow::Moved { after, .. }
+                        if after.number == 38 && line_text(after).contains("fn cache_key")
+                )
+            })
+            .expect("fixture must include its moved definition");
+        assert!(
+            definition < moved,
+            "source order must survive coalescing: {rows:#?}"
+        );
+        assert!(
+            moved < import,
+            "pure import churn belongs below primary logic hunks: {rows:#?}"
+        );
     }
 
     #[test]
-    fn definition_hunk_groups_treatments_and_elides_distant_context() {
+    fn pure_import_and_reflow_hunks_follow_primary_logic() {
+        let stable = concat!(
+            "const A: u8 = 0;\n",
+            "const B: u8 = 0;\n",
+            "const C: u8 = 0;\n",
+            "const D: u8 = 0;\n",
+            "const E: u8 = 0;\n",
+            "const F: u8 = 0;\n",
+            "const G: u8 = 0;\n",
+            "const H: u8 = 0;\n",
+        );
+        let before = format!(
+            "use crate::old;\n{stable}fn formatted() -> u8 {{ 1 }}\n{stable}fn logic() {{ old(); }}\n"
+        );
+        let after = format!(
+            "use crate::new;\n{stable}fn formatted() -> u8 {{\n    1\n}}\n{stable}fn logic() {{ new(); }}\n"
+        );
+        let diff = diff_file("src/cadence.rs", &before, &after).expect("source must parse");
+
+        let semantic = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk_has_text(hunk, "new();"))
+            .expect("semantic hunk");
+        let import = diff
+            .hunks
+            .iter()
+            .position(|hunk| {
+                hunk.rows
+                    .iter()
+                    .any(|row| matches!(row, DiffRow::Wordwise(_)))
+            })
+            .expect("compact import hunk");
+        let reflow = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk_has_text(hunk, "fn formatted"))
+            .expect("reflow hunk");
+
+        assert!(semantic < import && import < reflow, "{:#?}", diff.hunks);
+    }
+
+    #[test]
+    fn definition_hunk_keeps_hierarchy_local_context_and_distant_elision() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
         let hunk = hunk_containing(&diff, "fn load_profile");
 
-        assert_eq!(hunk.coverage.before, Some(23..31));
-        assert_eq!(hunk.coverage.after, Some(16..24));
-        assert_eq!(hunk.rows.len(), 8);
-        assert_eq!(
+        assert!(
             hunk.rows
                 .iter()
-                .filter(|row| matches!(row, DiffRow::Elision(_)))
-                .count(),
-            2
+                .any(|row| matches!(row, DiffRow::Elision(_)))
         );
+        for context in ["fn load_profile", "let cached", "profile.filter"] {
+            assert!(hunk_has_text(hunk, context), "missing {context:?}");
+        }
 
         let linewise = hunk.rows.iter().find_map(|row| {
             let DiffRow::Linewise { before, after } = row else {
@@ -266,14 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn structural_frame_can_carry_a_hunk_to_eof() {
+    fn structural_context_can_carry_a_hunk_to_eof() {
         let before = "fn run() { old(); }\n\n";
         let after = "fn run() { new(); }\n\n";
 
         let diff = diff_file("src/run.rs", before, after).expect("source must parse");
         let hunk = &diff.hunks[0];
 
-        assert_eq!(hunk.coverage.after, Some(1..2));
+        assert_eq!(hunk.coverage.after, Some(1..3));
         assert!(matches!(
             hunk.rows.iter().rev().nth(1),
             Some(DiffRow::Code { line, .. }) if line.number == 2 && line_text(line).is_empty()
@@ -287,17 +349,17 @@ mod tests {
         let after = "fn run() { new(); }\n\nfn later() {}\n";
 
         let diff = diff_file("src/run.rs", before, after).expect("source must parse");
-        let run = hunk_containing(&diff, "fn run");
-        let later = hunk_containing(&diff, "fn later");
+        let hunk = hunk_containing(&diff, "fn run");
 
-        assert_eq!(run.coverage.before, Some(1..2));
-        assert_eq!(run.coverage.after, Some(1..2));
-        assert!(!matches!(run.rows.last(), Some(DiffRow::FileBoundary)));
-        assert!(matches!(later.rows.last(), Some(DiffRow::FileBoundary)));
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(hunk.coverage.before, Some(1..2));
+        assert_eq!(hunk.coverage.after, Some(1..4));
+        assert!(hunk_has_text(hunk, "fn later"));
+        assert!(matches!(hunk.rows.last(), Some(DiffRow::FileBoundary)));
     }
 
     #[test]
-    fn one_context_line_between_edits_stays_visible() {
+    fn one_weak_line_between_edits_joins_their_revision_blocks() {
         let before = "fn run() {\n    before_one();\n\n    before_two();\n}\n";
         let after = "fn run() {\n    after_one();\n\n    after_two();\n}\n";
         let diff = diff_file("src/run.rs", before, after).expect("source must parse");
@@ -308,15 +370,32 @@ mod tests {
                 .iter()
                 .all(|row| !matches!(row, DiffRow::Elision(_)))
         );
-        assert!(hunk.rows.iter().any(|row| {
-            matches!(
-                row,
-                DiffRow::Code {
-                    line,
-                    role: CodeRole::Context,
-                } if line.number == 3 && line_text(line).is_empty()
-            )
-        }));
+        let replacement = hunk
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Linewise {
+                    before: Some(line),
+                    after: None,
+                } => Some(('-', line.number, line_text(line))),
+                DiffRow::Linewise {
+                    before: None,
+                    after: Some(line),
+                } => Some(('+', line.number, line_text(line))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replacement,
+            [
+                ('-', 2, "    before_one();".to_string()),
+                ('-', 3, String::new()),
+                ('-', 4, "    before_two();".to_string()),
+                ('+', 2, "    after_one();".to_string()),
+                ('+', 3, String::new()),
+                ('+', 4, "    after_two();".to_string()),
+            ],
+        );
     }
 
     #[test]
@@ -324,35 +403,34 @@ mod tests {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
         let hunk = hunk_containing(&diff, "fn cache_key");
 
-        assert_eq!(hunk.coverage.before, Some(16..22));
-        assert_eq!(hunk.coverage.after, Some(38..44));
-        assert_eq!(hunk.rows.len(), 3);
-
-        let DiffRow::Moved {
-            before: Some(before),
-            after,
-        } = &hunk.rows[0]
-        else {
-            panic!("move must begin with a before-to-after line correspondence");
-        };
-        assert_eq!((*before, after.number), (16, 38));
-        assert!(line_text(after).contains("fn cache_key"));
-
-        let DiffRow::Elision(coverage) = &hunk.rows[1] else {
-            panic!("unchanged moved body must be abbreviated");
-        };
-        assert_eq!(coverage.before, Some(17..21));
-        assert_eq!(coverage.after, Some(39..43));
-
-        let DiffRow::Moved {
-            before: None,
-            after,
-        } = &hunk.rows[2]
-        else {
-            panic!("the closing line must use only its current line number");
-        };
-        assert_eq!(after.number, 43);
-        assert_eq!(line_text(after), "}");
+        assert!(hunk.rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Moved {
+                    before: Some(16),
+                    after,
+                } if after.number == 38 && line_text(after).contains("fn cache_key")
+            )
+        }));
+        assert!(
+            hunk.rows.iter().any(|row| {
+                matches!(
+                    row,
+                    DiffRow::Elision(coverage)
+                        if coverage.before == Some(17..21) && coverage.after == Some(39..43)
+                )
+            }),
+            "{hunk:#?}"
+        );
+        assert!(hunk.rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Moved {
+                    before: None,
+                    after,
+                } if after.number == 43 && line_text(after) == "}"
+            )
+        }));
     }
 
     #[test]
@@ -402,42 +480,39 @@ mod tests {
     }
 
     #[test]
-    fn imports_and_reflow_use_distinct_late_hunks() {
+    fn imports_and_reflow_keep_their_treatments_and_local_context() {
         let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
         let import = diff
             .hunks
             .iter()
-            .find(|hunk| matches!(hunk.rows.as_slice(), [DiffRow::Wordwise(_)]))
+            .flat_map(|hunk| &hunk.rows)
+            .find_map(|row| match row {
+                DiffRow::Wordwise(import) => Some(import),
+                _ => None,
+            })
             .expect("fixture must include a wordwise import hunk");
         let formatting = hunk_containing(&diff, "fn render_response");
-        let [DiffRow::Wordwise(import)] = import.rows.as_slice() else {
-            panic!("import replacement must be a wordwise row");
-        };
         assert_eq!(import.prefix, "use crate::telemetry::");
         assert_eq!(import.removed, "legacy_counter");
         assert_eq!(import.added, "{Metric, ReviewMeter}");
         assert_eq!(import.suffix, ";");
 
-        assert_eq!(formatting.coverage.before, Some(32..38));
-        assert_eq!(formatting.coverage.after, Some(25..28));
-        assert!(matches!(
-            formatting.rows.as_slice(),
-            [
-                DiffRow::Code {
-                    role: CodeRole::Context,
-                    ..
-                },
-                DiffRow::Code {
-                    role: CodeRole::Reflow,
-                    ..
-                },
-                DiffRow::Code {
-                    role: CodeRole::Context,
-                    ..
-                }
-            ]
-        ));
+        for (number, role) in [
+            (25, CodeRole::Context),
+            (26, CodeRole::Reflow),
+            (27, CodeRole::Context),
+        ] {
+            assert!(formatting.rows.iter().any(|row| {
+                matches!(
+                    row,
+                    DiffRow::Code {
+                        line,
+                        role: actual,
+                    } if line.number == number && *actual == role
+                )
+            }));
+        }
     }
 
     #[test]
@@ -468,7 +543,66 @@ mod tests {
 
         assert_eq!(diff.hunks.len(), 1);
         assert!(hunk_has_added_text(&diff.hunks[0], "new"));
-        assert!(!hunk_has_text(&diff.hunks[0], "second"));
+        assert!(diff.hunks[0].rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Code {
+                    line,
+                    role: CodeRole::Context,
+                } if line_text(line).contains("second")
+            )
+        }));
+    }
+
+    #[test]
+    fn inserted_call_wrapper_does_not_mark_unchanged_empty_calls() {
+        let before = r#"async fn serve_one_turn() -> Result<()> {
+    let harmony = HarmonyAdapter::gpt_oss()?;
+    let mut parser = harmony.output_parser()?;
+    let (generated_tx, mut generated_rx) = unbounded_channel();
+    let history = history.to_owned();
+    let also_hub = hub.clone();
+    while let Some(event) = generated_rx.recv().await {}
+    let calls = parser.finish();
+    let message = error.to_string();
+    Ok(())
+}
+"#;
+        let after = r#"async fn serve_one_turn() -> Result<()> {
+    // The constructor may populate a cache through a blocking client.
+    let harmony = tokio::task::spawn_blocking(HarmonyAdapter::gpt_oss)
+        .await
+        .map_err(|error| eyre!(error))??;
+    let mut parser = harmony.output_parser()?;
+    let (generated_tx, mut generated_rx) = unbounded_channel();
+    let history = history.to_owned();
+    let also_hub = hub.clone();
+    while let Some(event) = generated_rx.recv().await {}
+    let calls = parser.finish();
+    let message = error.to_string();
+    Ok(())
+}
+"#;
+
+        let diff = diff_file("src/hub.rs", before, after).expect("source must parse");
+
+        assert!(hunk_has_added_text(&diff.hunks[0], "spawn_blocking"));
+        assert_eq!(current_line_occurrences(&diff, "output_parser()"), 1);
+        for unchanged in [
+            "output_parser()",
+            "unbounded_channel()",
+            "to_owned()",
+            "clone()",
+            "recv()",
+            "finish()",
+            "to_string()",
+        ] {
+            assert_eq!(
+                marked_line_occurrences(&diff, unchanged, DiffMark::Added),
+                0,
+                "unchanged call became added: {unchanged}"
+            );
+        }
     }
 
     #[test]
@@ -479,20 +613,24 @@ mod tests {
         let added = diff_file("src/run.rs", plain, commented).expect("source must parse");
         let removed = diff_file("src/run.rs", commented, plain).expect("source must parse");
 
-        assert!(matches!(
-            added.hunks[0].rows.as_slice(),
-            [DiffRow::Linewise {
-                before: None,
-                after: Some(_)
-            }]
-        ));
-        assert!(matches!(
-            removed.hunks[0].rows.as_slice(),
-            [DiffRow::Linewise {
-                before: Some(_),
-                after: None
-            }]
-        ));
+        assert!(added.hunks[0].rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: None,
+                    after: Some(after),
+                } if line_text(after).contains("explain why")
+            )
+        }));
+        assert!(removed.hunks[0].rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Linewise {
+                    before: Some(before),
+                    after: None,
+                } if line_text(before).contains("explain why")
+            )
+        }));
     }
 
     #[test]
@@ -913,7 +1051,7 @@ mod tests {
             marked_line_occurrences(&diff, "avatarSource", DiffMark::Added),
             1
         );
-        assert!(!has_two_sided_linewise_rows(&diff));
+        assert!(has_two_sided_linewise_rows(&diff));
 
         let syntax = displayed_syntax_classes(&diff);
         for expected in [
@@ -955,10 +1093,11 @@ mod tests {
         assert!(diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
             matches!(
                 row,
-                DiffRow::Code {
-                    line,
-                    role: CodeRole::Inline,
-                } if line_text(line).contains("grid-template-columns: 7rem")
+                DiffRow::Linewise {
+                    before: Some(before),
+                    after: Some(after),
+                } if line_text(before).contains("grid-template-columns: 6rem")
+                    && line_text(after).contains("grid-template-columns: 7rem")
             )
         }));
 

@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Frame, Language, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -32,15 +32,12 @@ impl Adapter for CssAdapter {
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "stylesheet" {
-            return NodeAnnotation {
-                review: Some(ReviewUnit::ignored(ReviewTreatment::Linewise)),
-                ..NodeAnnotation::default()
-            };
+            return NodeAnnotation::default();
         }
 
         if matches!(node.kind(), "comment" | "js_comment") {
             let review = (context.parent_kind == Some("stylesheet"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, Frame::None));
+                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
@@ -53,7 +50,7 @@ impl Adapter for CssAdapter {
         if node.kind() == "import_statement" {
             let identity = first_named_child(node).map(|source| source.byte_range());
             let review = (context.parent_kind == Some("stylesheet"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, Frame::None));
+                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 identity,
@@ -63,8 +60,9 @@ impl Adapter for CssAdapter {
 
         if is_inline_statement(node.kind()) {
             let identity = statement_identity(node, context.source);
-            let review = (context.parent_kind == Some("stylesheet"))
-                .then(|| ReviewUnit::movable(ReviewTreatment::Inline, Frame::AdjacentBlankLines));
+            let review = (context.parent_kind == Some("stylesheet")).then(|| {
+                ReviewUnit::movable(ReviewTreatment::Inline, LayoutOwnership::AdjacentBlankLines)
+            });
             return NodeAnnotation {
                 review,
                 identity,
@@ -84,7 +82,7 @@ impl Adapter for CssAdapter {
             return NodeAnnotation {
                 review: Some(ReviewUnit::stationary(
                     ReviewTreatment::Linewise,
-                    Frame::AdjacentBlankLines,
+                    LayoutOwnership::AdjacentBlankLines,
                 )),
                 ..NodeAnnotation::default()
             };

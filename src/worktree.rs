@@ -6,7 +6,7 @@ use mig::diff::diff_file;
 use mig::review::{
     FileNotice, FileReview, MAX_REVISION_BYTES, MAX_REVISION_LINES, revision_line_count,
 };
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,24 @@ enum WorktreeRevision {
     Unsupported,
 }
 
-/// Planned text reviews beneath one directory, with generated paths last.
+/// Git provenance retained until the review ribbon is ordered.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ChangeClass {
+    Dirty,
+    Staged,
+    Untracked,
+}
+
+/// Visible ribbon cadence, with inspected generated files deferred globally.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RibbonClass {
+    Dirty,
+    Staged,
+    Untracked,
+    Generated,
+}
+
+/// Planned text reviews in dirty, staged, untracked, then generated cadence.
 pub fn diff_directory(directory: &Path) -> Result<Vec<FileReview>> {
     diff_directory_with_limit(directory, MAX_REVISION_BYTES)
 }
@@ -49,9 +66,8 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
         .context("failed to read the pinned HEAD tree")?;
     let changes = changed_paths(&repo, directory, head_tree_id)?;
     let mut reviews = Vec::new();
-    let mut generated_reviews = Vec::new();
 
-    for path in changes {
+    for (class, path) in changes {
         let before = head_revision(&repo, &head_tree, &path)?;
         let before = match before {
             HeadRevision::Absent => None,
@@ -70,7 +86,10 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
         if before_bytes.is_some_and(|bytes| bytes > limit)
             || after_bytes.is_some_and(|bytes| bytes > limit)
         {
-            reviews.push(oversized_review(&path, before_bytes, after_bytes, limit));
+            reviews.push((
+                class,
+                oversized_review(&path, before_bytes, after_bytes, limit),
+            ));
             continue;
         }
 
@@ -80,7 +99,10 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
             Some(after) => match after.read(limit)? {
                 BoundedBytes::Contents(after) => after,
                 BoundedBytes::TooLarge(bytes) => {
-                    reviews.push(oversized_review(&path, before_bytes, Some(bytes), limit));
+                    reviews.push((
+                        class,
+                        oversized_review(&path, before_bytes, Some(bytes), limit),
+                    ));
                     continue;
                 }
             },
@@ -103,22 +125,33 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
         if before_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
             || after_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
         {
-            reviews.push(complexity_review(&path, before_lines, after_lines));
+            reviews.push((class, complexity_review(&path, before_lines, after_lines)));
             continue;
         }
 
         let label = path.to_string_lossy();
         let diff = diff_file(&label, &before, &after)?;
-        if diff.generated {
-            generated_reviews.push(FileReview::from(diff));
-            continue;
-        }
-        reviews.push(FileReview::from(diff));
+        reviews.push((class, FileReview::from(diff)));
     }
 
-    // Preserve path order within both review classes while deferring generated churn.
-    reviews.extend(generated_reviews);
-    Ok(reviews)
+    reviews.sort_by(|(left_class, left), (right_class, right)| {
+        ribbon_class(*left_class, left)
+            .cmp(&ribbon_class(*right_class, right))
+            .then_with(|| left.path().cmp(right.path()))
+    });
+    Ok(reviews.into_iter().map(|(_, review)| review).collect())
+}
+
+fn ribbon_class(class: ChangeClass, review: &FileReview) -> RibbonClass {
+    if review.is_generated() {
+        return RibbonClass::Generated;
+    }
+
+    match class {
+        ChangeClass::Dirty => RibbonClass::Dirty,
+        ChangeClass::Staged => RibbonClass::Staged,
+        ChangeClass::Untracked => RibbonClass::Untracked,
+    }
 }
 
 fn oversized_review(
@@ -147,7 +180,7 @@ fn changed_paths(
     repo: &gix::Repository,
     directory: &Path,
     head_tree_id: ObjectId,
-) -> Result<BTreeSet<PathBuf>> {
+) -> Result<Vec<(ChangeClass, PathBuf)>> {
     let patterns = scope_patterns(repo, directory)?;
     let status = repo
         .status(gix::progress::Discard)
@@ -160,26 +193,45 @@ fn changed_paths(
     let items = status
         .into_iter(patterns)
         .context("failed to start Git status")?;
-    let mut paths = BTreeSet::new();
+    let mut paths: BTreeMap<PathBuf, ChangeClass> = BTreeMap::new();
 
     for item in items {
         let item = item.context("failed while reading Git status")?;
-        let include = match &item {
-            gix::status::Item::IndexWorktree(
-                gix::status::index_worktree::Item::DirectoryContents { entry, .. },
-            ) => matches!(entry.status, gix::dir::entry::Status::Untracked),
-            _ => true,
-        };
-        if !include {
+        let Some(class) = status_change_class(&item) else {
             continue;
-        }
+        };
         let Some(path) = decode_git_path(item.location()) else {
             continue;
         };
-        paths.insert(path);
+        paths
+            .entry(path)
+            .and_modify(|existing| *existing = (*existing).min(class))
+            .or_insert(class);
     }
 
+    let mut paths = paths
+        .into_iter()
+        .map(|(path, class)| (class, path))
+        .collect::<Vec<_>>();
+    paths.sort();
     Ok(paths)
+}
+
+/// Strongest visible status for one emitted tree/index/worktree fact.
+fn status_change_class(item: &gix::status::Item) -> Option<ChangeClass> {
+    match item {
+        gix::status::Item::TreeIndex(_) => Some(ChangeClass::Staged),
+        gix::status::Item::IndexWorktree(change) => match change {
+            gix::status::index_worktree::Item::DirectoryContents { entry, .. }
+                if matches!(entry.status, gix::dir::entry::Status::Untracked) =>
+            {
+                Some(ChangeClass::Untracked)
+            }
+            // `NeedsUpdate` is bookkeeping, not an unstaged content change.
+            _ if change.summary().is_some() => Some(ChangeClass::Dirty),
+            _ => None,
+        },
+    }
 }
 
 /// Root-anchored literal scope independent of the process current directory.
@@ -312,6 +364,11 @@ mod tests {
         );
         write(
             repository.path(),
+            "also-modified.rs",
+            "fn also_modified() -> u8 { 1 }\n",
+        );
+        write(
+            repository.path(),
             "a-generated.txt",
             "# @generated\nold generated text\n",
         );
@@ -345,6 +402,17 @@ mod tests {
             repository.path(),
             "changed.rs",
             "fn changed() -> u8 { 2 }\n",
+        );
+        write(
+            repository.path(),
+            "also-modified.rs",
+            "fn also_modified() -> u8 { 2 }\n",
+        );
+        git(repository.path(), &["add", "also-modified.rs"]);
+        write(
+            repository.path(),
+            "also-modified.rs",
+            "fn also_modified() -> u8 { 3 }\n",
         );
         write(
             repository.path(),
@@ -390,12 +458,13 @@ mod tests {
         assert_eq!(
             paths,
             vec![
+                "also-modified.rs",
                 "changed.rs",
                 "deleted.rs",
                 "extensionless",
+                "notes.txt",
                 "nested/staged.rs",
                 "nested/untracked.rs",
-                "notes.txt",
                 "a-generated.txt",
                 "z-generated.txt"
             ]
@@ -405,8 +474,8 @@ mod tests {
                 matches!(review, FileReview::Diff(diff) if !diff.hunks.is_empty())
             })
         );
-        assert!(diffs[..6].iter().all(|review| !review.is_generated()));
-        assert!(diffs[6..].iter().all(FileReview::is_generated));
+        assert!(diffs[..7].iter().all(|review| !review.is_generated()));
+        assert!(diffs[7..].iter().all(FileReview::is_generated));
 
         let nested = diff_directory(&repository.path().join("nested")).expect("nested scan");
         let nested_paths = nested.iter().map(FileReview::path).collect::<Vec<_>>();
@@ -508,9 +577,9 @@ mod tests {
         assert_eq!(
             paths,
             vec![
+                "nested/tracked-ignored.txt",
                 "nested/.hidden.txt",
                 "nested/keep.tmp",
-                "nested/tracked-ignored.txt",
             ]
         );
 

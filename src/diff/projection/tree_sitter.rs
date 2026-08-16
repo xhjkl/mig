@@ -501,7 +501,6 @@ fn syntax_from_kind(kind: &str) -> SyntaxClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::projection::ReviewTreatment;
 
     struct InvalidQueryAdapter;
 
@@ -520,13 +519,8 @@ mod tests {
             &INVALID_HIGHLIGHT_QUERIES
         }
 
-        fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
-            let review = (context.node.kind() == "source_file")
-                .then(|| ReviewUnit::ignored(ReviewTreatment::Linewise));
-            NodeAnnotation {
-                review,
-                ..NodeAnnotation::default()
-            }
+        fn annotate(&self, _context: NodeContext<'_, '_>) -> NodeAnnotation {
+            NodeAnnotation::default()
         }
     }
 

@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Frame, Language, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::Language as TreeSitterLanguage;
 
@@ -32,15 +32,12 @@ impl Adapter for RustAdapter {
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "source_file" {
-            return NodeAnnotation {
-                review: Some(ReviewUnit::ignored(ReviewTreatment::Linewise)),
-                ..NodeAnnotation::default()
-            };
+            return NodeAnnotation::default();
         }
 
         if is_comment(node.kind()) {
             let review = (context.parent_kind == Some("source_file"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, Frame::None));
+                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
@@ -55,7 +52,7 @@ impl Adapter for RustAdapter {
                 .child_by_field_name("argument")
                 .map(|argument| argument.byte_range());
             let review = (context.parent_kind == Some("source_file"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, Frame::None));
+                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 identity,
@@ -65,8 +62,9 @@ impl Adapter for RustAdapter {
 
         if is_definition(node.kind()) {
             let identity = identity_node(node).map(|identity| identity.byte_range());
-            let review = (context.parent_kind == Some("source_file"))
-                .then(|| ReviewUnit::movable(ReviewTreatment::Inline, Frame::AdjacentBlankLines));
+            let review = (context.parent_kind == Some("source_file")).then(|| {
+                ReviewUnit::movable(ReviewTreatment::Inline, LayoutOwnership::AdjacentBlankLines)
+            });
             return NodeAnnotation {
                 review,
                 identity,
@@ -78,7 +76,7 @@ impl Adapter for RustAdapter {
             return NodeAnnotation {
                 review: Some(ReviewUnit::stationary(
                     ReviewTreatment::Linewise,
-                    Frame::AdjacentBlankLines,
+                    LayoutOwnership::AdjacentBlankLines,
                 )),
                 ..NodeAnnotation::default()
             };
