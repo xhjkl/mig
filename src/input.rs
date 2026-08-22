@@ -1,7 +1,15 @@
 use anyhow::{Context, Result};
+use gix::ObjectId;
 use std::fs::File;
 use std::io::{Read, Take};
 use std::path::{Path, PathBuf};
+
+/// Immutable Git blob identity and inspected size before its body is requested.
+#[derive(Clone, Copy)]
+pub(crate) struct GitBlob {
+    pub(crate) object: ObjectId,
+    pub(crate) bytes: u64,
+}
 
 /// Open file plus the size observed from its handle before any allocation.
 pub(crate) struct OpenFile {

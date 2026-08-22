@@ -1,0 +1,1162 @@
+use super::*;
+use crate::diff::projection::{ReviewMode, project_pair};
+use std::path::Path;
+
+fn pairs(matches: Vec<OrderedMatch>) -> Vec<(usize, usize)> {
+    matches
+        .into_iter()
+        .map(|edge| (edge.before, edge.after))
+        .collect()
+}
+
+fn is_descendant(projection: &Projection<'_>, node: NodeId, ancestor: NodeId) -> bool {
+    let mut parent = projection.node(node).parent;
+    while let Some(candidate) = parent {
+        if candidate == ancestor {
+            return true;
+        }
+        parent = projection.node(candidate).parent;
+    }
+    false
+}
+
+fn composite_on_line(projection: &Projection<'_>, root: NodeId, kind: &str, line: usize) -> NodeId {
+    descendant_composites(projection, root)
+        .into_iter()
+        .find(|id| {
+            let node = projection.node(*id);
+            node.kind == kind && node.lines.start == line
+        })
+        .unwrap_or_else(|| panic!("missing {kind:?} on line {line}"))
+}
+
+fn composite_link(graph: &Correspondence, before: NodeId) -> NodeLink {
+    graph
+        .composites
+        .iter()
+        .find(|link| link.before == before)
+        .copied()
+        .expect("before composite must remain linked")
+}
+
+#[test]
+fn empty_side_has_no_correspondence() {
+    assert!(ordered_matches::<u8>(&[], &[]).is_empty());
+    assert!(ordered_matches(&[1], &[]).is_empty());
+    assert!(ordered_matches(&[], &[1]).is_empty());
+}
+
+#[test]
+fn identity_matches_every_occurrence_in_order() {
+    let values = ["alpha", "beta", "gamma"];
+
+    assert_eq!(
+        pairs(ordered_matches(&values, &values)),
+        vec![(0, 0), (1, 1), (2, 2)]
+    );
+}
+
+#[test]
+fn insertions_and_removals_leave_surrounding_edges_stable() {
+    let before = ["a", "gone", "b", "c"];
+    let after = ["a", "b", "new", "c"];
+
+    assert_eq!(
+        pairs(ordered_matches(&before, &after)),
+        vec![(0, 0), (2, 1), (3, 3)]
+    );
+}
+
+#[test]
+fn repeated_values_are_retained_inside_anchored_gaps() {
+    let before = ["same", "anchor-a", "same", "anchor-b", "same"];
+    let after = ["same", "anchor-a", "anchor-b", "same", "same"];
+
+    assert_eq!(
+        pairs(ordered_matches(&before, &after)),
+        vec![(0, 0), (1, 1), (3, 2), (4, 3)]
+    );
+}
+
+#[test]
+fn crossing_unique_candidates_choose_a_deterministic_stable_subsequence() {
+    let before = ["a", "b", "c", "d"];
+    let after = ["b", "c", "a", "d"];
+
+    assert_eq!(
+        pairs(ordered_matches(&before, &after)),
+        vec![(1, 0), (2, 1), (3, 3)]
+    );
+}
+
+#[test]
+fn lcs_ties_prefer_skipping_before_values() {
+    let before = ["x", "y"];
+    let after = ["y", "x"];
+
+    assert_eq!(pairs(lcs_matches(&before, &after)), vec![(1, 0)]);
+}
+
+#[test]
+fn large_anchorless_gap_uses_linear_memory_fallback() {
+    let before = vec!["same"; 200];
+    let after = vec!["same"; 200];
+
+    let matches = ordered_matches(&before, &after);
+
+    assert_eq!(matches.len(), 200);
+    assert_eq!(matches.first(), Some(&OrderedMatch::new(0, 0)));
+    assert_eq!(matches.last(), Some(&OrderedMatch::new(199, 199)));
+}
+
+#[test]
+fn greedy_fallback_discards_positions_that_would_cross() {
+    let before = ["a", "b", "a", "c"];
+    let after = ["b", "a", "c", "a"];
+
+    assert_eq!(pairs(greedy_matches(&before, &after)), vec![(0, 1), (2, 3)]);
+}
+
+#[test]
+fn every_result_is_equal_unique_and_strictly_ordered() {
+    let before = [0, 1, 2, 1, 3, 4, 3, 5];
+    let after = [1, 0, 1, 2, 4, 3, 5, 3];
+    let matches = ordered_matches(&before, &after);
+
+    for edge in &matches {
+        assert_eq!(before[edge.before], after[edge.after]);
+    }
+    for pair in matches.windows(2) {
+        assert!(pair[0].before < pair[1].before);
+        assert!(pair[0].after < pair[1].after);
+    }
+}
+
+#[test]
+fn increasing_subsequence_membership_tracks_occurrences_not_values() {
+    assert_eq!(
+        increasing_subsequence_members(&[3, 1, 2, 0, 4]),
+        vec![false, true, true, false, true]
+    );
+    assert_eq!(increasing_subsequence_members(&[]), Vec::<bool>::new());
+}
+
+#[test]
+fn line_projection_is_the_same_ordered_unit_graph() {
+    let pair = project_pair(
+        Path::new("notes.txt"),
+        "alpha\nold\nomega\n",
+        "alpha\nnew\nomega\n",
+        false,
+    )
+    .expect("line projection cannot fail");
+    let graph = correspond(&pair);
+
+    assert!(matches!(
+        graph.units.as_slice(),
+        [
+            UnitEdit::Matched(MatchedUnit {
+                relation: ContentRelation::SourceEqual,
+                ..
+            }),
+            UnitEdit::Matched(MatchedUnit {
+                relation: ContentRelation::Modified,
+                ..
+            }),
+            UnitEdit::Matched(MatchedUnit {
+                relation: ContentRelation::SourceEqual,
+                ..
+            })
+        ]
+    ));
+    let UnitEdit::Matched(alpha) = &graph.units[0] else {
+        unreachable!();
+    };
+    let [link] = graph.unit_leaf_links(alpha) else {
+        panic!("one line unit must own one leaf link");
+    };
+    assert_eq!(link.relation, LeafRelation::Exact);
+    let before_link =
+        graph.before_leaf[link.before.index()].and_then(|index| graph.leaf_links.get(index));
+    assert_eq!(before_link, Some(link));
+    assert_eq!(graph.after_leaf_link(link.after), Some(link));
+    let UnitEdit::Matched(changed) = &graph.units[1] else {
+        unreachable!();
+    };
+    let [link] = graph.unit_leaf_links(changed) else {
+        panic!("one changed line unit must own one leaf link");
+    };
+    assert_eq!(link.relation, LeafRelation::Modified);
+}
+
+#[test]
+fn physical_line_links_are_exact_and_keep_absolute_coordinates() {
+    let pair = project_pair(
+        Path::new("notes.txt"),
+        "alpha\nbeta\ngamma\n",
+        "new\nalpha\nbeta\ngamma\n",
+        false,
+    )
+    .expect("line projection cannot fail");
+    let graph = correspond(&pair);
+
+    assert_eq!(
+        graph.line_links,
+        [
+            LineLink {
+                before: 0,
+                after: 1,
+            },
+            LineLink {
+                before: 1,
+                after: 2,
+            },
+            LineLink {
+                before: 2,
+                after: 3,
+            },
+        ]
+    );
+    assert_eq!(
+        graph.line_links_in(1..3, 2..4).collect::<Vec<_>>(),
+        [
+            LineLink {
+                before: 1,
+                after: 2,
+            },
+            LineLink {
+                before: 2,
+                after: 3,
+            },
+        ]
+    );
+}
+
+#[test]
+fn source_certificate_honors_adjacent_blank_layout_ownership() {
+    let adjacent = project_pair(
+        Path::new("lib.rs"),
+        "fn run() {}\n",
+        "\nfn run() { work(); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    assert!(!correspond(&adjacent).requires_line_fallback);
+
+    let outside_layout = project_pair(
+        Path::new("lib.rs"),
+        "fn run() {}\n",
+        "\n\nfn run() { work(); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    assert!(correspond(&outside_layout).requires_line_fallback);
+}
+
+#[test]
+fn source_formatting_and_comment_edits_have_distinct_relations() {
+    let formatting = project_pair(
+        Path::new("lib.rs"),
+        "fn run(){work();}\n",
+        "fn run() {\n    work();\n}\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let formatting = correspond(&formatting);
+    let formatting = only_matched(&formatting);
+    assert_eq!(formatting.relation, ContentRelation::FullEqual);
+    assert!(formatting.relation.full_equal());
+    assert!(!formatting.relation.source_equal());
+
+    let comment = project_pair(
+        Path::new("lib.rs"),
+        "fn run() {\n    // old\n    work();\n}\n",
+        "fn run() {\n    // new\n    work();\n}\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let comment = correspond(&comment);
+    let unit = only_matched(&comment);
+    assert_eq!(unit.relation, ContentRelation::PayloadEqual);
+    assert!(unit.relation.payload_equal());
+    assert!(!unit.relation.full_equal());
+    assert!(
+        comment
+            .unit_leaf_links(unit)
+            .iter()
+            .any(|link| link.relation == LeafRelation::Modified)
+    );
+}
+
+#[test]
+fn changed_leaf_payload_is_a_modified_structural_link() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "fn run() { old(); }\n",
+        "fn run() { new(); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+
+    assert_eq!(unit.relation, ContentRelation::Modified);
+    let modified = graph
+        .unit_leaf_links(unit)
+        .iter()
+        .find(|link| link.relation == LeafRelation::Modified)
+        .expect("same-shaped identifier payloads must remain linked");
+    assert_eq!(pair.before.leaf_text(modified.before), Some("old"));
+    assert_eq!(pair.after.leaf_text(modified.after), Some("new"));
+}
+
+#[test]
+fn exact_duplicate_units_are_paired_before_fifo_and_expose_reordering() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "fn same() { one(); }\nfn same() { two(); }\n",
+        "fn same() { two(); }\nfn same() { one(); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let matched = graph
+        .units
+        .iter()
+        .filter_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            Some(unit)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matched.len(), 2);
+    assert!(
+        matched
+            .iter()
+            .any(|unit| unit.placement == Placement::Reordered)
+    );
+    for unit in matched {
+        let before = pair
+            .before
+            .source
+            .slice(pair.before.node(unit.before).bytes.clone())
+            .unwrap();
+        let after = pair
+            .after
+            .source
+            .slice(pair.after.node(unit.after).bytes.clone())
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(unit.relation, ContentRelation::SourceEqual);
+    }
+}
+
+#[test]
+fn following_attribute_uses_its_definition_to_disambiguate_repeated_source() {
+    let before = concat!(
+        "#[derive(Clone, Copy)]\n",
+        "enum ReviewTreatment {\n",
+        "    Linewise,\n",
+        "    Compact,\n",
+        "}\n",
+        "#[derive(Clone, Copy)]\n",
+        "enum Movement {\n",
+        "    Track,\n",
+        "}\n",
+    );
+    let after = concat!(
+        "#[derive(Clone, Copy)]\n",
+        "enum ReviewMode {\n",
+        "    Compact,\n",
+        "    Linewise,\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("projection.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let review = graph
+        .units
+        .iter()
+        .find_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            (pair.after.identity_text(unit.after) == Some("ReviewMode")).then_some(unit)
+        })
+        .expect("renamed review enum must remain paired");
+    assert_eq!(
+        pair.before.identity_text(review.before),
+        Some("ReviewTreatment")
+    );
+
+    let derive = graph
+        .units
+        .iter()
+        .find_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            let after = pair.after.node(unit.after);
+            (after.kind == "attribute_item" && after.lines.start == 1).then_some(unit)
+        })
+        .expect("derive attribute must remain paired");
+    assert_eq!(pair.before.node(derive.before).lines.start, 1);
+}
+
+#[test]
+fn following_attributes_respect_established_owner_identity() {
+    let before = concat!(
+        "#[test]\n",
+        "fn alpha() { alpha_body(); }\n",
+        "#[test]\n",
+        "fn beta() { beta_body(); }\n",
+    );
+    let after = concat!(
+        "#[test]\n",
+        "fn alpha() { beta_body(); }\n",
+        "#[test]\n",
+        "fn beta() { alpha_body(); }\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let mut attributes = graph
+        .units
+        .iter()
+        .filter_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            (pair.before.node(unit.before).kind == "attribute_item").then(|| {
+                (
+                    pair.before.node(unit.before).lines.start,
+                    pair.after.node(unit.after).lines.start,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    attributes.sort_unstable();
+
+    assert_eq!(attributes, [(1, 1), (3, 3)]);
+}
+
+#[test]
+fn compact_units_stay_stable_and_do_not_vote_in_structural_movement() {
+    let pair = project_pair(
+        Path::new("view.ts"),
+        "function alpha() {}\nimport value from \"pkg\";\nfunction beta() {}\n",
+        "function beta() {}\nimport value from \"pkg\";\nfunction alpha() {}\n",
+        false,
+    )
+    .expect("TypeScript projection must parse");
+    let graph = correspond(&pair);
+    let mut reordered_payload = 0;
+    for edit in &graph.units {
+        let UnitEdit::Matched(unit) = edit else {
+            continue;
+        };
+        if unit.mode == ReviewMode::Compact {
+            assert_eq!(unit.placement, Placement::Stable);
+        } else if unit.placement == Placement::Reordered {
+            reordered_payload += 1;
+        }
+    }
+    assert_eq!(reordered_payload, 1);
+}
+
+#[test]
+fn mixed_module_modes_resolve_symmetrically_to_linewise_review() {
+    let inline = "mod subject { pub fn payload() {} }\n";
+    let bodyless = "mod subject;\n";
+
+    for (before, after) in [(inline, bodyless), (bodyless, inline)] {
+        let pair = project_pair(Path::new("lib.rs"), before, after, false)
+            .expect("Rust projection must parse");
+        let graph = correspond(&pair);
+        let unit = only_matched(&graph);
+
+        assert_eq!(unit.mode, ReviewMode::Linewise);
+        assert_eq!(unit.placement, Placement::Stable);
+        assert_eq!(unit.relation, ContentRelation::Modified);
+    }
+}
+
+#[test]
+fn exact_html_child_survives_an_inserted_parent_as_one_reparented_subtree() {
+    let before = "<article>\n  <img src=\"ada.webp\">\n</article>\n";
+    let after =
+        "<article>\n  <div class=\"portrait\">\n    <img src=\"ada.webp\">\n  </div>\n</article>\n";
+    let pair = project_pair(Path::new("view.html"), before, after, false)
+        .expect("HTML projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let retained = graph
+        .unit_composites(unit)
+        .iter()
+        .find(|link| {
+            pair.before.identity_text(link.before) == Some("img")
+                && pair.after.identity_text(link.after) == Some("img")
+        })
+        .expect("the exact img subtree must remain linked across the wrapper");
+
+    assert!(retained.reparented);
+    assert!(
+        graph
+            .unit_leaf_links(unit)
+            .iter()
+            .any(|link| link.relation == LeafRelation::Exact
+                && is_descendant(&pair.before, link.before, retained.before)
+                && is_descendant(&pair.after, link.after, retained.after))
+    );
+}
+
+#[test]
+fn same_tag_wrapper_is_detected_from_actual_parent_correspondence() {
+    let before = "<div><img src=\"ada.webp\"></div>\n";
+    let after = "<div><div><img src=\"ada.webp\"></div></div>\n";
+    let pair = project_pair(Path::new("view.html"), before, after, false)
+        .expect("HTML projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let retained = graph
+        .unit_composites(unit)
+        .iter()
+        .find(|link| {
+            pair.before.identity_text(link.before) == Some("div")
+                && pair.after.identity_text(link.after) == Some("div")
+                && pair
+                    .before
+                    .source
+                    .slice(pair.before.node(link.before).bytes.clone())
+                    == pair
+                        .after
+                        .source
+                        .slice(pair.after.node(link.after).bytes.clone())
+        })
+        .expect("the old div subtree must pair with the exact inserted inner occurrence");
+
+    assert!(retained.reparented);
+}
+
+#[test]
+fn swapped_exact_html_siblings_keep_both_links_and_report_placement() {
+    let before = "<article><p>alpha</p><p>beta</p></article>\n";
+    let after = "<article><p>beta</p><p>alpha</p></article>\n";
+    let pair = project_pair(Path::new("view.html"), before, after, false)
+        .expect("HTML projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let paragraphs = graph
+        .unit_composites(unit)
+        .iter()
+        .filter(|link| {
+            pair.before.node(link.before).kind == "element"
+                && pair.before.identity_text(link.before) == Some("p")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(paragraphs.len(), 2);
+    assert!(
+        paragraphs
+            .iter()
+            .any(|link| link.placement == Placement::Reordered)
+    );
+    for link in paragraphs {
+        let before = pair
+            .before
+            .source
+            .slice(pair.before.node(link.before).bytes.clone());
+        let after = pair
+            .after
+            .source
+            .slice(pair.after.node(link.after).bytes.clone());
+        assert_eq!(before, after);
+    }
+}
+
+#[test]
+fn nested_html_unwrap_keeps_leaf_links_one_to_one() {
+    let pair = project_pair(
+        Path::new("view.html"),
+        "<div><div><img></div></div>\n",
+        "<div><img></div>\n",
+        false,
+    )
+    .expect("HTML projection must parse");
+    let graph = correspond(&pair);
+    let before = graph
+        .leaf_links
+        .iter()
+        .map(|link| link.before)
+        .collect::<HashSet<_>>();
+    let after = graph
+        .leaf_links
+        .iter()
+        .map(|link| link.after)
+        .collect::<HashSet<_>>();
+
+    assert_eq!(before.len(), graph.leaf_links.len());
+    assert_eq!(after.len(), graph.leaf_links.len());
+    assert!(graph.composites.iter().any(|link| {
+        link.reparented
+            && pair.before.identity_text(link.before) == Some("div")
+            && pair
+                .before
+                .source
+                .slice(pair.before.node(link.before).bytes.clone())
+                == pair
+                    .after
+                    .source
+                    .slice(pair.after.node(link.after).bytes.clone())
+    }));
+}
+
+#[test]
+fn renamed_nested_definition_preserves_parent_links_for_exact_body_leaves() {
+    let before = concat!(
+        "mod tests {\n",
+        "    fn fixture_keeps_primary_logic_ahead_of_pure_imports() {\n",
+        "        let diff = diff_file(LABEL, BEFORE, AFTER);\n",
+        "        let rows = diff\n",
+        "            .hunks\n",
+        "            .iter()\n",
+        "            .collect::<Vec<_>>();\n",
+        "        assert_eq!(rows.len(), 2, \"primary logic\");\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "    fn fixture_keeps_payload_edits_ahead_of_pure_imports() {\n",
+        "        let diff = diff_file(LABEL, BEFORE, AFTER);\n",
+        "        let rows = diff\n",
+        "            .hunks\n",
+        "            .iter()\n",
+        "            .collect::<Vec<_>>();\n",
+        "        assert_eq!(rows.len(), 2, \"payload edits\");\n",
+        "    }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let hunks = graph
+        .unit_leaf_links(unit)
+        .iter()
+        .find(|link| {
+            pair.before.leaf_text(link.before) == Some("hunks")
+                && pair.after.leaf_text(link.after) == Some("hunks")
+        })
+        .expect("unchanged body leaf must remain linked");
+    let name = graph
+        .unit_leaf_links(unit)
+        .iter()
+        .find(|link| {
+            pair.before.leaf_text(link.before)
+                == Some("fixture_keeps_primary_logic_ahead_of_pure_imports")
+                && pair.after.leaf_text(link.after)
+                    == Some("fixture_keeps_payload_edits_ahead_of_pure_imports")
+        })
+        .expect("renamed definition leaf must remain linked");
+
+    assert_eq!(hunks.relation, LeafRelation::Exact);
+    assert!(!hunks.reparented);
+    assert_eq!(name.relation, LeafRelation::Modified);
+    assert!(!name.reparented);
+}
+
+#[test]
+fn ambiguous_nested_renames_do_not_gain_fifo_parent_links() {
+    let before = concat!(
+        "mod tests {\n",
+        "    fn old_alpha() { shared(); }\n",
+        "    fn old_beta() { shared(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "    fn new_alpha() { shared(); }\n",
+        "    fn new_beta() { shared(); }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let renamed = graph
+        .unit_leaf_links(unit)
+        .iter()
+        .filter(|link| {
+            pair.before
+                .leaf_text(link.before)
+                .is_some_and(|text| text.starts_with("old_"))
+                && pair
+                    .after
+                    .leaf_text(link.after)
+                    .is_some_and(|text| text.starts_with("new_"))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(renamed.len(), 2);
+    assert!(renamed.iter().all(|link| link.reparented));
+}
+
+#[test]
+fn exact_body_evidence_recovers_crossing_renames() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "fn alpha() { body_a(); }\n\nfn beta() { body_b(); }\n",
+        "fn gamma() { body_b(); }\n\nfn delta() { body_a(); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let links = graph
+        .units
+        .iter()
+        .filter_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            Some((
+                pair.before.identity_text(unit.before),
+                pair.after.identity_text(unit.after),
+                unit.placement,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        links
+            .iter()
+            .any(|link| link.0 == Some("alpha") && link.1 == Some("delta"))
+    );
+    assert!(
+        links
+            .iter()
+            .any(|link| link.0 == Some("beta") && link.1 == Some("gamma"))
+    );
+    assert_eq!(
+        links
+            .iter()
+            .filter(|link| link.2 == Placement::Reordered)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn large_crossing_rename_gap_uses_unique_body_evidence() {
+    const UNIT_COUNT: usize = 129;
+    const { assert!(UNIT_COUNT * UNIT_COUNT > MAX_LOCAL_ALIGNMENT_CELLS) };
+
+    let before = (0..UNIT_COUNT)
+        .map(|index| format!("fn before_{index:03}() {{ body_{index:03}(); }}\n"))
+        .collect::<String>();
+    let after = (0..UNIT_COUNT)
+        .rev()
+        .map(|index| format!("fn after_{index:03}() {{ body_{index:03}(); }}\n"))
+        .collect::<String>();
+    let pair = project_pair(Path::new("lib.rs"), &before, &after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let links = graph
+        .units
+        .iter()
+        .filter_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            let before = pair
+                .before
+                .identity_text(unit.before)
+                .expect("Rust function must retain its before identity");
+            let after = pair
+                .after
+                .identity_text(unit.after)
+                .expect("Rust function must retain its after identity");
+            Some((before, (after, unit.relation, unit.placement)))
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(links.len(), UNIT_COUNT);
+    for index in 0..UNIT_COUNT {
+        let before = format!("before_{index:03}");
+        let after = format!("after_{index:03}");
+        let link = links
+            .get(before.as_str())
+            .expect("every renamed function must remain paired");
+        assert_eq!(link.0, after);
+        assert_eq!(link.1, ContentRelation::Modified);
+    }
+    assert_eq!(
+        links
+            .values()
+            .filter(|(_, _, placement)| *placement == Placement::Reordered)
+            .count(),
+        UNIT_COUNT - 1
+    );
+}
+
+#[test]
+fn skewed_evidence_work_uses_the_conservative_fallback_before_the_cell_limit() {
+    let after_count = 100;
+    let long_evidence = MAX_LOCAL_ALIGNMENT_EVIDENCE_WORK / after_count + 1;
+    let shape = FingerprintId(50_000);
+    let unit = |index, evidence| UnitRecord {
+        id: NodeId::new(index),
+        kind: "function_item",
+        identity: None,
+        attachment: SiblingAttachment::None,
+        fingerprint: NodeFingerprints {
+            full: FingerprintId(60_000 + index),
+            payload: None,
+            shape,
+        },
+        shape,
+        evidence,
+        mode: ReviewMode::Structural,
+    };
+    let before = vec![unit(
+        0,
+        (0..long_evidence)
+            .map(|index| (FingerprintId(index), 1))
+            .collect(),
+    )];
+    let after = (0..after_count)
+        .map(|index| unit(index + 1, vec![(FingerprintId(long_evidence + index), 1)]))
+        .collect::<Vec<_>>();
+    let before_indices = [0];
+    let after_indices = (0..after.len()).collect::<Vec<_>>();
+
+    assert!(before_indices.len() * after_indices.len() <= MAX_LOCAL_ALIGNMENT_CELLS);
+    assert!(compatible_alignment_exceeds_budget(
+        &before,
+        &after,
+        &before_indices,
+        &after_indices,
+    ));
+    assert!(
+        compatible_unit_matches(&before, &after, &before_indices, &after_indices).is_empty(),
+        "the conservative fallback must not promote kind-only similarity"
+    );
+}
+
+#[test]
+fn established_unit_anchors_prevent_unrelated_global_pairing() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "use crate::obsolete;\nfn kept() {}\n",
+        "fn kept() {}\nuse crate::unrelated;\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+
+    assert!(!graph.units.iter().any(|edit| {
+        let UnitEdit::Matched(unit) = edit else {
+            return false;
+        };
+        pair.before.identity_text(unit.before) == Some("crate::obsolete")
+            || pair.after.identity_text(unit.after) == Some("crate::unrelated")
+    }));
+    assert!(
+        graph
+            .units
+            .iter()
+            .any(|edit| matches!(edit, UnitEdit::Removed { .. }))
+    );
+    assert!(
+        graph
+            .units
+            .iter()
+            .any(|edit| matches!(edit, UnitEdit::Added { .. }))
+    );
+}
+
+#[test]
+fn inserted_repeated_neighbor_does_not_reorder_an_exact_definition_cover() {
+    let before = concat!(
+        "mod tests {\n",
+        "#[test]\n",
+        "fn first() {\n",
+        "    let rows = compose();\n",
+        "    assert!(rows.contains(\"first contract\"));\n",
+        "}\n",
+        "#[test]\n",
+        "fn second() {\n",
+        "    let rows = compose();\n",
+        "    assert!(rows.contains(\"second contract\"));\n",
+        "}\n",
+        "#[test]\n",
+        "fn third() {\n",
+        "    let rows = compose();\n",
+        "    assert!(rows.contains(\"third contract\"));\n",
+        "}\n",
+        "}\n",
+    );
+    let after = before.replace(
+        "#[test]\nfn second()",
+        concat!(
+            "#[test]\n",
+            "fn inserted() {\n",
+            "    let rows = compose();\n",
+            "    assert!(rows.contains(\"inserted contract\"));\n",
+            "}\n",
+            "#[test]\n",
+            "fn second()",
+        ),
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, &after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let second = graph
+        .unit_composites(unit)
+        .iter()
+        .find(|link| {
+            pair.before.node(link.before).kind == "function_item"
+                && pair.before.identity_text(link.before) == Some("second")
+                && pair.after.identity_text(link.after) == Some("second")
+        })
+        .expect("the unchanged second definition must retain its exact cover");
+    let after_leaves = descendant_leaves(&pair.after, second.after)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let links = descendant_leaves(&pair.before, second.before)
+        .into_iter()
+        .map(|leaf| {
+            graph
+                .before_leaf_link(leaf)
+                .expect("every leaf in an exact cover must remain linked")
+        })
+        .collect::<Vec<_>>();
+    let before_second_attribute = composite_on_line(&pair.before, unit.before, "attribute_item", 7);
+    let before_third_attribute = composite_on_line(&pair.before, unit.before, "attribute_item", 12);
+    let after_inserted_attribute = composite_on_line(&pair.after, unit.after, "attribute_item", 7);
+    let after_second_attribute = composite_on_line(&pair.after, unit.after, "attribute_item", 12);
+    let after_third_attribute = composite_on_line(&pair.after, unit.after, "attribute_item", 17);
+    let second_attribute = composite_link(&graph, before_second_attribute);
+    let third_attribute = composite_link(&graph, before_third_attribute);
+
+    assert_eq!(second.placement, Placement::Stable);
+    assert!(!links.is_empty());
+    assert!(links.iter().all(|link| {
+        link.relation == LeafRelation::Exact
+            && link.placement == Placement::Stable
+            && !link.reparented
+            && after_leaves.contains(&link.after)
+    }));
+    assert_eq!(second_attribute.after, after_second_attribute);
+    assert_eq!(second_attribute.placement, Placement::Stable);
+    assert_eq!(third_attribute.after, after_third_attribute);
+    assert_eq!(third_attribute.placement, Placement::Stable);
+    assert!(
+        graph
+            .composites
+            .iter()
+            .all(|link| link.after != after_inserted_attribute)
+    );
+    assert!(
+        descendant_leaves(&pair.after, after_inserted_attribute)
+            .into_iter()
+            .all(|leaf| graph.after_leaf_link(leaf).is_none())
+    );
+}
+
+#[test]
+fn stacked_attributes_align_outward_from_their_following_definition() {
+    let before = concat!(
+        "mod tests {\n",
+        "#[cfg(feature = \"slow\")]\n",
+        "#[test]\n",
+        "fn target() { body(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "#[allow(dead_code)]\n",
+        "#[cfg(feature = \"slow\")]\n",
+        "#[test]\n",
+        "fn target() { body(); }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let before_cfg = composite_on_line(&pair.before, unit.before, "attribute_item", 2);
+    let before_test = composite_on_line(&pair.before, unit.before, "attribute_item", 3);
+    let after_added = composite_on_line(&pair.after, unit.after, "attribute_item", 2);
+    let after_cfg = composite_on_line(&pair.after, unit.after, "attribute_item", 3);
+    let after_test = composite_on_line(&pair.after, unit.after, "attribute_item", 4);
+
+    assert_eq!(composite_link(&graph, before_cfg).after, after_cfg);
+    assert_eq!(composite_link(&graph, before_test).after, after_test);
+    assert!(
+        graph
+            .composites
+            .iter()
+            .all(|link| link.after != after_added)
+    );
+}
+
+#[test]
+fn moved_annotated_definition_carries_its_anonymous_prefix() {
+    let before = concat!(
+        "mod tests {\n",
+        "#[test]\n",
+        "fn first() { first_body(); }\n",
+        "#[test]\n",
+        "fn second() { second_body(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "#[test]\n",
+        "fn second() { second_body(); }\n",
+        "#[test]\n",
+        "fn first() { first_body(); }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let mut placements = Vec::new();
+    for (name, before_line, after_line) in [("first", 2, 4), ("second", 4, 2)] {
+        let before_attribute =
+            composite_on_line(&pair.before, unit.before, "attribute_item", before_line);
+        let after_attribute =
+            composite_on_line(&pair.after, unit.after, "attribute_item", after_line);
+        let attribute = composite_link(&graph, before_attribute);
+        let definition = graph
+            .unit_composites(unit)
+            .iter()
+            .find(|link| pair.before.identity_text(link.before) == Some(name))
+            .expect("annotated definition must remain linked");
+
+        assert_eq!(attribute.after, after_attribute);
+        assert_eq!(attribute.placement, definition.placement);
+        placements.push(definition.placement);
+    }
+    assert!(placements.contains(&Placement::Reordered));
+}
+
+#[test]
+fn inner_attribute_remains_with_its_enclosing_module() {
+    let before = concat!(
+        "mod tests {\n",
+        "#![allow(dead_code)]\n",
+        "#[test]\n",
+        "fn first() { first_body(); }\n",
+        "#[test]\n",
+        "fn second() { second_body(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "#![allow(dead_code)]\n",
+        "#[test]\n",
+        "fn second() { second_body(); }\n",
+        "#[test]\n",
+        "fn first() { first_body(); }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let before_inner = composite_on_line(&pair.before, unit.before, "inner_attribute_item", 2);
+    let after_inner = composite_on_line(&pair.after, unit.after, "inner_attribute_item", 2);
+    let inner = composite_link(&graph, before_inner);
+
+    assert_eq!(
+        pair.before.node(before_inner).attachment,
+        SiblingAttachment::None
+    );
+    assert_eq!(inner.after, after_inner);
+    assert_eq!(inner.placement, Placement::Stable);
+}
+
+#[test]
+fn reordered_exact_inline_subtree_propagates_placement_to_its_leaves() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "fn run() { first(); second(); }\n",
+        "fn run() { second(); first(); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+
+    assert!(
+        graph
+            .unit_composites(unit)
+            .iter()
+            .any(|link| link.placement == Placement::Reordered)
+    );
+    assert!(graph.unit_leaf_links(unit).iter().any(|link| {
+        link.relation == LeafRelation::Exact && link.placement == Placement::Reordered
+    }));
+}
+
+#[test]
+fn exact_leaf_moved_between_parents_is_explicitly_reparented() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "fn run() { left(alpha); right(beta); }\n",
+        "fn run() { left(beta); right(alpha); }\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+    let alpha = graph
+        .unit_leaf_links(unit)
+        .iter()
+        .find(|link| {
+            pair.before.leaf_text(link.before) == Some("alpha")
+                && pair.after.leaf_text(link.after) == Some("alpha")
+        })
+        .expect("exact moved payload must remain one linked occurrence");
+
+    assert_eq!(alpha.relation, LeafRelation::Exact);
+    assert!(alpha.reparented);
+}
+
+#[test]
+fn physical_line_certificate_covers_anchors_gaps_and_missing_sides() {
+    let cases = [
+        ("same\n", "same", true),
+        ("old\r\n", "new\n", true),
+        ("same\n", "same\r\n", true),
+        ("", "new\n", false),
+        ("old\n", "", false),
+        ("old", "", true),
+        ("old\n", "new\n", false),
+    ];
+
+    for (before, after, expected) in cases {
+        let pair = project_pair(Path::new("notes.txt"), before, after, false)
+            .expect("line projection cannot fail");
+        let (_, requires_line_fallback) = physical_line_correspondence(&pair);
+        assert_eq!(requires_line_fallback, expected, "{before:?} -> {after:?}");
+    }
+}
+
+fn only_matched(graph: &Correspondence) -> &MatchedUnit {
+    let mut matched = graph.units.iter().filter_map(|edit| {
+        let UnitEdit::Matched(unit) = edit else {
+            return None;
+        };
+        Some(unit)
+    });
+    let unit = matched.next().expect("expected one matched unit");
+    assert!(matched.next().is_none(), "expected only one matched unit");
+    unit
+}

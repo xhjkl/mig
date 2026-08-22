@@ -1,5 +1,6 @@
 use super::{
-    ContentChannel, Language, Leaf, NodeId, Projection, ProjectionHealth, ReviewUnit, SyntaxNode,
+    ContentChannel, Language, Leaf, NodeId, Projection, ProjectionHealth, ReviewUnit,
+    SiblingAttachment, SyntaxNode,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -13,9 +14,9 @@ use std::sync::OnceLock;
 
 const MAX_SYNTAX_NODES: usize = 500_000;
 
-/// Untrusted input falls back; frontend setup defects remain explicit errors.
+/// Source-owned failures fall back; frontend setup defects remain explicit errors.
 pub(super) enum ProjectFailure<'source> {
-    Untrusted(SourceFailure<'source>, SyntaxFailure),
+    Fallback(SourceFailure<'source>, SyntaxFailure),
     Setup(anyhow::Error),
 }
 
@@ -66,6 +67,8 @@ pub(super) struct NodeAnnotation {
     pub(super) descendant_channel: Option<ContentChannel>,
     /// Language-specific spelling used as a graph identity, independent of review units.
     pub(super) identity: Option<Range<usize>>,
+    /// Local sibling ownership used only after the following sibling has correspondence.
+    pub(super) attachment: SiblingAttachment,
     /// Language-owned extent when the grammar stops before the semantic content does.
     pub(super) extent: Option<Range<usize>>,
     /// Treat the node's complete byte range as one payload and discard parser children.
@@ -119,6 +122,11 @@ pub(super) trait Adapter {
     fn highlight_queries(&self) -> &'static HighlightQueries;
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation;
 
+    /// Language-owned certificate for a byte-total error-recovery tree.
+    fn accepts_error_recovery(&self, _root: Node<'_>, _source: &str) -> bool {
+        false
+    }
+
     fn gap_channel(&self, context: GapContext<'_, '_>) -> ContentChannel {
         context.default_channel()
     }
@@ -128,6 +136,14 @@ pub(super) trait Adapter {
 pub(super) fn project<'source>(
     source: Source<'source>,
     adapter: &impl Adapter,
+) -> std::result::Result<Projection<'source>, ProjectFailure<'source>> {
+    project_with_node_limit(source, adapter, MAX_SYNTAX_NODES)
+}
+
+fn project_with_node_limit<'source>(
+    source: Source<'source>,
+    adapter: &impl Adapter,
+    node_limit: usize,
 ) -> std::result::Result<Projection<'source>, ProjectFailure<'source>> {
     let mut parser = Parser::new();
     let language = adapter.language();
@@ -144,16 +160,23 @@ pub(super) fn project<'source>(
         )));
     };
     let root = tree.root_node();
-    if root.has_error() || root.is_missing() {
-        return Err(ProjectFailure::Untrusted(
+    if root.is_missing() {
+        return Err(ProjectFailure::Fallback(
             SourceFailure { source },
             SyntaxFailure::Parse,
         ));
     }
-    if tree_exceeds_node_limit(root, MAX_SYNTAX_NODES) {
-        return Err(ProjectFailure::Untrusted(
+    if tree_exceeds_node_limit(root, node_limit) {
+        return Err(ProjectFailure::Fallback(
             SourceFailure { source },
             SyntaxFailure::Complexity,
+        ));
+    }
+    let recovered = root.has_error();
+    if recovered && !adapter.accepts_error_recovery(root, source.as_str()) {
+        return Err(ProjectFailure::Fallback(
+            SourceFailure { source },
+            SyntaxFailure::Parse,
         ));
     }
 
@@ -163,11 +186,16 @@ pub(super) fn project<'source>(
         .map_err(ProjectFailure::Setup)?;
     let highlights = collect_highlights(highlight_queries, root, source.as_str().as_bytes());
     let nodes = project_nodes(&source, root, adapter, &highlights);
+    let health = if recovered {
+        ProjectionHealth::Recovered
+    } else {
+        ProjectionHealth::Parsed
+    };
 
     Ok(Projection::from_nodes(
         source,
         adapter.projected_language(),
-        ProjectionHealth::Parsed,
+        health,
         NodeId::new(0),
         nodes,
     ))
@@ -262,6 +290,7 @@ fn project_nodes(
                         channel: fragment.channel,
                     }),
                     identity: None,
+                    attachment: SiblingAttachment::None,
                     review: None,
                     named: false,
                     extra: false,
@@ -331,6 +360,7 @@ fn project_nodes(
             }),
             leaf,
             identity: annotation.identity,
+            attachment: annotation.attachment,
             review: annotation.review,
             named: node.is_named(),
             extra: node.is_extra(),
@@ -501,8 +531,13 @@ fn syntax_from_kind(kind: &str) -> SyntaxClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     struct InvalidQueryAdapter;
+
+    struct RecoveryAdapter {
+        called: Cell<bool>,
+    }
 
     static INVALID_HIGHLIGHT_QUERIES: HighlightQueries = HighlightQueries::new(&["("]);
 
@@ -521,6 +556,29 @@ mod tests {
 
         fn annotate(&self, _context: NodeContext<'_, '_>) -> NodeAnnotation {
             NodeAnnotation::default()
+        }
+    }
+
+    impl Adapter for RecoveryAdapter {
+        fn language(&self) -> TreeSitterLanguage {
+            tree_sitter_rust::LANGUAGE.into()
+        }
+
+        fn projected_language(&self) -> Language {
+            Language::Rust
+        }
+
+        fn highlight_queries(&self) -> &'static HighlightQueries {
+            &INVALID_HIGHLIGHT_QUERIES
+        }
+
+        fn annotate(&self, _context: NodeContext<'_, '_>) -> NodeAnnotation {
+            NodeAnnotation::default()
+        }
+
+        fn accepts_error_recovery(&self, _root: Node<'_>, _source: &str) -> bool {
+            self.called.set(true);
+            true
         }
     }
 
@@ -556,5 +614,19 @@ mod tests {
 
         assert!(tree_exceeds_node_limit(tree.root_node(), 2));
         assert!(!tree_exceeds_node_limit(tree.root_node(), 1_000));
+    }
+
+    #[test]
+    fn syntax_node_budget_precedes_language_recovery_walks() {
+        let adapter = RecoveryAdapter {
+            called: Cell::new(false),
+        };
+        let result = project_with_node_limit(Source::new("fn {"), &adapter, 1);
+
+        assert!(matches!(
+            result,
+            Err(ProjectFailure::Fallback(_, SyntaxFailure::Complexity))
+        ));
+        assert!(!adapter.called.get());
     }
 }

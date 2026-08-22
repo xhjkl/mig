@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -27,7 +27,7 @@ pub(super) fn project_typescript<'source>(
     tree_sitter::project(
         source,
         &TypeScriptAdapter {
-            flavor: Flavor::TypeScript,
+            dialect: ScriptDialect::TypeScript,
         },
     )
 }
@@ -38,7 +38,7 @@ pub(super) fn project_tsx<'source>(
     tree_sitter::project(
         source,
         &TypeScriptAdapter {
-            flavor: Flavor::Tsx,
+            dialect: ScriptDialect::Tsx,
         },
     )
 }
@@ -49,7 +49,7 @@ pub(super) fn project_javascript<'source>(
     tree_sitter::project(
         source,
         &TypeScriptAdapter {
-            flavor: Flavor::JavaScript,
+            dialect: ScriptDialect::JavaScript,
         },
     )
 }
@@ -60,13 +60,13 @@ pub(super) fn project_jsx<'source>(
     tree_sitter::project(
         source,
         &TypeScriptAdapter {
-            flavor: Flavor::Jsx,
+            dialect: ScriptDialect::Jsx,
         },
     )
 }
 
 #[derive(Clone, Copy)]
-enum Flavor {
+enum ScriptDialect {
     TypeScript,
     Tsx,
     JavaScript,
@@ -74,33 +74,35 @@ enum Flavor {
 }
 
 struct TypeScriptAdapter {
-    flavor: Flavor,
+    dialect: ScriptDialect,
 }
 
 impl Adapter for TypeScriptAdapter {
     fn language(&self) -> TreeSitterLanguage {
-        match self.flavor {
-            Flavor::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Flavor::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Flavor::JavaScript | Flavor::Jsx => tree_sitter_javascript::LANGUAGE.into(),
+        match self.dialect {
+            ScriptDialect::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ScriptDialect::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ScriptDialect::JavaScript | ScriptDialect::Jsx => {
+                tree_sitter_javascript::LANGUAGE.into()
+            }
         }
     }
 
     fn projected_language(&self) -> Language {
-        match self.flavor {
-            Flavor::TypeScript => Language::TypeScript,
-            Flavor::Tsx => Language::Tsx,
-            Flavor::JavaScript => Language::JavaScript,
-            Flavor::Jsx => Language::Jsx,
+        match self.dialect {
+            ScriptDialect::TypeScript => Language::TypeScript,
+            ScriptDialect::Tsx => Language::Tsx,
+            ScriptDialect::JavaScript => Language::JavaScript,
+            ScriptDialect::Jsx => Language::Jsx,
         }
     }
 
     fn highlight_queries(&self) -> &'static HighlightQueries {
-        match self.flavor {
-            Flavor::TypeScript => &TYPESCRIPT_HIGHLIGHTS,
-            Flavor::Tsx => &TSX_HIGHLIGHTS,
-            Flavor::JavaScript => &JAVASCRIPT_HIGHLIGHTS,
-            Flavor::Jsx => &JSX_HIGHLIGHTS,
+        match self.dialect {
+            ScriptDialect::TypeScript => &TYPESCRIPT_HIGHLIGHTS,
+            ScriptDialect::Tsx => &TSX_HIGHLIGHTS,
+            ScriptDialect::JavaScript => &JAVASCRIPT_HIGHLIGHTS,
+            ScriptDialect::Jsx => &JSX_HIGHLIGHTS,
         }
     }
 
@@ -112,7 +114,7 @@ impl Adapter for TypeScriptAdapter {
 
         if matches!(node.kind(), "comment" | "html_comment") {
             let review = (context.parent_kind == Some("program"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, LayoutOwnership::None));
+                .then(|| ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
@@ -127,7 +129,7 @@ impl Adapter for TypeScriptAdapter {
                 .child_by_field_name("source")
                 .map(|source| source.byte_range());
             let review = (context.parent_kind == Some("program"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, LayoutOwnership::None));
+                .then(|| ReviewUnit::new(ReviewMode::Compact, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 identity,
@@ -146,7 +148,7 @@ impl Adapter for TypeScriptAdapter {
         if is_declaration(node.kind()) {
             let identity = declaration_identity(node).map(|name| name.byte_range());
             let review = (context.parent_kind == Some("program")).then(|| {
-                ReviewUnit::movable(ReviewTreatment::Inline, LayoutOwnership::AdjacentBlankLines)
+                ReviewUnit::new(ReviewMode::Structural, LayoutOwnership::AdjacentBlankLines)
             });
             return NodeAnnotation {
                 review,
@@ -157,8 +159,8 @@ impl Adapter for TypeScriptAdapter {
 
         if context.parent_kind == Some("program") && node.is_named() {
             return NodeAnnotation {
-                review: Some(ReviewUnit::stationary(
-                    ReviewTreatment::Linewise,
+                review: Some(ReviewUnit::new(
+                    ReviewMode::Linewise,
                     LayoutOwnership::AdjacentBlankLines,
                 )),
                 ..NodeAnnotation::default()

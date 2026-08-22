@@ -154,7 +154,7 @@ fn display_pair_path(before: &Path, after: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mig::diff::{CodeRole, DiffRow};
+    use mig::diff::DiffRow;
     use std::fs;
     use tempfile::TempDir;
 
@@ -292,11 +292,7 @@ mod tests {
             .iter()
             .flat_map(|hunk| &hunk.rows)
             .filter_map(|row| {
-                let DiffRow::Code {
-                    line,
-                    role: CodeRole::Reflow,
-                } = row
-                else {
+                let DiffRow::Reflow(line) = row else {
                     return None;
                 };
                 let text = line
@@ -327,10 +323,7 @@ mod tests {
                 .filter(|row| {
                     matches!(
                         row,
-                        DiffRow::Code {
-                            line,
-                            role: CodeRole::Reflow,
-                        } if line
+                        DiffRow::Reflow(line) if line
                             .spans
                             .iter()
                             .map(|span| span.text.as_str())
@@ -341,7 +334,7 @@ mod tests {
                 .count();
             assert_eq!(retained, 1, "{needle:?} must stay in the retained tag");
             assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-                let DiffRow::Linewise { before, after } = row else {
+                let DiffRow::LineChange { before, after } = row else {
                     return false;
                 };
                 before.iter().chain(after).any(|line| {

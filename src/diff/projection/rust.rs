@@ -1,7 +1,10 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
+use super::{
+    ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit,
+    SiblingAttachment,
+};
 use crate::diff::source::Source;
 use ::tree_sitter::Language as TreeSitterLanguage;
 
@@ -37,7 +40,7 @@ impl Adapter for RustAdapter {
 
         if is_comment(node.kind()) {
             let review = (context.parent_kind == Some("source_file"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, LayoutOwnership::None));
+                .then(|| ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
@@ -47,12 +50,13 @@ impl Adapter for RustAdapter {
             };
         }
 
-        if node.kind() == "use_declaration" {
+        if node.kind() == "use_declaration" || is_bodyless_module(node) {
             let identity = node
                 .child_by_field_name("argument")
-                .map(|argument| argument.byte_range());
+                .or_else(|| node.child_by_field_name("name"))
+                .map(|identity| identity.byte_range());
             let review = (context.parent_kind == Some("source_file"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, LayoutOwnership::None));
+                .then(|| ReviewUnit::new(ReviewMode::Compact, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 identity,
@@ -63,7 +67,7 @@ impl Adapter for RustAdapter {
         if is_definition(node.kind()) {
             let identity = identity_node(node).map(|identity| identity.byte_range());
             let review = (context.parent_kind == Some("source_file")).then(|| {
-                ReviewUnit::movable(ReviewTreatment::Inline, LayoutOwnership::AdjacentBlankLines)
+                ReviewUnit::new(ReviewMode::Structural, LayoutOwnership::AdjacentBlankLines)
             });
             return NodeAnnotation {
                 review,
@@ -72,17 +76,26 @@ impl Adapter for RustAdapter {
             };
         }
 
+        let attachment = if node.kind() == "attribute_item" {
+            SiblingAttachment::Following
+        } else {
+            SiblingAttachment::None
+        };
         if context.parent_kind == Some("source_file") && node.is_named() {
             return NodeAnnotation {
-                review: Some(ReviewUnit::stationary(
-                    ReviewTreatment::Linewise,
+                review: Some(ReviewUnit::new(
+                    ReviewMode::Linewise,
                     LayoutOwnership::AdjacentBlankLines,
                 )),
+                attachment,
                 ..NodeAnnotation::default()
             };
         }
 
-        NodeAnnotation::default()
+        NodeAnnotation {
+            attachment,
+            ..NodeAnnotation::default()
+        }
     }
 
     fn gap_channel(&self, context: GapContext<'_, '_>) -> ContentChannel {
@@ -113,6 +126,11 @@ fn is_comment(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment")
 }
 
+/// External module declarations are source wiring; inline modules remain definitions.
+fn is_bodyless_module(node: ::tree_sitter::Node<'_>) -> bool {
+    node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
+}
+
 fn is_definition(kind: &str) -> bool {
     matches!(
         kind,
@@ -130,4 +148,48 @@ fn is_definition(kind: &str) -> bool {
             | "type_item"
             | "union_item"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bodyless_modules_are_compact_but_inline_modules_are_structural() {
+        let source = Source::new("mod external;\nmod inline { fn payload() {} }\n");
+        let projection = project(source);
+        let Ok(projection) = projection else {
+            panic!("Rust source must project");
+        };
+        let modules = projection
+            .review_units()
+            .filter(|(_, node)| node.kind == "mod_item")
+            .map(|(_, node)| node.review.as_ref().unwrap().mode)
+            .collect::<Vec<_>>();
+
+        assert_eq!(modules, [ReviewMode::Compact, ReviewMode::Structural]);
+    }
+
+    #[test]
+    fn only_outer_attributes_attach_to_the_following_sibling() {
+        let source =
+            Source::new("mod tests {\n#![allow(dead_code)]\n#[test]\nfn payload() {}\n}\n");
+        let projection = project(source);
+        let Ok(projection) = projection else {
+            panic!("Rust source must project");
+        };
+        let outer = projection
+            .nodes
+            .iter()
+            .find(|node| node.kind == "attribute_item")
+            .expect("outer attribute");
+        let inner = projection
+            .nodes
+            .iter()
+            .find(|node| node.kind == "inner_attribute_item")
+            .expect("inner attribute");
+
+        assert_eq!(outer.attachment, SiblingAttachment::Following);
+        assert_eq!(inner.attachment, SiblingAttachment::None);
+    }
 }

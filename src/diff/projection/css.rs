@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -37,7 +37,7 @@ impl Adapter for CssAdapter {
 
         if matches!(node.kind(), "comment" | "js_comment") {
             let review = (context.parent_kind == Some("stylesheet"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Linewise, LayoutOwnership::None));
+                .then(|| ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
@@ -50,7 +50,7 @@ impl Adapter for CssAdapter {
         if node.kind() == "import_statement" {
             let identity = first_named_child(node).map(|source| source.byte_range());
             let review = (context.parent_kind == Some("stylesheet"))
-                .then(|| ReviewUnit::stationary(ReviewTreatment::Compact, LayoutOwnership::None));
+                .then(|| ReviewUnit::new(ReviewMode::Compact, LayoutOwnership::None));
             return NodeAnnotation {
                 review,
                 identity,
@@ -61,7 +61,7 @@ impl Adapter for CssAdapter {
         if is_inline_statement(node.kind()) {
             let identity = statement_identity(node, context.source);
             let review = (context.parent_kind == Some("stylesheet")).then(|| {
-                ReviewUnit::movable(ReviewTreatment::Inline, LayoutOwnership::AdjacentBlankLines)
+                ReviewUnit::new(ReviewMode::Structural, LayoutOwnership::AdjacentBlankLines)
             });
             return NodeAnnotation {
                 review,
@@ -80,8 +80,8 @@ impl Adapter for CssAdapter {
 
         if context.parent_kind == Some("stylesheet") && node.is_named() {
             return NodeAnnotation {
-                review: Some(ReviewUnit::stationary(
-                    ReviewTreatment::Linewise,
+                review: Some(ReviewUnit::new(
+                    ReviewMode::Linewise,
                     LayoutOwnership::AdjacentBlankLines,
                 )),
                 ..NodeAnnotation::default()

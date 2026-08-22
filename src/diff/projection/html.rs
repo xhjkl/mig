@@ -1,7 +1,7 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewTreatment, ReviewUnit};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -43,14 +43,15 @@ impl Adapter for HtmlAdapter {
         &HIGHLIGHT_QUERIES
     }
 
+    fn accepts_error_recovery(&self, root: Node<'_>, source: &str) -> bool {
+        optional_paragraph_end_tag_recovery(root, source)
+    }
+
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "document" {
             return NodeAnnotation {
-                review: Some(ReviewUnit::stationary(
-                    ReviewTreatment::Linewise,
-                    LayoutOwnership::None,
-                )),
+                review: Some(ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None)),
                 ..NodeAnnotation::default()
             };
         }
@@ -127,6 +128,34 @@ impl Adapter for HtmlAdapter {
         }
         context.default_channel()
     }
+}
+
+/// Local `</p>` recovery after a block implicitly closed its paragraph.
+fn optional_paragraph_end_tag_recovery(root: Node<'_>, source: &str) -> bool {
+    let mut pending = vec![(root, false)];
+    let mut recovered = false;
+    while let Some((node, inside_error)) = pending.pop() {
+        if node.is_missing() {
+            return false;
+        }
+
+        let is_error = node.kind() == "ERROR";
+        if is_error && !inside_error {
+            recovered = true;
+            let error = &source[node.byte_range()];
+            if !error.trim().eq_ignore_ascii_case("</p>") {
+                return false;
+            }
+        }
+
+        let inside_error = inside_error || is_error;
+        let mut cursor = node.walk();
+        pending.extend(
+            node.children(&mut cursor)
+                .map(|child| (child, inside_error)),
+        );
+    }
+    recovered
 }
 
 fn is_element(kind: &str) -> bool {
