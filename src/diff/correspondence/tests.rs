@@ -233,7 +233,7 @@ fn physical_line_links_are_exact_and_keep_absolute_coordinates() {
 }
 
 #[test]
-fn source_certificate_honors_adjacent_blank_layout_ownership() {
+fn source_exactness_keeps_adjacent_blank_layout_as_local_fallback() {
     let adjacent = project_pair(
         Path::new("lib.rs"),
         "fn run() {}\n",
@@ -241,7 +241,13 @@ fn source_certificate_honors_adjacent_blank_layout_ownership() {
         false,
     )
     .expect("Rust projection must parse");
-    assert!(!correspond(&adjacent).requires_line_fallback);
+    assert_eq!(
+        correspond(&adjacent).line_fallbacks,
+        [LineFallback {
+            before: 0..0,
+            after: 0..1,
+        }]
+    );
 
     let outside_layout = project_pair(
         Path::new("lib.rs"),
@@ -250,7 +256,131 @@ fn source_certificate_honors_adjacent_blank_layout_ownership() {
         false,
     )
     .expect("Rust projection must parse");
-    assert!(correspond(&outside_layout).requires_line_fallback);
+    assert_eq!(
+        correspond(&outside_layout).line_fallbacks,
+        [LineFallback {
+            before: 0..0,
+            after: 0..2,
+        }]
+    );
+}
+
+#[test]
+fn equal_blank_separators_travel_with_reordered_definitions() {
+    let before = "fn first() {\n    first_body();\n}\n\nfn second() {\n    second_body();\n}\n";
+    let after = "fn second() {\n    second_body();\n}\n\nfn first() {\n    first_body();\n}\n";
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+
+    assert_eq!(correspond(&pair).line_fallbacks, []);
+}
+
+#[test]
+fn growing_a_shared_blank_separator_remains_local_edit_signal() {
+    let pair = project_pair(
+        Path::new("lib.rs"),
+        "fn first() {}\n\nfn second() {}\n",
+        "fn first() {}\n\n\nfn second() {}\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+
+    assert!(
+        graph
+            .line_fallbacks
+            .iter()
+            .any(|fallback| fallback.after.contains(&2)),
+        "the second current blank row must remain source signal: {graph:#?}",
+    );
+}
+
+#[test]
+fn fallback_normalization_merges_interleaved_overlap_components() {
+    let normalized = normalize_line_fallbacks(vec![
+        LineFallback {
+            before: 0..2,
+            after: 0..1,
+        },
+        LineFallback {
+            before: 10..11,
+            after: 1..2,
+        },
+        LineFallback {
+            before: 1..3,
+            after: 2..3,
+        },
+    ]);
+
+    assert_eq!(
+        normalized,
+        [LineFallback {
+            before: 0..11,
+            after: 0..3,
+        }]
+    );
+}
+
+#[test]
+fn fallback_closure_scales_across_many_disjoint_changed_units() {
+    const REGION_COUNT: usize = 2_048;
+
+    let mut fallbacks = (0..REGION_COUNT)
+        .map(|index| {
+            let start = index * 4;
+            LineFallback {
+                before: start..start + 1,
+                after: start..start + 1,
+            }
+        })
+        .collect::<Vec<_>>();
+    let units = (0..REGION_COUNT)
+        .map(|index| {
+            let start = index * 4;
+            UnitLineGeometry {
+                before: start..start + 2,
+                after: start..start + 2,
+                changed: true,
+                expands_fallback: true,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    close_fallbacks_over_changed_units(&mut fallbacks, &units);
+
+    assert_eq!(fallbacks.len(), REGION_COUNT);
+    for (index, fallback) in fallbacks.iter().enumerate() {
+        let start = index * 4;
+        assert_eq!(fallback.before, start..start + 2);
+        assert_eq!(fallback.after, start..start + 2);
+    }
+}
+
+#[test]
+fn terminator_delta_is_local_to_its_physical_row() {
+    let pair = project_pair(
+        Path::new("src/local.rs"),
+        "fn alpha() { old(); }\nfn stable() {\n    same();\n}\n",
+        "fn alpha() { new(); }\nfn stable() {\r\n    same();\n}\n",
+        false,
+    )
+    .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+
+    assert_eq!(
+        graph.line_ending_edits,
+        [LineLink {
+            before: 1,
+            after: 1,
+        }]
+    );
+    assert_eq!(
+        graph.line_fallbacks,
+        [LineFallback {
+            before: 1..2,
+            after: 1..2,
+        }]
+    );
 }
 
 #[test]
@@ -440,6 +570,282 @@ fn following_attributes_respect_established_owner_identity() {
     attributes.sort_unstable();
 
     assert_eq!(attributes, [(1, 1), (3, 3)]);
+}
+
+#[test]
+fn top_level_decorations_follow_matched_definition_owners() {
+    let before = concat!(
+        "#[derive(Clone)]\n",
+        "// explanatory comment\n",
+        "/// Alpha documentation.\n",
+        "struct Alpha { value: u8 }\n",
+        "\n",
+        "#[derive(Clone)]\n",
+        "/// Beta documentation.\n",
+        "struct Beta { value: u16 }\n",
+    );
+    let after = concat!(
+        "#[derive(Clone)]\n",
+        "/// Beta documentation.\n",
+        "struct Beta { value: u32 }\n",
+        "\n",
+        "#[derive(Clone)]\n",
+        "// explanatory comment\n",
+        "/// Alpha documentation.\n",
+        "struct Alpha { value: u8 }\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+
+    for before_line in [1, 3, 6, 7] {
+        let decoration = graph
+            .units
+            .iter()
+            .find_map(|edit| {
+                let UnitEdit::Matched(unit) = edit else {
+                    return None;
+                };
+                let node = pair.before.node(unit.before);
+                (node.lines.start == before_line && node.decoration_owner.is_some()).then_some(unit)
+            })
+            .expect("every decoration must remain paired");
+        let before_owner = pair
+            .before
+            .node(decoration.before)
+            .decoration_owner
+            .expect("before decoration owner");
+        let after_owner = pair
+            .after
+            .node(decoration.after)
+            .decoration_owner
+            .expect("after decoration owner");
+        assert_eq!(
+            pair.before.identity_text(before_owner),
+            pair.after.identity_text(after_owner),
+            "a repeated decoration must not cross semantic owners",
+        );
+        let owner = graph
+            .units
+            .iter()
+            .find_map(|edit| {
+                let UnitEdit::Matched(unit) = edit else {
+                    return None;
+                };
+                (unit.before == before_owner && unit.after == after_owner).then_some(unit)
+            })
+            .expect("a decoration can pair only through a matched owner");
+        assert_eq!(decoration.placement, owner.placement);
+    }
+
+    let comment = graph
+        .units
+        .iter()
+        .find_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            let before = pair.before.node(unit.before);
+            (before.kind == "line_comment" && before.lines.start == 2).then_some(unit)
+        })
+        .expect("ordinary commentary remains independently reviewable");
+    assert_eq!(pair.before.node(comment.before).decoration_owner, None);
+    assert_eq!(pair.after.node(comment.after).decoration_owner, None);
+    assert_eq!(pair.after.node(comment.after).lines.start, 6);
+}
+
+#[test]
+fn structural_decorations_inherit_movement_without_voting_on_it() {
+    let fingerprints = |index| NodeFingerprints {
+        full: FingerprintId(10_000 + index),
+        payload: Some(FingerprintId(20_000 + index)),
+        shape: FingerprintId(30_000 + index),
+    };
+    let unit = |id: usize, decoration_owner: Option<usize>| UnitRecord {
+        id: NodeId::new(id),
+        kind: "synthetic",
+        identity: None,
+        decoration_owner: decoration_owner.map(NodeId::new),
+        fingerprint: fingerprints(id),
+        shape: FingerprintId(30_000 + id),
+        evidence: Vec::new(),
+        mode: ReviewMode::Structural,
+    };
+    // The decorator crosses the other semantic owner. If it entered the LIS,
+    // it would choose a different definition as the apparent move.
+    let before = [unit(11, Some(10)), unit(10, None), unit(12, None)];
+    let after = [unit(22, None), unit(21, Some(20)), unit(20, None)];
+    let before_match = [Some(1), Some(2), Some(0)];
+    let after_match = [Some(2), Some(0), Some(1)];
+
+    assert_eq!(
+        stable_unit_matches(&before_match, &after_match, &before, &after),
+        [false, false, true],
+    );
+}
+
+#[test]
+fn root_owned_inner_doc_stays_ahead_of_a_removed_neighbor() {
+    let before = concat!(
+        "//! Crate contract.\n",
+        "use crate::obsolete;\n",
+        "use crate::kept;\n",
+    );
+    let after = concat!("//! Crate contract.\n", "use crate::kept;\n");
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let doc = graph
+        .units
+        .iter()
+        .position(|edit| {
+            matches!(
+                edit,
+                UnitEdit::Matched(unit)
+                    if pair.before.node(unit.before).kind == "line_comment"
+                        && unit.relation == ContentRelation::SourceEqual
+            )
+        })
+        .expect("the unchanged inner doc must remain paired through the source root");
+    let removed = graph
+        .units
+        .iter()
+        .position(|edit| {
+            matches!(
+                edit,
+                UnitEdit::Removed { before }
+                    if pair.before.identity_text(*before) == Some("crate::obsolete")
+            )
+        })
+        .expect("the obsolete import must remain a removal");
+
+    assert!(
+        doc < removed,
+        "source-order serialization must retain the root decoration"
+    );
+}
+
+#[test]
+fn repeated_decoration_cannot_escape_a_removed_owner() {
+    let before = concat!(
+        "#[derive(Clone)]\n",
+        "struct Alpha;\n",
+        "#[derive(Clone)]\n",
+        "struct Beta;\n",
+    );
+    let after = concat!("#[derive(Clone)]\n", "struct Beta;\n");
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let matched_attributes = graph
+        .units
+        .iter()
+        .filter_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            (pair.before.node(unit.before).kind == "attribute_item").then_some(unit)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matched_attributes.len(), 1);
+    assert_eq!(
+        pair.before.node(matched_attributes[0].before).lines.start,
+        3
+    );
+    assert_eq!(pair.after.node(matched_attributes[0].after).lines.start, 1);
+    assert!(graph.units.iter().any(|edit| {
+        matches!(edit, UnitEdit::Removed { before }
+            if pair.before.node(*before).kind == "attribute_item"
+                && pair.before.node(*before).lines.start == 1)
+    }));
+}
+
+#[test]
+fn nested_repeated_decorations_inherit_their_function_correspondence() {
+    let before = concat!(
+        "mod tests {\n",
+        "#[test]\n",
+        "/// Exercise contract.\n",
+        "fn alpha() { old(); }\n",
+        "#[test]\n",
+        "/// Exercise contract.\n",
+        "fn beta() { beta_body(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "#[test]\n",
+        "/// Exercise contract.\n",
+        "fn beta() { beta_body(); }\n",
+        "#[test]\n",
+        "/// Exercise contract.\n",
+        "fn alpha() { new(); }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let unit = only_matched(&graph);
+
+    for (name, before_attribute_line, before_docs_line, after_attribute_line, after_docs_line) in
+        [("alpha", 2, 3, 5, 6), ("beta", 5, 6, 2, 3)]
+    {
+        let before_attribute = composite_on_line(
+            &pair.before,
+            unit.before,
+            "attribute_item",
+            before_attribute_line,
+        );
+        let after_attribute = composite_on_line(
+            &pair.after,
+            unit.after,
+            "attribute_item",
+            after_attribute_line,
+        );
+        let before_docs = pair
+            .before
+            .nodes
+            .iter()
+            .position(|node| node.kind == "line_comment" && node.lines.start == before_docs_line)
+            .map(NodeId::new)
+            .expect("before documentation leaf");
+        let after_docs = pair
+            .after
+            .nodes
+            .iter()
+            .position(|node| node.kind == "line_comment" && node.lines.start == after_docs_line)
+            .map(NodeId::new)
+            .expect("after documentation leaf");
+        let attribute = composite_link(&graph, before_attribute);
+        let docs = graph
+            .before_leaf_link(before_docs)
+            .expect("documentation leaf must remain paired");
+
+        assert_eq!(attribute.after, after_attribute);
+        assert_eq!(docs.after, after_docs);
+        assert_eq!(attribute.placement, docs.placement);
+        assert_eq!(
+            pair.before
+                .identity_text(pair.before.node(before_attribute).decoration_owner.unwrap()),
+            Some(name),
+        );
+        assert_eq!(
+            pair.after
+                .identity_text(pair.after.node(after_attribute).decoration_owner.unwrap()),
+            Some(name),
+        );
+        assert_eq!(
+            pair.before
+                .identity_text(pair.before.node(before_docs).decoration_owner.unwrap()),
+            Some(name),
+        );
+        assert_eq!(
+            pair.after
+                .identity_text(pair.after.node(after_docs).decoration_owner.unwrap()),
+            Some(name),
+        );
+    }
 }
 
 #[test]
@@ -810,7 +1216,7 @@ fn skewed_evidence_work_uses_the_conservative_fallback_before_the_cell_limit() {
         id: NodeId::new(index),
         kind: "function_item",
         identity: None,
-        attachment: SiblingAttachment::None,
+        decoration_owner: None,
         fingerprint: NodeFingerprints {
             full: FingerprintId(60_000 + index),
             payload: None,
@@ -1075,8 +1481,8 @@ fn inner_attribute_remains_with_its_enclosing_module() {
     let inner = composite_link(&graph, before_inner);
 
     assert_eq!(
-        pair.before.node(before_inner).attachment,
-        SiblingAttachment::None
+        pair.before.node(before_inner).decoration_owner,
+        Some(unit.before)
     );
     assert_eq!(inner.after, after_inner);
     assert_eq!(inner.placement, Placement::Stable);
@@ -1130,23 +1536,46 @@ fn exact_leaf_moved_between_parents_is_explicitly_reparented() {
 }
 
 #[test]
-fn physical_line_certificate_covers_anchors_gaps_and_missing_sides() {
+fn physical_line_analysis_retains_terminator_edits_and_missing_sides() {
     let cases = [
-        ("same\n", "same", true),
-        ("old\r\n", "new\n", true),
-        ("same\n", "same\r\n", true),
-        ("", "new\n", false),
-        ("old\n", "", false),
-        ("old", "", true),
-        ("old\n", "new\n", false),
+        ("same\n", "same", 1, 0),
+        ("old\r\n", "new\n", 1, 0),
+        ("same\n", "same\r\n", 1, 0),
+        ("", "new\n", 0, 0),
+        ("old\n", "", 0, 0),
+        ("old", "", 0, 1),
+        ("old\n", "new\n", 0, 0),
     ];
 
-    for (before, after, expected) in cases {
+    for (before, after, ending_edits, missing_terminators) in cases {
         let pair = project_pair(Path::new("notes.txt"), before, after, false)
             .expect("line projection cannot fail");
-        let (_, requires_line_fallback) = physical_line_correspondence(&pair);
-        assert_eq!(requires_line_fallback, expected, "{before:?} -> {after:?}");
+        let facts = physical_line_correspondence(&pair);
+        assert_eq!(
+            facts.ending_edits.len(),
+            ending_edits,
+            "{before:?} -> {after:?}"
+        );
+        assert_eq!(
+            facts.missing_terminators.len(),
+            missing_terminators,
+            "{before:?} -> {after:?}",
+        );
     }
+}
+
+#[test]
+fn unequal_physical_gaps_do_not_invent_terminator_pairs() {
+    let pair = project_pair(
+        Path::new("notes.txt"),
+        "head\nold\ntail\n",
+        "head\ninserted\r\nnew\ntail\n",
+        false,
+    )
+    .expect("line projection cannot fail");
+    let facts = physical_line_correspondence(&pair);
+
+    assert!(facts.ending_edits.is_empty());
 }
 
 fn only_matched(graph: &Correspondence) -> &MatchedUnit {

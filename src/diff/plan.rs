@@ -10,14 +10,15 @@ use super::context::{
     context_halo_start, merge_windows_touch, ranges_overlap, review_selection_ranges,
 };
 use super::correspondence::{
-    Correspondence, LeafRelation, MatchedUnit, NodeLink, Placement, UnitEdit,
+    Correspondence, LeafRelation, LineLink, MatchedUnit, NodeLink, Placement, UnitEdit,
+    ordered_matches,
 };
 use super::projection::{ContentChannel, NodeId, Projection, ProjectionPair, ReviewMode};
 use super::render::{
     MarkedRange, build_display_line, build_display_lines, changed_display_lines, word_diff,
 };
 use super::source::SourceLine;
-use super::{DiffMark, DiffRow, DisplayLine, Hunk, LineCoverage, LineEnding, SyntaxClass};
+use super::{DiffMark, DiffRow, DisplayLine, Hunk, LineCoverage, LineEnding};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -208,13 +209,20 @@ struct ReviewSequence {
 }
 
 impl ReviewSequence {
-    fn new(pair: &ProjectionPair<'_, '_>, correspondence: &Correspondence) -> Self {
+    fn new(
+        pair: &ProjectionPair<'_, '_>,
+        correspondence: &Correspondence,
+        suppressed_units: &[bool],
+    ) -> Self {
         let mut sequence = Self {
             before_owner: vec![None; pair.before.source.lines().len() + 1],
             after_owner: vec![None; pair.after.source.lines().len() + 1],
             after_units: Vec::new(),
         };
         for (order, edit) in correspondence.units.iter().enumerate() {
+            if suppressed_units[order] {
+                continue;
+            }
             match edit {
                 UnitEdit::Matched(unit) => {
                     sequence.claim_before(pair.before.node(unit.before).lines.clone(), order);
@@ -349,19 +357,12 @@ impl<'graph> LineAlignment<'graph> {
     /// Unmatched old lines occupy an explicit gap; exact lines share current order.
     fn before_order(&self, line: usize) -> SourceOrder {
         let index = line.saturating_sub(1);
-        let insertion = self
-            .graph
-            .line_links
-            .partition_point(|link| link.before < index);
-        if let Some(link) = self.graph.line_links.get(insertion)
-            && link.before == index
-        {
+        if let Some(link) = self.line_pair_at_before(index) {
             return SourceOrder::current(link.after + 1);
         }
 
-        let preceding_lines = insertion
-            .checked_sub(1)
-            .and_then(|previous| self.graph.line_links.get(previous))
+        let preceding_lines = self
+            .preceding_line_pair(index)
             .map_or(0, |link| link.after + 1);
         let after_gap = if preceding_lines == 0 {
             AfterGap::BEFORE_FIRST
@@ -380,14 +381,40 @@ impl<'graph> LineAlignment<'graph> {
         Some(line.clamp(1, self.after_lines))
     }
 
-    fn exact_before_line(&self, after_line: usize) -> Option<usize> {
+    fn aligned_before_line(&self, after_line: usize) -> Option<usize> {
         let index = after_line.checked_sub(1)?;
-        let insertion = self
-            .graph
-            .line_links
-            .partition_point(|link| link.after < index);
-        let link = self.graph.line_links.get(insertion)?;
-        (link.after == index).then_some(link.before + 1)
+        self.line_pair_at_after(index).map(|link| link.before + 1)
+    }
+
+    /// Exact rows and explicit terminator edits share physical source order.
+    fn line_pair_at_before(&self, before: usize) -> Option<LineLink> {
+        [
+            line_link_at_before(&self.graph.line_links, before),
+            line_link_at_before(&self.graph.line_ending_edits, before),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|link| link.after)
+    }
+
+    fn line_pair_at_after(&self, after: usize) -> Option<LineLink> {
+        [
+            line_link_at_after(&self.graph.line_links, after),
+            line_link_at_after(&self.graph.line_ending_edits, after),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|link| link.before)
+    }
+
+    fn preceding_line_pair(&self, before: usize) -> Option<LineLink> {
+        [
+            preceding_line_link(&self.graph.line_links, before),
+            preceding_line_link(&self.graph.line_ending_edits, before),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|link| (link.before, link.after))
     }
 
     fn focus_order(&self, focus: &SignalFocus) -> SourceOrder {
@@ -434,6 +461,27 @@ impl<'graph> LineAlignment<'graph> {
     }
 }
 
+fn line_link_at_before(links: &[LineLink], before: usize) -> Option<LineLink> {
+    let index = links.partition_point(|link| link.before < before);
+    links
+        .get(index)
+        .copied()
+        .filter(|link| link.before == before)
+}
+
+fn line_link_at_after(links: &[LineLink], after: usize) -> Option<LineLink> {
+    let index = links.partition_point(|link| link.after < after);
+    links.get(index).copied().filter(|link| link.after == after)
+}
+
+fn preceding_line_link(links: &[LineLink], before: usize) -> Option<LineLink> {
+    let index = links.partition_point(|link| link.before < before);
+    index
+        .checked_sub(1)
+        .and_then(|index| links.get(index))
+        .copied()
+}
+
 /// Turn one neutral edit graph into the complete ordered review stream.
 pub(crate) fn plan_hunks(
     pair: &ProjectionPair<'_, '_>,
@@ -453,14 +501,21 @@ pub(crate) fn plan_hunks(
                 .is_some_and(|review| review.mode == ReviewMode::Linewise)
         });
     let anchor_facts = AnchorFacts::new(pair);
+    let fallback_index = FallbackIndex::new(&correspondence.line_fallbacks);
+    let suppressed_units = correspondence
+        .units
+        .iter()
+        .map(|edit| fallback_index.suppresses(pair, edit))
+        .collect::<Vec<_>>();
     let changes = if only_linewise {
         edit_fragments(plan_whole_file_lines(pair, correspondence, &anchor_facts))
     } else {
-        plan_units(pair, correspondence, &anchor_facts)
+        plan_units(pair, correspondence, &anchor_facts, &suppressed_units)
     };
 
     let alignment = LineAlignment::new(correspondence, pair.after.source.lines().len());
-    let review_sequence = (!only_linewise).then(|| ReviewSequence::new(pair, correspondence));
+    let review_sequence =
+        (!only_linewise).then(|| ReviewSequence::new(pair, correspondence, &suppressed_units));
     let mut changes = changes
         .into_iter()
         .map(|change| change.place(&alignment))
@@ -601,7 +656,7 @@ fn complete_display_gaps(
     displayed.dedup();
     let before_displayed = displayed
         .iter()
-        .filter_map(|line| alignment.exact_before_line(*line))
+        .filter_map(|line| alignment.aligned_before_line(*line))
         .collect::<Vec<_>>();
     trim_elisions_behind_context(&mut change.groups, &before_displayed, &displayed);
     let elisions = change
@@ -786,11 +841,15 @@ fn plan_units(
     pair: &ProjectionPair<'_, '_>,
     correspondence: &Correspondence,
     anchor_facts: &AnchorFacts,
+    suppressed_units: &[bool],
 ) -> Vec<ChangeFragment> {
     let mut fragments = Vec::new();
     let mut preceding_after_lines = 0;
 
-    for edit in &correspondence.units {
+    for (index, edit) in correspondence.units.iter().enumerate() {
+        if suppressed_units[index] {
+            continue;
+        }
         match edit {
             UnitEdit::Matched(unit) => {
                 plan_matched_unit(pair, correspondence, anchor_facts, unit, &mut fragments);
@@ -849,7 +908,85 @@ fn plan_units(
             }
         }
     }
+    for fallback in &correspondence.line_fallbacks {
+        let excerpts = plan_line_region(
+            pair,
+            correspondence,
+            one_based_line_range(&fallback.before),
+            one_based_line_range(&fallback.after),
+            &[],
+            None,
+            LineAnchors::new(AnchorBasis::Physical, anchor_facts),
+        );
+        fragments.extend(edit_fragments(excerpts));
+    }
     fragments
+}
+
+/// Disjoint local-fallback intervals shared by planning and final source ordering.
+struct FallbackIndex {
+    before: Vec<Range<usize>>,
+    after: Vec<Range<usize>>,
+}
+
+impl FallbackIndex {
+    fn new(fallbacks: &[super::correspondence::LineFallback]) -> Self {
+        let mut before = fallbacks
+            .iter()
+            .filter(|fallback| !fallback.before.is_empty())
+            .map(|fallback| fallback.before.clone())
+            .collect::<Vec<_>>();
+        let mut after = fallbacks
+            .iter()
+            .filter(|fallback| !fallback.after.is_empty())
+            .map(|fallback| fallback.after.clone())
+            .collect::<Vec<_>>();
+        before.sort_unstable_by_key(|range| (range.start, range.end));
+        after.sort_unstable_by_key(|range| (range.start, range.end));
+        debug_assert!(before.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        debug_assert!(after.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        Self { before, after }
+    }
+
+    fn suppresses(&self, pair: &ProjectionPair<'_, '_>, edit: &UnitEdit) -> bool {
+        let (before, after) = unit_line_indices(pair, edit);
+        indexed_ranges_overlap(&self.before, &before) || indexed_ranges_overlap(&self.after, &after)
+    }
+}
+
+fn indexed_ranges_overlap(ranges: &[Range<usize>], query: &Range<usize>) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let candidate = ranges.partition_point(|range| range.end <= query.start);
+    ranges
+        .get(candidate)
+        .is_some_and(|range| range.start < query.end)
+}
+
+fn unit_line_indices(
+    pair: &ProjectionPair<'_, '_>,
+    edit: &UnitEdit,
+) -> (Range<usize>, Range<usize>) {
+    match edit {
+        UnitEdit::Matched(unit) => (
+            node_line_indices(&pair.before, unit.before),
+            node_line_indices(&pair.after, unit.after),
+        ),
+        UnitEdit::Removed { before } => (node_line_indices(&pair.before, *before), 0..0),
+        UnitEdit::Added { after } => (0..0, node_line_indices(&pair.after, *after)),
+    }
+}
+
+fn node_line_indices(projection: &Projection<'_>, node: NodeId) -> Range<usize> {
+    line_indices(
+        Some(projection.node(node).lines.clone()),
+        projection.source.lines().len(),
+    )
+}
+
+fn one_based_line_range(lines: &Range<usize>) -> Option<Range<usize>> {
+    (!lines.is_empty()).then(|| lines.start + 1..lines.end + 1)
 }
 
 fn plan_matched_unit(
@@ -910,7 +1047,8 @@ fn plan_matched_unit(
                 return;
             }
 
-            let comments = comment_edits(pair, correspondence, unit);
+            let dependents = presentation_dependents(pair, correspondence, unit);
+            let comments = comment_edits(pair, correspondence, unit, &dependents);
             if unit.relation.payload_equal() {
                 fragments.extend(
                     plan_reflow_with_comments(pair, correspondence, unit, comments)
@@ -937,9 +1075,16 @@ fn plan_matched_unit(
                 return;
             }
             fragments.extend(
-                plan_payload(pair, correspondence, anchor_facts, unit, comments)
-                    .into_iter()
-                    .map(ChangeFragment::edit),
+                plan_payload(
+                    pair,
+                    correspondence,
+                    anchor_facts,
+                    unit,
+                    &dependents,
+                    comments,
+                )
+                .into_iter()
+                .map(ChangeFragment::edit),
             );
         }
     }
@@ -1072,6 +1217,11 @@ fn plan_move(pair: &ProjectionPair<'_, '_>, unit: &MatchedUnit) -> ReviewExcerpt
             rows: Vec::new(),
         };
     };
+    if let Some(rows) =
+        moved_rows_with_line_endings(pair, before.lines.clone(), after.lines.clone(), &lines)
+    {
+        return ReviewExcerpt { coverage, rows };
+    }
     if lines.len() == 1 {
         return ReviewExcerpt {
             coverage,
@@ -1101,6 +1251,127 @@ fn plan_move(pair: &ProjectionPair<'_, '_>, unit: &MatchedUnit) -> ReviewExcerpt
         after: last,
     });
     ReviewExcerpt { coverage, rows }
+}
+
+/// A move remains the primary fact, but concrete terminator edits inside it cannot disappear.
+fn moved_rows_with_line_endings(
+    pair: &ProjectionPair<'_, '_>,
+    before: Range<usize>,
+    after: Range<usize>,
+    lines: &[DisplayLine],
+) -> Option<Vec<DiffRow>> {
+    let before_indices = line_indices(Some(before.clone()), pair.before.source.lines().len());
+    let after_indices = line_indices(Some(after.clone()), pair.after.source.lines().len());
+    if after_indices.len() != lines.len() {
+        return None;
+    }
+    let before_text = before_indices
+        .clone()
+        .map(|index| pair.before.source.text(&pair.before.source.lines()[index]))
+        .collect::<Vec<_>>();
+    let after_text = after_indices
+        .clone()
+        .map(|index| pair.after.source.text(&pair.after.source.lines()[index]))
+        .collect::<Vec<_>>();
+    let matches = ordered_matches(&before_text, &after_text);
+    let mut matched_before = vec![false; before_indices.len()];
+    let mut matched_after = vec![false; after_indices.len()];
+    let mut endings = vec![None; after_indices.len()];
+    for link in matches {
+        matched_before[link.before] = true;
+        matched_after[link.after] = true;
+        let before_ending = pair.before.source.lines()[before_indices.start + link.before].ending;
+        let after_ending = pair.after.source.lines()[after_indices.start + link.after].ending;
+        if before_ending != after_ending {
+            endings[link.after] = Some((Some(before_ending), Some(after_ending)));
+        }
+    }
+
+    // Unmatched layout cannot create a line pair. Cancel equal special endings as
+    // multisets, then retain only the concrete one-sided source facts that remain.
+    let mut before_only = Vec::new();
+    for ending in [LineEnding::Missing, LineEnding::CrLf] {
+        let before_offsets = before_indices
+            .clone()
+            .enumerate()
+            .filter(|(offset, index)| {
+                !matched_before[*offset] && pair.before.source.lines()[*index].ending == ending
+            })
+            .map(|(_, index)| index)
+            .collect::<Vec<_>>();
+        let after_offsets = after_indices
+            .clone()
+            .enumerate()
+            .filter(|(offset, index)| {
+                !matched_after[*offset] && pair.after.source.lines()[*index].ending == ending
+            })
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        let cancelled = before_offsets.len().min(after_offsets.len());
+        before_only.extend(before_offsets.into_iter().skip(cancelled).map(|_| ending));
+        for offset in after_offsets.into_iter().skip(cancelled) {
+            endings[offset] = Some((None, Some(ending)));
+        }
+    }
+    if before_only.is_empty() && endings.iter().all(Option::is_none) {
+        return None;
+    }
+
+    let mut rows = vec![DiffRow::Moved {
+        before: Some(before.start),
+        after: lines[0].clone(),
+    }];
+    // A one-sided old terminator has no current line coordinate; the move header
+    // is the explicit owner of that old unit.
+    for ending in before_only {
+        rows.push(DiffRow::LineEnding {
+            before: Some(ending),
+            after: None,
+        });
+    }
+    append_moved_line_ending(&mut rows, endings[0]);
+    if lines.len() == 1 {
+        return Some(rows);
+    }
+
+    let last = lines.len() - 1;
+    let show_only_middle = (lines.len() == 3).then_some(1);
+    let mut offset = 1;
+    while offset < last {
+        let selected = show_only_middle == Some(offset) || endings[offset].is_some();
+        if selected {
+            rows.push(DiffRow::Line(lines[offset].clone()));
+            append_moved_line_ending(&mut rows, endings[offset]);
+            offset += 1;
+            continue;
+        }
+
+        let start = offset;
+        while offset < last && show_only_middle != Some(offset) && endings[offset].is_none() {
+            offset += 1;
+        }
+        rows.push(DiffRow::Elision(LineCoverage {
+            before: (before.len() == after.len())
+                .then(|| before.start + start..before.start + offset),
+            after: Some(after.start + start..after.start + offset),
+        }));
+    }
+    rows.push(DiffRow::Moved {
+        before: None,
+        after: lines[last].clone(),
+    });
+    append_moved_line_ending(&mut rows, endings[last]);
+    Some(rows)
+}
+
+fn append_moved_line_ending(
+    rows: &mut Vec<DiffRow>,
+    ending: Option<(Option<LineEnding>, Option<LineEnding>)>,
+) {
+    let Some((before, after)) = ending else {
+        return;
+    };
+    rows.push(DiffRow::LineEnding { before, after });
 }
 
 fn plan_reflow(
@@ -1195,6 +1466,7 @@ fn plan_payload(
     correspondence: &Correspondence,
     anchor_facts: &AnchorFacts,
     unit: &MatchedUnit,
+    dependents: &PresentationDependents,
     mut edits: Vec<LineEdit>,
 ) -> Vec<ReviewExcerpt> {
     let before = pair.before.node(unit.before);
@@ -1242,6 +1514,8 @@ fn plan_payload(
             ) && correspondence.after_leaf_link(*node).is_none()
         })
     }));
+    changed_before.retain(|leaf| !dependents.before.contains(leaf));
+    changed_after.retain(|leaf| !dependents.after.contains(leaf));
     let before_marked = marked_leaf_ranges(&pair.before, changed_before, DiffMark::Removed);
     let after_marked = marked_leaf_ranges(&pair.after, changed_after, DiffMark::Added);
     edits.extend(fully_marked_line_edits(
@@ -1317,6 +1591,7 @@ fn comment_edits(
     pair: &ProjectionPair<'_, '_>,
     correspondence: &Correspondence,
     unit: &MatchedUnit,
+    dependents: &PresentationDependents,
 ) -> Vec<LineEdit> {
     let mut edits = Vec::new();
     let linked_before = correspondence
@@ -1335,7 +1610,10 @@ fn comment_edits(
         let after_leaf = pair.after.node(link.after).leaf;
         let comment = before_leaf.is_some_and(|leaf| leaf.channel == ContentChannel::Comment)
             && after_leaf.is_some_and(|leaf| leaf.channel == ContentChannel::Comment);
+        let dependent =
+            dependents.before.contains(&link.before) && dependents.after.contains(&link.after);
         if !comment
+            || dependent
             || link.relation == LeafRelation::Exact
                 && link.placement == Placement::Stable
                 && !link.reparented
@@ -1387,6 +1665,93 @@ fn comment_edits(
     }
     deduplicate_line_edits(&mut edits);
     edits
+}
+
+/// Exact decorations presented with their semantic owner, never as independent signals.
+#[derive(Default)]
+struct PresentationDependents {
+    before: HashSet<NodeId>,
+    after: HashSet<NodeId>,
+}
+
+fn presentation_dependents(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    unit: &MatchedUnit,
+) -> PresentationDependents {
+    let mut dependents = PresentationDependents::default();
+    for link in correspondence.unit_composites(unit) {
+        let before = pair.before.node(link.before);
+        let after = pair.after.node(link.after);
+        if before.decoration_owner.is_none()
+            || after.decoration_owner.is_none()
+            || !physically_equal_isolated_nodes(pair, link.before, link.after)
+        {
+            continue;
+        }
+        dependents
+            .before
+            .extend(descendant_leaves(&pair.before, link.before));
+        dependents
+            .after
+            .extend(descendant_leaves(&pair.after, link.after));
+    }
+    for link in correspondence.unit_leaf_links(unit) {
+        if link.relation != LeafRelation::Exact
+            || pair.before.node(link.before).decoration_owner.is_none()
+            || pair.after.node(link.after).decoration_owner.is_none()
+            || !physically_equal_isolated_nodes(pair, link.before, link.after)
+        {
+            continue;
+        }
+        dependents.before.insert(link.before);
+        dependents.after.insert(link.after);
+    }
+    dependents
+}
+
+fn physically_equal_isolated_nodes(
+    pair: &ProjectionPair<'_, '_>,
+    before: NodeId,
+    after: NodeId,
+) -> bool {
+    if !node_is_presentational_line_isolated(&pair.before, before)
+        || !node_is_presentational_line_isolated(&pair.after, after)
+    {
+        return false;
+    }
+    let before = node_line_indices(&pair.before, before);
+    let after = node_line_indices(&pair.after, after);
+    physical_lines_equal(pair, &before, &after)
+}
+
+/// A decoration may own its newline, but never neighboring source content.
+fn node_is_presentational_line_isolated(projection: &Projection<'_>, node: NodeId) -> bool {
+    let node = projection.node(node);
+    let Some(first) = projection.source.line(node.lines.start) else {
+        return false;
+    };
+    let Some(last_number) = node.lines.end.checked_sub(1) else {
+        return false;
+    };
+    let Some(last) = projection.source.line(last_number) else {
+        return false;
+    };
+    if node.bytes.start < first.content_bytes.start || node.bytes.end > last.full_bytes.end {
+        return false;
+    }
+    if node.bytes.end > last.content_bytes.end && node.bytes.end != last.full_bytes.end {
+        return false;
+    }
+
+    let prefix = projection
+        .source
+        .slice(first.content_bytes.start..node.bytes.start);
+    let suffix_start = node.bytes.end.min(last.content_bytes.end);
+    let suffix = projection
+        .source
+        .slice(suffix_start..last.content_bytes.end);
+    prefix.is_some_and(horizontal_layout) && suffix.is_some_and(horizontal_layout)
 }
 
 fn modified_payload_edits(
@@ -1698,6 +2063,8 @@ enum LineFact {
         before: Range<usize>,
         after: Range<usize>,
     },
+    /// A physically paired row kept atomic so its concrete terminator stays visible.
+    TerminatorEdit { before: usize, after: usize },
     Reflow {
         before: Range<usize>,
         after: Range<usize>,
@@ -1733,7 +2100,7 @@ impl AnchorFacts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NodeAnchorFacts {
     has_opaque: bool,
     has_payload: bool,
@@ -1747,8 +2114,7 @@ fn projection_anchor_facts(projection: &Projection<'_>) -> Vec<NodeAnchorFacts> 
             .leaf
             .map_or_else(NodeAnchorFacts::default, |leaf| NodeAnchorFacts {
                 has_opaque: leaf.channel == ContentChannel::Opaque,
-                has_payload: leaf.channel != ContentChannel::Layout
-                    && leaf.syntax != SyntaxClass::Punctuation,
+                has_payload: leaf.channel != ContentChannel::Layout && !leaf.delimiter,
             });
         for child in &node.children {
             let child = facts[child.index()];
@@ -1773,6 +2139,10 @@ enum LineCheckpoint {
         before: usize,
         after: usize,
         strong: bool,
+    },
+    TerminatorEdit {
+        before: usize,
+        after: usize,
     },
     Retained(RetainedRegion),
 }
@@ -1846,13 +2216,20 @@ fn retained_regions(
     before_region: &Range<usize>,
     after_region: &Range<usize>,
 ) -> Vec<RetainedRegion> {
-    let crossed = structural_link_crossings(pair, composites);
-    let mut candidates = composites
+    // Decorations follow semantic owners; neither they nor their descendants
+    // may introduce checkpoints or make semantic links appear crossed.
+    let composites = composites
         .iter()
+        .copied()
+        .filter(|link| !link_belongs_to_decoration(pair, *link))
+        .collect::<Vec<_>>();
+    let crossed = structural_link_crossings(pair, &composites);
+    let mut candidates = composites
+        .into_iter()
         .zip(crossed)
         .filter(|(link, crossed)| link.placement == Placement::Stable && !crossed)
         .filter_map(|(link, _)| {
-            retained_region(pair, anchor_facts, *link, before_region, after_region)
+            retained_region(pair, anchor_facts, link, before_region, after_region)
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -1947,7 +2324,7 @@ fn retained_region(
     before_region: &Range<usize>,
     after_region: &Range<usize>,
 ) -> Option<RetainedRegion> {
-    if link.placement == Placement::Reordered {
+    if link.placement == Placement::Reordered || link_belongs_to_decoration(pair, link) {
         return None;
     }
     let before = pair.before.node(link.before);
@@ -1992,6 +2369,25 @@ fn retained_region(
         after: after_lines,
         retention,
     })
+}
+
+/// Decoration subtrees inherit presentation from their semantic owner.
+fn link_belongs_to_decoration(pair: &ProjectionPair<'_, '_>, link: NodeLink) -> bool {
+    node_belongs_to_decoration(&pair.before, link.before)
+        || node_belongs_to_decoration(&pair.after, link.after)
+}
+
+fn node_belongs_to_decoration(projection: &Projection<'_>, mut id: NodeId) -> bool {
+    loop {
+        let node = projection.node(id);
+        if node.decoration_owner.is_some() {
+            return true;
+        }
+        let Some(parent) = node.parent else {
+            return false;
+        };
+        id = parent;
+    }
 }
 
 /// Retaining a subtree may claim whole rows only when adjacent bytes are indentation.
@@ -2091,6 +2487,7 @@ fn line_facts(
     for checkpoint in checkpoints {
         let (before_end, after_end) = match &checkpoint {
             LineCheckpoint::Exact { before, after, .. } => (*before, *after),
+            LineCheckpoint::TerminatorEdit { before, after } => (*before, *after),
             LineCheckpoint::Retained(region) => (region.before.start, region.after.start),
         };
         if before_start < before_end || after_start < after_end {
@@ -2111,6 +2508,11 @@ fn line_facts(
                     after,
                     strong,
                 });
+                before_start = before + 1;
+                after_start = after + 1;
+            }
+            LineCheckpoint::TerminatorEdit { before, after } => {
+                facts.push(LineFact::TerminatorEdit { before, after });
                 before_start = before + 1;
                 after_start = after + 1;
             }
@@ -2161,7 +2563,7 @@ fn display_line_checkpoints(
     after_bounds: &Range<usize>,
     basis: AnchorBasis,
 ) -> Vec<LineCheckpoint> {
-    let checkpoints = exact_line_checkpoints(pair, correspondence, before, after);
+    let checkpoints = physical_line_checkpoints(pair, correspondence, before, after);
     let AnchorBasis::Structural { same_owner } = basis else {
         return checkpoints;
     };
@@ -2170,7 +2572,7 @@ fn display_line_checkpoints(
         .into_iter()
         .filter_map(|checkpoint| {
             let LineCheckpoint::Exact { before, after, .. } = checkpoint else {
-                unreachable!("physical line checkpoints are exact")
+                return Some(checkpoint);
             };
             let first = before == before_bounds.start && after == after_bounds.start;
             let last = before.checked_add(1) == Some(before_bounds.end)
@@ -2187,14 +2589,14 @@ fn display_line_checkpoints(
         .collect()
 }
 
-fn exact_line_checkpoints(
+fn physical_line_checkpoints(
     pair: &ProjectionPair<'_, '_>,
     correspondence: &Correspondence,
     before: Range<usize>,
     after: Range<usize>,
 ) -> Vec<LineCheckpoint> {
-    correspondence
-        .line_links_in(before, after)
+    let mut checkpoints = correspondence
+        .line_links_in(before.clone(), after.clone())
         .map(|link| {
             let strong = line_link_is_display_checkpoint(pair, link.before, link.after);
             LineCheckpoint::Exact {
@@ -2203,7 +2605,21 @@ fn exact_line_checkpoints(
                 strong,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    checkpoints.extend(
+        correspondence
+            .line_ending_edits_in(before.clone(), after.clone())
+            .map(|link| LineCheckpoint::TerminatorEdit {
+                before: link.before,
+                after: link.after,
+            }),
+    );
+    checkpoints.sort_by_key(|checkpoint| match checkpoint {
+        LineCheckpoint::Exact { before, after, .. }
+        | LineCheckpoint::TerminatorEdit { before, after } => (*before, *after),
+        LineCheckpoint::Retained(_) => unreachable!("retained regions are inserted separately"),
+    });
+    checkpoints
 }
 
 /// Exact substantive source text is sufficient to split physical replacement regions.
@@ -2236,7 +2652,9 @@ fn coalesce_weak_line_context(facts: Vec<LineFact>) -> Vec<LineFact> {
     for fact in facts {
         let strong = matches!(
             fact,
-            LineFact::Context { strong: true, .. } | LineFact::Reflow { .. }
+            LineFact::Context { strong: true, .. }
+                | LineFact::TerminatorEdit { .. }
+                | LineFact::Reflow { .. }
         );
         if !strong {
             flexible.push(fact);
@@ -2307,8 +2725,8 @@ fn merge_flexible_line_facts(facts: &[LineFact]) -> LineFact {
                 include_index_range(&mut before, removed.clone());
                 include_index_range(&mut after, added.clone());
             }
-            LineFact::Reflow { .. } => {
-                unreachable!("retained regions flush flexible line facts")
+            LineFact::TerminatorEdit { .. } | LineFact::Reflow { .. } => {
+                unreachable!("atomic and retained facts flush flexible line facts")
             }
         }
     }
@@ -2466,6 +2884,7 @@ fn context_fact_for_after_line(facts: &[LineFact], line: usize) -> Option<usize>
 fn line_fact_after_end(fact: &LineFact) -> usize {
     match fact {
         LineFact::Context { after, .. } => after + 1,
+        LineFact::TerminatorEdit { after, .. } => after + 1,
         LineFact::Edit { after, .. } | LineFact::Reflow { after, .. } => after.end,
     }
 }
@@ -2480,6 +2899,11 @@ fn line_fact_signal_lines(facts: &[LineFact], before_side: bool) -> HashSet<usiz
                 } else {
                     after
                 }
+            }
+            LineFact::TerminatorEdit { before, after } => {
+                let line = if before_side { before } else { after };
+                lines.insert(line + 1);
+                continue;
             }
             LineFact::Context { .. } => continue,
         };
@@ -2510,6 +2934,11 @@ fn append_line_fact_rows(
             include_index_coverage(&mut coverage.after, after.clone());
             append_line_change_rows(rows, pair, before.clone(), after.clone());
         }
+        LineFact::TerminatorEdit { before, after } => {
+            include_index_coverage(&mut coverage.before, *before..*before + 1);
+            include_index_coverage(&mut coverage.after, *after..*after + 1);
+            append_line_change_rows(rows, pair, *before..*before + 1, *after..*after + 1);
+        }
         LineFact::Reflow {
             before,
             after,
@@ -2535,6 +2964,10 @@ fn line_fact_coverage(facts: &[LineFact]) -> LineCoverage {
                 } else {
                     after.clone()
                 }
+            }
+            LineFact::TerminatorEdit { before, after } => {
+                let line = if before_side { before } else { after };
+                *line..*line + 1
             }
         };
         let start = facts
@@ -2867,9 +3300,17 @@ fn structural_context_lines(
 
 /// Preserve replacement boundaries before independently planned excerpts coalesce.
 fn group_rows(rows: Vec<DiffRow>) -> Vec<Vec<DiffRow>> {
-    let mut groups = Vec::new();
+    let mut groups: Vec<Vec<DiffRow>> = Vec::new();
     let mut rows = rows.into_iter().peekable();
     while let Some(row) = rows.next() {
+        if matches!(row, DiffRow::LineEnding { .. })
+            && let Some(group) = groups.last_mut()
+        {
+            // Terminators have no independent geometry; they follow the source
+            // row whose physical ending they describe.
+            group.push(row);
+            continue;
+        }
         if !matches!(row, DiffRow::LineChange { .. }) {
             groups.push(vec![row]);
             continue;
@@ -2918,6 +3359,15 @@ fn order_replacement_group(rows: Vec<DiffRow>) -> Vec<DiffRow> {
                 before: old,
                 after: current,
             } => {
+                // A concrete terminator replacement is one source fact. Keep it
+                // beside the current row instead of fabricating remove/add facts.
+                if let (Some(old), Some(current)) = (old, current) {
+                    after.push(DiffRow::LineEnding {
+                        before: Some(old),
+                        after: Some(current),
+                    });
+                    continue;
+                }
                 before.extend(old.map(|ending| DiffRow::LineEnding {
                     before: Some(ending),
                     after: None,

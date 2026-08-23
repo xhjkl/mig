@@ -76,7 +76,7 @@ fn html_optional_paragraph_end_tag_keeps_structural_anchors() {
     assert!(is_descendant(&pair.after, after_img, after_div));
 
     let graph = correspond(&pair);
-    assert!(!graph.requires_line_fallback);
+    assert!(graph.line_fallbacks.is_empty());
     assert!(graph.composites.iter().any(|link| {
         link.before == before_img
             && link.after == after_img
@@ -329,6 +329,7 @@ fn tree_sitter_arenas_are_byte_total_and_retain_intrinsic_numeric_prefixes() {
         Some(Leaf {
             syntax: SyntaxClass::Literal,
             channel: ContentChannel::Syntax,
+            delimiter: false,
         })
     );
     let parent = pair.before.node(digit).parent.unwrap();

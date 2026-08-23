@@ -1,10 +1,8 @@
 use super::tree_sitter::{
-    self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
+    self, Adapter, DecorationHint, GapContext, HighlightQueries, NodeAnnotation, NodeContext,
+    ProjectFailure,
 };
-use super::{
-    ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit,
-    SiblingAttachment,
-};
+use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
 use crate::diff::source::Source;
 use ::tree_sitter::Language as TreeSitterLanguage;
 
@@ -35,16 +33,21 @@ impl Adapter for RustAdapter {
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "source_file" {
-            return NodeAnnotation::default();
+            return NodeAnnotation {
+                owns_decorations: true,
+                ..NodeAnnotation::default()
+            };
         }
 
         if is_comment(node.kind()) {
             let review = (context.parent_kind == Some("source_file"))
                 .then(|| ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None));
+            let text = &context.source[node.byte_range()];
             return NodeAnnotation {
                 review,
                 channel: Some(ContentChannel::Comment),
                 descendant_channel: Some(ContentChannel::Comment),
+                decoration: doc_comment_decoration(node.kind(), text),
                 prune_children: true,
                 ..NodeAnnotation::default()
             };
@@ -60,6 +63,7 @@ impl Adapter for RustAdapter {
             return NodeAnnotation {
                 review,
                 identity,
+                owns_decorations: true,
                 ..NodeAnnotation::default()
             };
         }
@@ -72,14 +76,15 @@ impl Adapter for RustAdapter {
             return NodeAnnotation {
                 review,
                 identity,
+                owns_decorations: true,
                 ..NodeAnnotation::default()
             };
         }
 
-        let attachment = if node.kind() == "attribute_item" {
-            SiblingAttachment::Following
-        } else {
-            SiblingAttachment::None
+        let decoration = match node.kind() {
+            "attribute_item" => DecorationHint::FollowingSibling,
+            "inner_attribute_item" => DecorationHint::EnclosingOwner,
+            _ => DecorationHint::None,
         };
         if context.parent_kind == Some("source_file") && node.is_named() {
             return NodeAnnotation {
@@ -87,13 +92,15 @@ impl Adapter for RustAdapter {
                     ReviewMode::Linewise,
                     LayoutOwnership::AdjacentBlankLines,
                 )),
-                attachment,
+                decoration,
+                owns_decorations: true,
                 ..NodeAnnotation::default()
             };
         }
 
         NodeAnnotation {
-            attachment,
+            decoration,
+            owns_decorations: is_nested_decoration_owner(node.kind()),
             ..NodeAnnotation::default()
         }
     }
@@ -126,6 +133,36 @@ fn is_comment(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment")
 }
 
+fn doc_comment_decoration(kind: &str, text: &str) -> DecorationHint {
+    match kind {
+        "line_comment" if text.starts_with("//!") => DecorationHint::EnclosingOwner,
+        "line_comment" if text.starts_with("///") && !text.starts_with("////") => {
+            DecorationHint::FollowingSibling
+        }
+        "block_comment" if text.starts_with("/*!") => DecorationHint::EnclosingOwner,
+        "block_comment" if text.starts_with("/**") && !text.starts_with("/***") => {
+            DecorationHint::FollowingSibling
+        }
+        "line_comment" | "block_comment" => DecorationHint::None,
+        _ => unreachable!("doc-comment policy receives only Rust comments"),
+    }
+}
+
+/// Nested semantic boundaries that may receive an outer attribute or documentation comment.
+fn is_nested_decoration_owner(kind: &str) -> bool {
+    is_definition(kind)
+        || matches!(
+            kind,
+            "associated_type"
+                | "enum_variant"
+                | "field_declaration"
+                | "function_signature_item"
+                | "let_declaration"
+                | "macro_invocation"
+                | "match_arm"
+        )
+}
+
 /// External module declarations are source wiring; inline modules remain definitions.
 fn is_bodyless_module(node: ::tree_sitter::Node<'_>) -> bool {
     node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
@@ -153,6 +190,7 @@ fn is_definition(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::projection::NodeId;
 
     #[test]
     fn bodyless_modules_are_compact_but_inline_modules_are_structural() {
@@ -188,8 +226,102 @@ mod tests {
             .iter()
             .find(|node| node.kind == "inner_attribute_item")
             .expect("inner attribute");
+        let module = projection
+            .nodes
+            .iter()
+            .position(|node| node.kind == "mod_item")
+            .map(NodeId::new)
+            .expect("module owner");
+        let function = projection
+            .nodes
+            .iter()
+            .position(|node| node.kind == "function_item")
+            .map(NodeId::new)
+            .expect("function owner");
 
-        assert_eq!(outer.attachment, SiblingAttachment::Following);
-        assert_eq!(inner.attachment, SiblingAttachment::None);
+        assert_eq!(outer.decoration_owner, Some(function));
+        assert_eq!(inner.decoration_owner, Some(module));
+    }
+
+    #[test]
+    fn outer_decorations_cross_independent_comments_to_their_declared_owner() {
+        let source = Source::new(concat!(
+            "#[derive(Clone)]\n",
+            "// explanatory comment\n",
+            "/// Alpha documentation.\n",
+            "struct Alpha { value: u8 }\n",
+            "\n",
+            "#[derive(Clone)]\n",
+            "/// Beta documentation.\n",
+            "struct Beta { value: u16 }\n",
+        ));
+        let projection = project(source);
+        let Ok(projection) = projection else {
+            panic!("Rust source must project");
+        };
+        let node_on_line = |kind: &str, line: usize| {
+            projection
+                .nodes
+                .iter()
+                .position(|node| node.kind == kind && node.lines.start == line)
+                .map(NodeId::new)
+                .expect("expected syntax node")
+        };
+        let alpha = node_on_line("struct_item", 4);
+        let beta = node_on_line("struct_item", 8);
+        let alpha_attribute = node_on_line("attribute_item", 1);
+        let ordinary_comment = node_on_line("line_comment", 2);
+        let alpha_docs = node_on_line("line_comment", 3);
+        let beta_attribute = node_on_line("attribute_item", 6);
+        let beta_docs = node_on_line("line_comment", 7);
+
+        assert_eq!(
+            projection.node(alpha_attribute).decoration_owner,
+            Some(alpha)
+        );
+        assert_eq!(projection.node(alpha_docs).decoration_owner, Some(alpha));
+        assert_eq!(projection.node(ordinary_comment).decoration_owner, None);
+        assert_eq!(projection.node(beta_attribute).decoration_owner, Some(beta));
+        assert_eq!(projection.node(beta_docs).decoration_owner, Some(beta));
+    }
+
+    #[test]
+    fn nested_outer_and_inner_docs_choose_following_and_enclosing_owners() {
+        let source = Source::new(concat!(
+            "mod tests {\n",
+            "#![allow(dead_code)]\n",
+            "//! Module line documentation.\n",
+            "/*! Module block documentation. */\n",
+            "#[test]\n",
+            "/// Alpha documentation.\n",
+            "fn alpha() {}\n",
+            "}\n",
+        ));
+        let projection = project(source);
+        let Ok(projection) = projection else {
+            panic!("Rust source must project");
+        };
+        let node_on_line = |kind: &str, line: usize| {
+            projection
+                .nodes
+                .iter()
+                .position(|node| node.kind == kind && node.lines.start == line)
+                .map(NodeId::new)
+                .expect("expected syntax node")
+        };
+        let module = node_on_line("mod_item", 1);
+        let inner_attribute = node_on_line("inner_attribute_item", 2);
+        let inner_line_docs = node_on_line("line_comment", 3);
+        let inner_block_docs = node_on_line("block_comment", 4);
+        let outer_attribute = node_on_line("attribute_item", 5);
+        let outer_docs = node_on_line("line_comment", 6);
+        let function = node_on_line("function_item", 7);
+
+        for decoration in [inner_attribute, inner_line_docs, inner_block_docs] {
+            assert_eq!(projection.node(decoration).decoration_owner, Some(module));
+        }
+        for decoration in [outer_attribute, outer_docs] {
+            assert_eq!(projection.node(decoration).decoration_owner, Some(function));
+        }
     }
 }

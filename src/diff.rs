@@ -141,17 +141,6 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
 
     let pair = projection::project_pair(Path::new(path), before, after, generated)?;
     let correspondence = correspondence::correspond(&pair);
-    let (pair, correspondence) = if correspondence.requires_line_fallback
-        && pair.before.language != projection::Language::Lines
-    {
-        let pair =
-            projection::line_pair(before, after, projection::FallbackReason::SourceExactness);
-        let correspondence = correspondence::correspond(&pair);
-        (pair, correspondence)
-    } else {
-        (pair, correspondence)
-    };
-
     let hunks = plan::plan_hunks(&pair, &correspondence);
     Ok(FileDiff {
         path: path.to_owned(),

@@ -1,6 +1,6 @@
 use super::{
     ContentChannel, FallbackReason, Language, LayoutOwnership, Leaf, NodeId, Projection,
-    ProjectionHealth, ReviewMode, ReviewUnit, SiblingAttachment, SyntaxNode,
+    ProjectionHealth, ReviewMode, ReviewUnit, SyntaxNode,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -23,7 +23,7 @@ pub(super) fn project<'source>(
         children: Vec::with_capacity(source.lines().len()),
         leaf: None,
         identity: None,
-        attachment: SiblingAttachment::None,
+        decoration_owner: None,
         review: None,
         named: true,
         extra: false,
@@ -43,9 +43,10 @@ pub(super) fn project<'source>(
             leaf: Some(Leaf {
                 syntax: SyntaxClass::Plain,
                 channel: ContentChannel::Opaque,
+                delimiter: false,
             }),
             identity: Some(line.full_bytes.clone()),
-            attachment: SiblingAttachment::None,
+            decoration_owner: None,
             review: Some(ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None)),
             named: true,
             extra: false,

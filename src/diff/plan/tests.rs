@@ -1,4 +1,5 @@
 use super::*;
+use crate::diff::SyntaxClass;
 use crate::diff::correspondence::correspond;
 use crate::diff::projection::project_pair;
 use std::collections::HashSet;
@@ -7,7 +8,50 @@ use std::path::Path;
 fn planned(path: &str, before: &str, after: &str) -> Vec<Hunk> {
     let pair = project_pair(Path::new(path), before, after, false).unwrap();
     let correspondence = correspond(&pair);
-    plan_hunks(&pair, &correspondence)
+    let hunks = plan_hunks(&pair, &correspondence);
+    assert_source_space_invariants(path, &hunks);
+    assert_local_fallbacks_are_signal(path, &correspondence, &hunks);
+    hunks
+}
+
+/// Every non-exact row admitted to local line review remains materialized as an edit.
+fn assert_local_fallbacks_are_signal(path: &str, correspondence: &Correspondence, hunks: &[Hunk]) {
+    let mut before_signal = HashSet::new();
+    let mut after_signal = HashSet::new();
+    for row in hunks.iter().flat_map(|hunk| &hunk.rows) {
+        let DiffRow::LineChange { before, after } = row else {
+            continue;
+        };
+        before_signal.extend(before.as_ref().map(|line| line.number.saturating_sub(1)));
+        after_signal.extend(after.as_ref().map(|line| line.number.saturating_sub(1)));
+    }
+    let before_exact = correspondence
+        .line_links
+        .iter()
+        .map(|link| link.before)
+        .collect::<HashSet<_>>();
+    let after_exact = correspondence
+        .line_links
+        .iter()
+        .map(|link| link.after)
+        .collect::<HashSet<_>>();
+
+    for fallback in &correspondence.line_fallbacks {
+        for line in fallback.before.clone() {
+            assert!(
+                before_exact.contains(&line) || before_signal.contains(&line),
+                "{path} hides before line {} inside local fallback {fallback:#?}: {hunks:#?}",
+                line + 1,
+            );
+        }
+        for line in fallback.after.clone() {
+            assert!(
+                after_exact.contains(&line) || after_signal.contains(&line),
+                "{path} hides current line {} inside local fallback {fallback:#?}: {hunks:#?}",
+                line + 1,
+            );
+        }
+    }
 }
 
 #[test]
@@ -20,6 +64,17 @@ fn move_merge_window_does_not_borrow_an_edit_halo() {
     assert!(merge_windows_touch(&moved, &near_edit));
     assert!(!merge_windows_touch(&moved, &distant_edit));
     assert!(merge_windows_touch(&first_edit, &distant_edit));
+}
+
+#[test]
+fn fallback_index_ignores_an_empty_counterpart_coordinate() {
+    let index = FallbackIndex::new(&[crate::diff::correspondence::LineFallback {
+        before: 7..8,
+        after: 7..7,
+    }]);
+
+    assert!(indexed_ranges_overlap(&index.before, &(2..9)));
+    assert!(!indexed_ranges_overlap(&index.after, &(2..10)));
 }
 
 fn line_text(line: &DisplayLine) -> String {
@@ -39,12 +94,43 @@ fn current_line(row: &DiffRow) -> Option<&DisplayLine> {
     }
 }
 
-/// Materialized source rows have one display owner inside a visual hunk.
-fn assert_single_source_row_ownership(hunks: &[Hunk]) {
-    for hunk in hunks {
+/// Current-world coverage represented by one planned row; old-only ghosts have none.
+fn current_world_coverage(row: &DiffRow) -> Option<Range<usize>> {
+    match row {
+        DiffRow::Line(line) | DiffRow::Reflow(line) | DiffRow::Moved { after: line, .. } => {
+            Some(line.number..line.number.saturating_add(1))
+        }
+        DiffRow::LineChange {
+            after: Some(line), ..
+        } => Some(line.number..line.number.saturating_add(1)),
+        DiffRow::Wordwise(word) => word.after_line.map(|line| line..line.saturating_add(1)),
+        DiffRow::Elision(coverage) => coverage.after.clone(),
+        DiffRow::LineChange { after: None, .. }
+        | DiffRow::LineEnding { .. }
+        | DiffRow::FileBoundary => None,
+    }
+}
+
+/// Planned rows remain ordered and singly owned inside each visual hunk.
+///
+/// Ownership is deliberately hunk-local: an ancestor breadcrumb may frame two distant hunks.
+fn assert_source_space_invariants(path: &str, hunks: &[Hunk]) {
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
         let mut before = HashSet::new();
         let mut after = HashSet::new();
-        for row in &hunk.rows {
+        let mut previous_current_end = None;
+        for (row_index, row) in hunk.rows.iter().enumerate() {
+            if let Some(current) = current_world_coverage(row) {
+                if let Some(previous_end) = previous_current_end {
+                    assert!(
+                        current.start >= previous_end,
+                        "{path} hunk {hunk_index} row {row_index} moves backwards or overlaps \
+                         current source after {previous_end}: {row:#?}\n{hunk:#?}",
+                    );
+                }
+                previous_current_end = Some(current.end);
+            }
+
             let (before_line, after_line) = match row {
                 DiffRow::Line(line) | DiffRow::Reflow(line) => (None, Some(line.number)),
                 DiffRow::LineChange { before, after } => (
@@ -60,13 +146,15 @@ fn assert_single_source_row_ownership(hunks: &[Hunk]) {
             if let Some(line) = before_line {
                 assert!(
                     before.insert(line),
-                    "before line {line} has multiple owners in one hunk: {hunk:#?}",
+                    "{path} hunk {hunk_index} gives before line {line} multiple display owners: \
+                     {hunk:#?}",
                 );
             }
             if let Some(line) = after_line {
                 assert!(
                     after.insert(line),
-                    "current line {line} has multiple owners in one hunk: {hunk:#?}",
+                    "{path} hunk {hunk_index} gives current line {line} multiple display owners: \
+                     {hunk:#?}",
                 );
             }
         }
@@ -116,6 +204,50 @@ fn retained_html_child_uses_after_indentation() {
 }
 
 #[test]
+fn display_syntax_does_not_change_structural_anchor_admission() {
+    let before = "<article>\n  <img\n  src=\"ada.webp\"\n  />\n</article>\n";
+    let after =
+        "<article>\n  <div>\n    <img\n      src=\"ada.webp\"\n    />\n  </div>\n</article>\n";
+    let pair = project_pair(Path::new("view.html"), before, after, false).unwrap();
+    let correspondence = correspond(&pair);
+    let baseline_facts = AnchorFacts::new(&pair);
+    let baseline = plan_hunks(&pair, &correspondence);
+
+    let mut recolored = pair.clone();
+    for projection in [&mut recolored.before, &mut recolored.after] {
+        for node in &mut projection.nodes {
+            if let Some(leaf) = &mut node.leaf {
+                leaf.syntax = SyntaxClass::Punctuation;
+            }
+        }
+    }
+    let recolored_facts = AnchorFacts::new(&recolored);
+    assert_eq!(baseline_facts.before, recolored_facts.before);
+    assert_eq!(baseline_facts.after, recolored_facts.after);
+
+    let correspondence = correspond(&recolored);
+    let recolored = plan_hunks(&recolored, &correspondence);
+    let reflows = |hunks: &[Hunk]| {
+        hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .filter_map(|row| match row {
+                DiffRow::Reflow(line) => Some((line.number, line_text(line))),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let baseline = reflows(&baseline);
+    assert!(
+        baseline
+            .iter()
+            .any(|(_, text)| text == "      src=\"ada.webp\""),
+        "fixture must exercise a retained structural anchor: {baseline:#?}",
+    );
+    assert_eq!(baseline, reflows(&recolored));
+}
+
+#[test]
 fn opaque_plaintext_body_stays_literal() {
     let before = "<plaintext>\n</plaintext>\n  <img>\n";
     let after = "<plaintext>\n</plaintext>\n  <div>\n    <img>\n  </div>\n";
@@ -148,7 +280,8 @@ fn opaque_plaintext_body_stays_literal() {
 fn replacement_group_uses_current_position_and_deletion_uses_its_gap() {
     let graph = Correspondence {
         units: Vec::new(),
-        requires_line_fallback: false,
+        line_ending_edits: Vec::new(),
+        line_fallbacks: Vec::new(),
         line_links: vec![crate::diff::correspondence::LineLink {
             before: 91,
             after: 91,
@@ -201,7 +334,8 @@ fn replacement_group_uses_current_position_and_deletion_uses_its_gap() {
 fn deletion_gaps_are_stable_before_first_between_anchors_at_eof_and_when_empty() {
     let graph = Correspondence {
         units: Vec::new(),
-        requires_line_fallback: false,
+        line_ending_edits: Vec::new(),
+        line_fallbacks: Vec::new(),
         line_links: vec![
             crate::diff::correspondence::LineLink {
                 before: 1,
@@ -226,7 +360,8 @@ fn deletion_gaps_are_stable_before_first_between_anchors_at_eof_and_when_empty()
 
     let empty = Correspondence {
         units: Vec::new(),
-        requires_line_fallback: false,
+        line_ending_edits: Vec::new(),
+        line_fallbacks: Vec::new(),
         line_links: Vec::new(),
         leaf_links: Vec::new(),
         before_leaf: Vec::new(),
@@ -478,13 +613,13 @@ fn removed_syntax_is_never_hidden_in_a_current_only_row() {
 }
 
 #[test]
-fn overlapping_syntax_units_fall_back_to_one_physical_row() {
+fn overlapping_syntax_units_review_one_physical_row_locally() {
     let diff = crate::diff::diff_file(
         "lib.rs",
         "fn alpha() {} fn beta() {}\n",
         "fn alpha() { x(); } fn beta() { y(); }\n",
     )
-    .expect("overlapping syntax units must safely reproject");
+    .expect("overlapping syntax units must review locally");
     let current = diff
         .hunks
         .iter()
@@ -854,7 +989,6 @@ fn changed_chain_repeats_inside_one_ordered_replacement_without_duplicate_source
         "}\n",
     );
     let hunks = planned("rust.rs", before, after);
-    assert_single_source_row_ownership(&hunks);
     let replacement = hunks
         .iter()
         .flat_map(|hunk| &hunk.rows)
@@ -910,7 +1044,6 @@ fn nearby_soft_continuation_repeats_inside_the_revision_runs() {
         .replace("old_first", "new_first")
         .replace("old_last", "new_last");
     let hunks = planned("chain.rs", before, &after);
-    assert_single_source_row_ownership(&hunks);
     let shared = hunks
         .iter()
         .flat_map(|hunk| &hunk.rows)
@@ -1000,7 +1133,6 @@ fn crossed_exact_children_repeat_instead_of_anchoring_an_outer_deletion() {
         "fn stable_tail() {}\n",
     );
     let hunks = planned("projection.rs", before, after);
-    assert_single_source_row_ownership(&hunks);
     let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
     let position = |needle: &str, mark: DiffMark| {
         rows.iter().position(|row| match row {
@@ -1132,7 +1264,6 @@ fn replaced_owner_repeats_its_shared_delimiter() {
             "fn tail() {}\n",
         ),
     );
-    assert_single_source_row_ownership(&hunks);
     let replacement = hunks
         .iter()
         .flat_map(|hunk| &hunk.rows)
@@ -1203,7 +1334,6 @@ fn documentation_does_not_turn_crossing_variants_into_display_anchors() {
             .iter()
             .any(|row| matches!(row, DiffRow::Elision(_)))
     );
-    assert_single_source_row_ownership(&hunks);
     let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
     assert!(rows.iter().any(|row| {
         matches!(
@@ -1296,6 +1426,68 @@ fn documentation_does_not_turn_crossing_variants_into_display_anchors() {
             matches!(row, DiffRow::Line(line) | DiffRow::Reflow(line) if line_text(line).contains(variant))
         }));
     }
+}
+
+#[test]
+fn stable_attribute_subtrees_cannot_become_structural_checkpoints() {
+    let before = concat!(
+        "mod tests {\n",
+        "    #[test]\n",
+        "    fn alpha() { old(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "    #[test]\n",
+        "    fn alpha() { new(); }\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("lib.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+    let attribute = graph
+        .composites
+        .iter()
+        .copied()
+        .find(|link| pair.before.node(link.before).kind == "attribute_item")
+        .expect("the stable test attribute must remain structurally paired");
+    let descendants = pair
+        .before
+        .descendants(attribute.before)
+        .collect::<HashSet<_>>();
+    let nested = graph
+        .composites
+        .iter()
+        .copied()
+        .find(|link| descendants.contains(&link.before))
+        .expect("the attribute must retain a paired nested subtree");
+    let before_region = 0..pair.before.source.lines().len();
+    let after_region = 0..pair.after.source.lines().len();
+    let anchor_facts = AnchorFacts::new(&pair);
+
+    assert!(link_belongs_to_decoration(&pair, attribute));
+    assert_eq!(pair.before.node(nested.before).decoration_owner, None);
+    assert!(link_belongs_to_decoration(&pair, nested));
+    assert!(
+        retained_region(
+            &pair,
+            &anchor_facts,
+            attribute,
+            &before_region,
+            &after_region,
+        )
+        .is_none()
+    );
+    assert!(
+        retained_regions(
+            &pair,
+            &anchor_facts,
+            &[attribute, nested],
+            &before_region,
+            &after_region,
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -1841,7 +2033,7 @@ fn history_shape_crosses_unit_boundaries_without_losing_source_order() {
     let position = |predicate: &dyn Fn(&DiffRow) -> bool| {
         rows.iter()
             .position(|row| predicate(row))
-            .expect("expected history row")
+            .unwrap_or_else(|| panic!("expected history row: {hunks:#?}"))
     };
     let module = position(&|row| matches!(row, DiffRow::Line(line) if line.number == 1));
     let removed_import = position(&|row| {

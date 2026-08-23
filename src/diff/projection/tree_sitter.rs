@@ -1,6 +1,5 @@
 use super::{
-    ContentChannel, Language, Leaf, NodeId, Projection, ProjectionHealth, ReviewUnit,
-    SiblingAttachment, SyntaxNode,
+    ContentChannel, Language, Leaf, NodeId, Projection, ProjectionHealth, ReviewUnit, SyntaxNode,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -59,6 +58,17 @@ impl GapContext<'_, '_> {
     }
 }
 
+/// Frontend instruction resolved to one concrete decoration-owner edge after projection.
+#[derive(Clone, Copy, Default)]
+pub(super) enum DecorationHint {
+    #[default]
+    None,
+    /// Decorates the next frontend-declared owner in this sibling scope.
+    FollowingSibling,
+    /// Decorates the nearest frontend-declared enclosing owner.
+    EnclosingOwner,
+}
+
 /// Language decision for one parser node before its parser handle is discarded.
 #[derive(Default)]
 pub(super) struct NodeAnnotation {
@@ -67,8 +77,10 @@ pub(super) struct NodeAnnotation {
     pub(super) descendant_channel: Option<ContentChannel>,
     /// Language-specific spelling used as a graph identity, independent of review units.
     pub(super) identity: Option<Range<usize>>,
-    /// Local sibling ownership used only after the following sibling has correspondence.
-    pub(super) attachment: SiblingAttachment,
+    /// Source-language decoration relationship; resolved only after all siblings exist.
+    pub(super) decoration: DecorationHint,
+    /// Whether this semantic boundary may own decorations.
+    pub(super) owns_decorations: bool,
     /// Language-owned extent when the grammar stops before the semantic content does.
     pub(super) extent: Option<Range<usize>>,
     /// Treat the node's complete byte range as one payload and discard parser children.
@@ -257,6 +269,8 @@ fn project_nodes(
     highlights: &HashMap<usize, Highlight>,
 ) -> Vec<SyntaxNode> {
     let mut nodes = Vec::<SyntaxNode>::new();
+    let mut decoration_hints = Vec::<DecorationHint>::new();
+    let mut decoration_owners = Vec::<bool>::new();
     let mut pending = vec![Pending::Parser(PendingNode {
         node: root,
         parent: None,
@@ -278,6 +292,10 @@ fn project_nodes(
                 let lines = source
                     .line_coverage(fragment.bytes.clone())
                     .expect("source fragments remain inside source geometry");
+                let spelling = source
+                    .slice(fragment.bytes.clone())
+                    .expect("source fragments remain inside source geometry");
+                let delimiter = is_delimiter_spelling(spelling);
                 nodes.push(SyntaxNode {
                     kind: "source_fragment",
                     field: None,
@@ -288,14 +306,17 @@ fn project_nodes(
                     leaf: Some(Leaf {
                         syntax: fragment.syntax,
                         channel: fragment.channel,
+                        delimiter,
                     }),
                     identity: None,
-                    attachment: SiblingAttachment::None,
+                    decoration_owner: None,
                     review: None,
                     named: false,
                     extra: false,
                     missing: false,
                 });
+                decoration_hints.push(DecorationHint::None);
+                decoration_owners.push(false);
                 continue;
             }
             Pending::Parser(pending_node) => pending_node,
@@ -343,9 +364,16 @@ fn project_nodes(
         let lines = source
             .line_coverage(bytes.clone())
             .expect("tree-sitter nodes remain within their parsed source");
-        let leaf = (annotation.prune_children || node.child_count() == 0).then(|| Leaf {
-            syntax: leaf_syntax(node.kind(), leaf_channel, inherited_syntax),
-            channel: leaf_channel,
+        let leaf = (annotation.prune_children || node.child_count() == 0).then(|| {
+            let spelling = source
+                .slice(bytes.clone())
+                .expect("tree-sitter leaves remain inside source geometry");
+            Leaf {
+                syntax: leaf_syntax(node.kind(), leaf_channel, inherited_syntax),
+                channel: leaf_channel,
+                // Named leaves carry grammar meaning even when their spelling is punctuation.
+                delimiter: !node.is_named() && is_delimiter_spelling(spelling),
+            }
         });
         nodes.push(SyntaxNode {
             kind: node.kind(),
@@ -360,12 +388,14 @@ fn project_nodes(
             }),
             leaf,
             identity: annotation.identity,
-            attachment: annotation.attachment,
+            decoration_owner: None,
             review: annotation.review,
             named: node.is_named(),
             extra: node.is_extra(),
             missing: node.is_missing(),
         });
+        decoration_hints.push(annotation.decoration);
+        decoration_owners.push(annotation.owns_decorations);
 
         if annotation.prune_children || node.child_count() == 0 {
             continue;
@@ -409,7 +439,69 @@ fn project_nodes(
         }
         pending.extend(projected_children.into_iter().rev());
     }
+    resolve_decoration_owners(&mut nodes, &decoration_hints, &decoration_owners);
     nodes
+}
+
+/// Resolve frontend-declared decoration relationships without widening either source extent.
+fn resolve_decoration_owners(nodes: &mut [SyntaxNode], hints: &[DecorationHint], owners: &[bool]) {
+    debug_assert_eq!(nodes.len(), hints.len());
+    debug_assert_eq!(nodes.len(), owners.len());
+
+    for parent_index in 0..nodes.len() {
+        let parent = NodeId::new(parent_index);
+        let children = nodes[parent_index].children.clone();
+        let mut following_owner = None;
+        for child in children.into_iter().rev() {
+            match hints[child.index()] {
+                DecorationHint::FollowingSibling => {
+                    nodes[child.index()].decoration_owner = following_owner;
+                }
+                DecorationHint::EnclosingOwner => {
+                    nodes[child.index()].decoration_owner =
+                        nearest_decoration_owner(nodes, owners, parent);
+                }
+                DecorationHint::None if owners[child.index()] => {
+                    following_owner = Some(child);
+                }
+                DecorationHint::None if !decoration_transparent(&nodes[child.index()]) => {
+                    following_owner = None;
+                }
+                DecorationHint::None => {}
+            }
+        }
+    }
+}
+
+fn nearest_decoration_owner(
+    nodes: &[SyntaxNode],
+    owners: &[bool],
+    mut candidate: NodeId,
+) -> Option<NodeId> {
+    loop {
+        if owners[candidate.index()] {
+            return Some(candidate);
+        }
+        candidate = nodes[candidate.index()].parent?;
+    }
+}
+
+/// Layout and independent commentary may separate a decoration from its semantic owner.
+fn decoration_transparent(node: &SyntaxNode) -> bool {
+    !node.named
+        || node.leaf.is_some_and(|leaf| {
+            matches!(
+                leaf.channel,
+                ContentChannel::Comment | ContentChannel::Layout
+            )
+        })
+}
+
+/// Anonymous punctuation and spacing delimit syntax without carrying anchor payload.
+fn is_delimiter_spelling(spelling: &str) -> bool {
+    spelling
+        .chars()
+        .all(|character| character.is_whitespace() || character.is_ascii_punctuation())
 }
 
 fn fragment_pending<'tree>(

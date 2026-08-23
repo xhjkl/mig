@@ -48,8 +48,6 @@ pub(crate) enum FallbackReason {
     Unsupported,
     ParseError(ParseSide),
     SyntaxComplexity(ParseSide),
-    /// A concrete source fact, such as a terminator edit, is absent from the CST.
-    SourceExactness,
 }
 
 /// Revision whose parse prevented symmetric syntax correspondence.
@@ -106,14 +104,6 @@ impl ReviewMode {
     }
 }
 
-/// Language-declared ownership of an otherwise anonymous sibling prefix.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) enum SiblingAttachment {
-    #[default]
-    None,
-    Following,
-}
-
 /// Parser-omitted layout that a unit owns for source-completeness certification.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum LayoutOwnership {
@@ -139,6 +129,8 @@ impl ReviewUnit {
 pub(crate) struct Leaf {
     pub(crate) syntax: SyntaxClass,
     pub(crate) channel: ContentChannel,
+    /// Grammar delimiter status, kept independent of terminal highlighting.
+    pub(crate) delimiter: bool,
 }
 
 /// One neutral CST occurrence with exact source geometry and ordered containment.
@@ -155,8 +147,8 @@ pub(crate) struct SyntaxNode {
     pub(crate) leaf: Option<Leaf>,
     /// Exact source spelling used to disambiguate same-shaped graph nodes.
     pub(crate) identity: Option<Range<usize>>,
-    /// Adjacent sibling whose correspondence gives this anonymous node its local context.
-    pub(crate) attachment: SiblingAttachment,
+    /// Semantic syntax node decorated by this occurrence, independent of source extent.
+    pub(crate) decoration_owner: Option<NodeId>,
     /// Presence promotes this syntax node to an independently matched review unit.
     pub(crate) review: Option<ReviewUnit>,
     pub(crate) named: bool,

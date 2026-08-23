@@ -1,5 +1,6 @@
 use super::*;
 use crate::fixture::{AFTER, BEFORE, LABEL, web};
+use std::collections::HashSet;
 
 #[test]
 fn display_line_derives_change_state_from_its_spans() {
@@ -343,6 +344,177 @@ fn moved_definition_keeps_its_single_body_line_visible() {
             DiffRow::FileBoundary
         ]
     ));
+}
+
+#[test]
+fn moved_definition_keeps_its_terminator_edit_visible() {
+    let before = "fn alpha() { alpha(); }\nfn beta() { beta(); }\n";
+    let after = "fn beta() { beta(); }\nfn alpha() { alpha(); }\r\n";
+    let diff = diff_file("src/run.rs", before, after).expect("source must parse");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(
+        rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Moved {
+                    before: Some(_),
+                    after,
+                } if line_text(after).contains("fn alpha") || line_text(after).contains("fn beta")
+            )
+        }),
+        "{rows:#?}"
+    );
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineEnding {
+                before: Some(LineEnding::Lf),
+                after: Some(LineEnding::CrLf),
+            }
+        )
+    }));
+}
+
+#[test]
+fn moved_unit_owns_a_terminator_fallback_retained_by_physical_lcs() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    one();\n",
+        "    two();\n",
+        "    three();\n",
+        "}\n",
+        "fn beta() { beta(); }\n",
+    );
+    let after = concat!(
+        "fn beta() { beta(); }\n",
+        "fn alpha() {\r\n",
+        "    one();\n",
+        "    two();\n",
+        "    three();\n",
+        "}\n",
+    );
+    let diff = diff_file("src/move.rs", before, after).expect("source must parse");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(
+        rows.windows(2).any(|rows| {
+            matches!(
+                rows,
+                [
+                    DiffRow::Moved {
+                        before: Some(1),
+                        after,
+                    },
+                    DiffRow::LineEnding {
+                        before: Some(LineEnding::Lf),
+                        after: Some(LineEnding::CrLf),
+                    }
+                ] if after.number == 2 && line_text(after).contains("fn alpha")
+            )
+        }),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::LineChange { before, after }
+                    if before.as_ref().is_some_and(|line| line.number == 1)
+                        || after.as_ref().is_some_and(|line| line.number == 2)
+            )
+        }),
+        "the move must remain the sole producer: {rows:#?}"
+    );
+    assert_source_space_invariants("src/move.rs", &diff);
+}
+
+#[test]
+fn moved_reflow_owns_an_unmatched_missing_terminator() {
+    let before = "fn alpha(){alpha();}\nfn beta(){beta();}\n";
+    let after = "fn beta(){beta();}\nfn alpha() {\n    alpha();\n}";
+    let diff = diff_file("src/move.rs", before, after).expect("source must parse");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(
+        rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Moved { after, .. } if line_text(after).contains("fn alpha")
+            )
+        }),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.windows(2).any(|rows| {
+            matches!(
+                rows,
+                [
+                    DiffRow::Moved { after, .. },
+                    DiffRow::LineEnding {
+                        before: None,
+                        after: Some(LineEnding::Missing),
+                    }
+                ] if line_text(after) == "}"
+            )
+        }),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row, DiffRow::LineChange { .. })),
+        "the move must remain the sole producer: {rows:#?}"
+    );
+    assert_source_space_invariants("src/move.rs", &diff);
+}
+
+#[test]
+fn moved_reflow_keeps_an_unmatched_crlf_visible() {
+    let before = "fn alpha(){alpha();}\nfn beta(){beta();}\n";
+    let after = "fn beta(){beta();}\nfn alpha() {\r\n    alpha();\n}\n";
+    let diff = diff_file("src/run.rs", before, after).expect("source must parse");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(
+        rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::Moved { after, .. }
+                    if after.number == 2 && line_text(after).contains("fn alpha")
+            )
+        }),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| {
+            matches!(
+                row,
+                DiffRow::LineEnding {
+                    before: None,
+                    after: Some(LineEnding::CrLf),
+                }
+            )
+        }),
+        "{rows:#?}"
+    );
+    assert_source_space_invariants("src/run.rs", &diff);
 }
 
 #[test]
@@ -879,6 +1051,90 @@ fn inserted_top_level_test_keeps_attributes_with_their_definitions() {
 }
 
 #[test]
+fn reordered_decorated_definitions_do_not_churn_repeated_prefixes() {
+    let before = concat!(
+        "#[derive(Clone)]\n",
+        "// explanatory comment\n",
+        "/// Alpha documentation.\n",
+        "struct Alpha { value: u8 }\n",
+        "\n",
+        "#[derive(Clone)]\n",
+        "/// Beta documentation.\n",
+        "struct Beta { value: u16 }\n",
+    );
+    let after = concat!(
+        "#[derive(Clone)]\n",
+        "/// Beta documentation.\n",
+        "struct Beta { value: u32 }\n",
+        "\n",
+        "#[derive(Clone)]\n",
+        "// explanatory comment\n",
+        "/// Alpha documentation.\n",
+        "struct Alpha { value: u8 }\n",
+    );
+    let diff = diff_file("src/decorated.rs", before, after).expect("Rust must plan");
+
+    for decoration in [
+        "#[derive(Clone)]",
+        "/// Alpha documentation.",
+        "/// Beta documentation.",
+    ] {
+        assert_eq!(
+            marked_line_occurrences(&diff, decoration, DiffMark::Removed),
+            0,
+            "exact decoration must follow its semantic owner: {diff:#?}",
+        );
+        assert_eq!(
+            marked_line_occurrences(&diff, decoration, DiffMark::Added),
+            0,
+            "exact decoration must follow its semantic owner: {diff:#?}",
+        );
+    }
+    assert_eq!(marked_line_occurrences(&diff, "u16", DiffMark::Removed), 1);
+    assert_eq!(marked_line_occurrences(&diff, "u32", DiffMark::Added), 1);
+}
+
+#[test]
+fn nested_test_decorations_follow_their_reordered_functions() {
+    let before = concat!(
+        "mod tests {\n",
+        "    #[test]\n",
+        "    /// Alpha contract.\n",
+        "    fn alpha() { old(); }\n",
+        "    #[test]\n",
+        "    /// Beta contract.\n",
+        "    fn beta() { stable(); }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod tests {\n",
+        "    #[test]\n",
+        "    /// Beta contract.\n",
+        "    fn beta() { stable(); }\n",
+        "    #[test]\n",
+        "    /// Alpha contract.\n",
+        "    fn alpha() { new(); }\n",
+        "}\n",
+    );
+    let diff = diff_file("src/nested.rs", before, after).expect("Rust must plan");
+
+    for decoration in ["#[test]", "/// Alpha contract.", "/// Beta contract."] {
+        assert_eq!(
+            marked_line_occurrences(&diff, decoration, DiffMark::Removed),
+            0,
+            "nested decoration must follow its semantic owner: {diff:#?}",
+        );
+        assert_eq!(
+            marked_line_occurrences(&diff, decoration, DiffMark::Added),
+            0,
+            "nested decoration must follow its semantic owner: {diff:#?}",
+        );
+    }
+    assert_eq!(marked_line_occurrences(&diff, "old", DiffMark::Removed), 1);
+    assert_eq!(marked_line_occurrences(&diff, "new", DiffMark::Added), 1);
+}
+
+#[test]
 fn bare_html_wrapper_does_not_steal_an_existing_div_anchor() {
     let before = "<section>\n  <img src=\"avatar.webp\">\n  <div>\n    <p>Existing</p>\n  </div>\n</section>\n";
     let after = "<section>\n  <div>\n    <img src=\"avatar.webp\">\n  </div>\n  <div>\n    <p>Existing</p>\n  </div>\n</section>\n";
@@ -1263,7 +1519,7 @@ fn line_projection_retains_end_of_file_newline_changes() {
 }
 
 #[test]
-fn rust_terminator_edits_reproject_both_revisions_as_line_leaves() {
+fn rust_terminator_edits_stay_local_and_explicit() {
     for (before, after, expected_after) in [
         ("fn same() {}\n", "fn same() {}\r\n", LineEnding::CrLf),
         ("fn same() {}\n", "fn same() {}", LineEnding::Missing),
@@ -1284,6 +1540,141 @@ fn rust_terminator_edits_reproject_both_revisions_as_line_leaves() {
             Some(DiffRow::FileBoundary)
         ));
     }
+}
+
+#[test]
+fn inserted_blank_layout_is_signal_without_flattening_its_definition() {
+    let before = "fn run() { old(); }\n";
+    let after = "\nfn run() { new(); }\n";
+    let diff = diff_file("src/run.rs", before, after).expect("Rust input must plan");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineChange {
+                before: None,
+                after: Some(line),
+            } if line.number == 1 && line_text(line).is_empty()
+        )
+    }));
+    let definition = source_lines(&diff)
+        .into_iter()
+        .find(|line| line.number == 2 && line_text(line).contains("new"))
+        .expect("edited definition remains visible in current source");
+    assert!(
+        definition
+            .spans
+            .iter()
+            .any(|span| span.syntax != SyntaxClass::Plain)
+    );
+    assert!(
+        definition
+            .spans
+            .iter()
+            .any(|span| span.mark == DiffMark::Added && span.text.contains("new"))
+    );
+}
+
+#[test]
+fn neighboring_crlf_edit_does_not_flatten_a_structural_change() {
+    let before = concat!(
+        "fn alpha() { old(); }\n",
+        "fn stable() {\n",
+        "    same();\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() { new(); }\n",
+        "fn stable() {\r\n",
+        "    same();\n",
+        "}\n",
+    );
+    let diff = diff_file("src/local.rs", before, after).expect("Rust input must plan");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineEnding {
+                before: Some(LineEnding::Lf),
+                after: Some(LineEnding::CrLf),
+            }
+        )
+    }));
+    let definition = source_lines(&diff)
+        .into_iter()
+        .find(|line| line.number == 1 && line_text(line).contains("new"))
+        .expect("unrelated definition retains structural rendering");
+    assert!(
+        definition
+            .spans
+            .iter()
+            .any(|span| span.syntax != SyntaxClass::Plain)
+    );
+    assert!(
+        definition
+            .spans
+            .iter()
+            .any(|span| span.mark == DiffMark::Added && span.text.contains("new"))
+    );
+    assert!(!rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineChange {
+                before: Some(line),
+                after: None,
+            } if line.number >= 3
+        )
+    }));
+}
+
+#[test]
+fn terminator_fact_survives_an_expanded_local_replacement() {
+    let before = concat!("fn run() {\n", "    old();\n", "    stable();\n", "}\n",);
+    let after = concat!("fn run() {\r\n", "    new();\n", "    stable();\n", "}\n",);
+    let diff = diff_file("src/local.rs", before, after).expect("Rust input must plan");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineEnding {
+                before: Some(LineEnding::Lf),
+                after: Some(LineEnding::CrLf),
+            }
+        )
+    }));
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineChange {
+                before: Some(before),
+                after: None,
+            } if before.number == 2 && line_text(before).contains("old")
+        )
+    }));
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineChange {
+                before: None,
+                after: Some(after),
+            } if after.number == 2 && line_text(after).contains("new")
+        )
+    }));
 }
 
 #[test]
@@ -1311,7 +1702,7 @@ fn generated_rust_is_flagged_and_forced_through_line_projection() {
 }
 
 #[test]
-fn public_rows_stay_in_current_source_order() {
+fn representative_public_rows_obey_source_space_invariants() {
     let moved_before = concat!(
         "fn first() {\n",
         "    one();\n",
@@ -1335,26 +1726,72 @@ fn public_rows_stay_in_current_source_order() {
         "    extra();\n",
         "}\n",
     );
-
-    for (path, before, after) in [
+    let distant_before = concat!(
+        "one\n",
+        "old two\n",
+        "three\n",
+        "four\n",
+        "five\n",
+        "six\n",
+        "seven\n",
+        "eight\n",
+        "nine\n",
+        "ten\n",
+        "eleven\n",
+        "old twelve\n",
+        "thirteen\n",
+        "fourteen\n",
+    );
+    let distant_after = concat!(
+        "one\n",
+        "new two\n",
+        "three\n",
+        "four\n",
+        "five\n",
+        "six\n",
+        "seven\n",
+        "eight\n",
+        "nine\n",
+        "ten\n",
+        "eleven\n",
+        "new twelve\n",
+        "thirteen\n",
+        "fourteen\n",
+    );
+    let edge_cases = [
         ("src/order.rs", moved_before, moved_after),
-        (LABEL, BEFORE, AFTER),
+        ("notes.md", distant_before, distant_after),
         ("notes.txt", "same\n", "same"),
-    ] {
+        ("src/removed.rs", "fn removed() {}\n", ""),
+        ("src/added.rs", "", "fn added() {}\n"),
+    ];
+
+    let fixtures = [(LABEL, BEFORE, AFTER)]
+        .into_iter()
+        .chain(
+            web::ALL
+                .iter()
+                .map(|fixture| (fixture.path, fixture.before, fixture.after)),
+        )
+        .chain(edge_cases);
+    let mut observed = ObservedRowKinds::default();
+    for (path, before, after) in fixtures {
         let diff = diff_file(path, before, after).expect("source must plan");
 
-        for (index, hunk) in diff.hunks.iter().enumerate() {
-            let current = hunk
-                .rows
-                .iter()
-                .flat_map(current_world_lines)
-                .collect::<Vec<_>>();
-            assert!(
-                current.windows(2).all(|lines| lines[0] <= lines[1]),
-                "{path} hunk {index} moves backwards at {current:?}: {hunk:#?}",
-            );
-        }
+        assert_source_space_invariants(path, &diff);
+        observed.extend(&diff);
     }
+    assert!(observed.line, "matrix must exercise ordinary source rows");
+    assert!(observed.reflow, "matrix must exercise reflow rows");
+    assert!(observed.line_change, "matrix must exercise line changes");
+    assert!(observed.line_ending, "matrix must exercise line endings");
+    assert!(observed.moved, "matrix must exercise moves");
+    assert!(observed.wordwise, "matrix must exercise compact changes");
+    assert!(observed.elision, "matrix must exercise elisions");
+    assert!(
+        observed.file_boundary,
+        "matrix must exercise file boundaries"
+    );
 }
 
 #[test]
@@ -1381,7 +1818,7 @@ fn generated_marker_is_exact_and_header_bounded() {
 }
 
 #[test]
-fn malformed_or_unprojected_rust_falls_back_to_plain_rows() {
+fn malformed_or_linewise_rust_still_materializes_source_changes() {
     for (before, after) in [
         ("fn broken(value: u32 {}\n", "fn broken(value: u64 {}\n"),
         ("// old license\n", "// new license\n"),
@@ -1434,22 +1871,102 @@ fn line_text(line: &DisplayLine) -> String {
     line.spans.iter().map(|span| span.text.as_str()).collect()
 }
 
+/// Numbered source rows materially rendered by one public row.
+fn materialized_source_rows(row: &DiffRow) -> (Option<usize>, Option<usize>) {
+    match row {
+        DiffRow::Line(line) | DiffRow::Reflow(line) => (None, Some(line.number)),
+        DiffRow::LineChange { before, after } => (
+            before.as_ref().map(|line| line.number),
+            after.as_ref().map(|line| line.number),
+        ),
+        DiffRow::Moved { before, after } => (*before, Some(after.number)),
+        DiffRow::Wordwise(word) => (word.before_line, word.after_line),
+        DiffRow::LineEnding { .. } | DiffRow::Elision(_) | DiffRow::FileBoundary => (None, None),
+    }
+}
+
 /// Current-world coverage represented by one public row; old-only ghosts have none.
-fn current_world_lines(row: &DiffRow) -> Range<usize> {
+fn current_world_coverage(row: &DiffRow) -> Option<Range<usize>> {
     match row {
         DiffRow::Line(line) | DiffRow::Reflow(line) | DiffRow::Moved { after: line, .. } => {
-            line.number..line.number.saturating_add(1)
+            Some(line.number..line.number.saturating_add(1))
         }
         DiffRow::LineChange {
             after: Some(line), ..
-        } => line.number..line.number.saturating_add(1),
-        DiffRow::Wordwise(word) => word
-            .after_line
-            .map_or(0..0, |line| line..line.saturating_add(1)),
-        DiffRow::Elision(coverage) => coverage.after.clone().unwrap_or(0..0),
+        } => Some(line.number..line.number.saturating_add(1)),
+        DiffRow::Wordwise(word) => word.after_line.map(|line| line..line.saturating_add(1)),
+        DiffRow::Elision(coverage) => coverage.after.clone(),
         DiffRow::LineChange { after: None, .. }
         | DiffRow::LineEnding { .. }
-        | DiffRow::FileBoundary => 0..0,
+        | DiffRow::FileBoundary => None,
+    }
+}
+
+/// Public review rows remain ordered and singly owned inside each visual hunk.
+///
+/// Ownership is deliberately hunk-local: an ancestor breadcrumb may frame two distant hunks.
+fn assert_source_space_invariants(path: &str, diff: &FileDiff) {
+    for (hunk_index, hunk) in diff.hunks.iter().enumerate() {
+        let mut before_owners = HashSet::new();
+        let mut after_owners = HashSet::new();
+        let mut previous_current_end = None;
+        for (row_index, row) in hunk.rows.iter().enumerate() {
+            if let Some(current) = current_world_coverage(row) {
+                if let Some(previous_end) = previous_current_end {
+                    assert!(
+                        current.start >= previous_end,
+                        "{path} hunk {hunk_index} row {row_index} moves backwards or overlaps \
+                         current source after {previous_end}: {row:#?}\n{hunk:#?}",
+                    );
+                }
+                previous_current_end = Some(current.end);
+            }
+
+            let (before, after) = materialized_source_rows(row);
+            if let Some(line) = before {
+                assert!(
+                    before_owners.insert(line),
+                    "{path} hunk {hunk_index} gives before line {line} multiple display owners: \
+                     {hunk:#?}",
+                );
+            }
+            if let Some(line) = after {
+                assert!(
+                    after_owners.insert(line),
+                    "{path} hunk {hunk_index} gives current line {line} multiple display owners: \
+                     {hunk:#?}",
+                );
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ObservedRowKinds {
+    line: bool,
+    reflow: bool,
+    line_change: bool,
+    line_ending: bool,
+    moved: bool,
+    wordwise: bool,
+    elision: bool,
+    file_boundary: bool,
+}
+
+impl ObservedRowKinds {
+    fn extend(&mut self, diff: &FileDiff) {
+        for row in diff.hunks.iter().flat_map(|hunk| &hunk.rows) {
+            match row {
+                DiffRow::Line(_) => self.line = true,
+                DiffRow::Reflow(_) => self.reflow = true,
+                DiffRow::LineChange { .. } => self.line_change = true,
+                DiffRow::LineEnding { .. } => self.line_ending = true,
+                DiffRow::Moved { .. } => self.moved = true,
+                DiffRow::Wordwise(_) => self.wordwise = true,
+                DiffRow::Elision(_) => self.elision = true,
+                DiffRow::FileBoundary => self.file_boundary = true,
+            }
+        }
     }
 }
 

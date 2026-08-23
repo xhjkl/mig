@@ -2,7 +2,6 @@
 
 use super::projection::{
     ContentChannel, Language, LayoutOwnership, NodeId, Projection, ProjectionPair, ReviewMode,
-    SiblingAttachment,
 };
 use super::source::LineEnding;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,10 +18,12 @@ const MIN_CONFIDENT_UNIT_SIMILARITY: u64 = 5;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Correspondence {
     pub(crate) units: Vec<UnitEdit>,
-    /// Exact line terminator changes require the symmetric line projection.
-    pub(crate) requires_line_fallback: bool,
     /// Whole-revision exact physical-line alignment, computed once by the graph engine.
     pub(crate) line_links: Vec<LineLink>,
+    /// Content-paired physical rows whose concrete terminators differ.
+    pub(crate) line_ending_edits: Vec<LineLink>,
+    /// Source-exact regions reviewed linewise without discarding neighboring syntax.
+    pub(crate) line_fallbacks: Vec<LineFallback>,
     pub(crate) leaf_links: Vec<LeafLink>,
     /// Dense before-node lookup into `leaf_links`.
     pub(crate) before_leaf: Vec<Option<usize>>,
@@ -46,6 +47,24 @@ impl Correspondence {
             .line_links
             .partition_point(|link| link.before < before.end);
         self.line_links[start..end]
+            .iter()
+            .copied()
+            .filter(move |link| after.contains(&link.after))
+    }
+
+    /// Terminator edits wholly contained by a pair of absolute line ranges.
+    pub(crate) fn line_ending_edits_in(
+        &self,
+        before: Range<usize>,
+        after: Range<usize>,
+    ) -> impl Iterator<Item = LineLink> + '_ {
+        let start = self
+            .line_ending_edits
+            .partition_point(|link| link.before < before.start);
+        let end = self
+            .line_ending_edits
+            .partition_point(|link| link.before < before.end);
+        self.line_ending_edits[start..end]
             .iter()
             .copied()
             .filter(move |link| after.contains(&link.after))
@@ -79,6 +98,13 @@ impl Correspondence {
 pub(crate) struct LineLink {
     pub(crate) before: usize,
     pub(crate) after: usize,
+}
+
+/// Zero-based physical source ranges that require local linewise review.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LineFallback {
+    pub(crate) before: Range<usize>,
+    pub(crate) after: Range<usize>,
 }
 
 /// One review unit in the merged before/after edit script.
@@ -314,7 +340,7 @@ struct UnitRecord<'source> {
     id: NodeId,
     kind: &'static str,
     identity: Option<&'source str>,
-    attachment: SiblingAttachment,
+    decoration_owner: Option<NodeId>,
     fingerprint: NodeFingerprints,
     shape: FingerprintId,
     evidence: Vec<(FingerprintId, u32)>,
@@ -342,19 +368,20 @@ pub(crate) fn correspond(pair: &ProjectionPair<'_, '_>) -> Correspondence {
         pair.after.root,
     );
     let stable = stable_unit_matches(&before_match, &after_match, &before_units, &after_units);
-    let (line_links, requires_line_fallback) = if pair.before.language == Language::Lines {
-        (
-            line_links_from_unit_matches(pair, &before_units, &after_units, &before_match),
-            false,
-        )
+    let physical = if pair.before.language == Language::Lines {
+        PhysicalLineFacts {
+            exact: line_links_from_unit_matches(pair, &before_units, &after_units, &before_match),
+            ..PhysicalLineFacts::default()
+        }
     } else {
         physical_line_correspondence(pair)
     };
 
     let graph = Correspondence {
         units: Vec::new(),
-        requires_line_fallback,
-        line_links,
+        line_links: physical.exact,
+        line_ending_edits: physical.ending_edits,
+        line_fallbacks: Vec::new(),
         leaf_links: Vec::new(),
         before_leaf: vec![None; pair.before.nodes.len()],
         after_leaf: vec![None; pair.after.nodes.len()],
@@ -373,8 +400,9 @@ pub(crate) fn correspond(pair: &ProjectionPair<'_, '_>) -> Correspondence {
         graph,
     };
     let mut graph = builder.build();
-    graph.requires_line_fallback |= !projection_covers_source_changes(pair, &graph)
-        || !changed_units_are_line_disjoint(pair, &graph);
+    if pair.before.language != Language::Lines {
+        graph.line_fallbacks = local_line_fallbacks(pair, &graph, physical.missing_terminators);
+    }
     graph
 }
 
@@ -402,42 +430,17 @@ fn line_links_from_unit_matches(
         .collect()
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct PhysicalLineKey<'source> {
-    text: &'source str,
-    ending: LineEnding,
+#[derive(Default)]
+struct PhysicalLineFacts {
+    exact: Vec<LineLink>,
+    ending_edits: Vec<LineLink>,
+    missing_terminators: Vec<LineFallback>,
 }
 
-/// Align physical lines once and certify whether syntax would hide a terminator edit.
-fn physical_line_correspondence(pair: &ProjectionPair<'_, '_>) -> (Vec<LineLink>, bool) {
+/// Align physical content once while retaining concrete terminator differences as source facts.
+fn physical_line_correspondence(pair: &ProjectionPair<'_, '_>) -> PhysicalLineFacts {
     let before = &pair.before;
     let after = &pair.after;
-    let before_keys = before
-        .source
-        .lines()
-        .iter()
-        .map(|line| PhysicalLineKey {
-            text: before.source.text(line),
-            ending: line.ending,
-        })
-        .collect::<Vec<_>>();
-    let after_keys = after
-        .source
-        .lines()
-        .iter()
-        .map(|line| PhysicalLineKey {
-            text: after.source.text(line),
-            ending: line.ending,
-        })
-        .collect::<Vec<_>>();
-    let line_links = ordered_matches(&before_keys, &after_keys)
-        .into_iter()
-        .map(|edge| LineLink {
-            before: edge.before,
-            after: edge.after,
-        })
-        .collect();
-
     let before_text = before
         .source
         .lines()
@@ -451,6 +454,7 @@ fn physical_line_correspondence(pair: &ProjectionPair<'_, '_>) -> (Vec<LineLink>
         .map(|line| after.source.text(line))
         .collect::<Vec<_>>();
     let anchors = ordered_matches(&before_text, &after_text);
+    let mut facts = PhysicalLineFacts::default();
     let mut before_start = 0;
     let mut after_start = 0;
     for anchor in anchors.into_iter().chain(std::iter::once(OrderedMatch::new(
@@ -459,143 +463,679 @@ fn physical_line_correspondence(pair: &ProjectionPair<'_, '_>) -> (Vec<LineLink>
     ))) {
         let before_gap = &before.source.lines()[before_start..anchor.before];
         let after_gap = &after.source.lines()[after_start..anchor.after];
-        let paired = before_gap.len().min(after_gap.len());
-        if before_gap[..paired]
-            .iter()
-            .zip(&after_gap[..paired])
-            .any(|(before, after)| before.ending != after.ending)
+        // Unequal gaps cannot gain row correspondence merely because a
+        // terminator differs at the same ordinal offset.
+        let paired = if before_gap.len() == after_gap.len() {
+            before_gap.len()
+        } else {
+            0
+        };
+        for (offset, (before_line, after_line)) in
+            before_gap.iter().zip(after_gap).take(paired).enumerate()
         {
-            return (line_links, true);
+            if before_line.ending == after_line.ending {
+                continue;
+            }
+            facts.ending_edits.push(LineLink {
+                before: before_start + offset,
+                after: after_start + offset,
+            });
         }
-        if before_gap[paired..]
-            .iter()
-            .chain(&after_gap[paired..])
-            .any(|line| line.ending == LineEnding::Missing)
-        {
-            return (line_links, true);
+        for (offset, line) in before_gap.iter().enumerate().skip(paired) {
+            if line.ending != LineEnding::Missing {
+                continue;
+            }
+            let before = before_start + offset;
+            facts.missing_terminators.push(LineFallback {
+                before: before..before + 1,
+                after: anchor.after..anchor.after,
+            });
+        }
+        for (offset, line) in after_gap.iter().enumerate().skip(paired) {
+            if line.ending != LineEnding::Missing {
+                continue;
+            }
+            let after = after_start + offset;
+            facts.missing_terminators.push(LineFallback {
+                before: anchor.before..anchor.before,
+                after: after..after + 1,
+            });
         }
 
-        if anchor.before < before_text.len()
-            && anchor.after < after_text.len()
-            && before.source.lines()[anchor.before].ending
-                != after.source.lines()[anchor.after].ending
-        {
-            return (line_links, true);
+        if anchor.before < before_text.len() && anchor.after < after_text.len() {
+            let link = LineLink {
+                before: anchor.before,
+                after: anchor.after,
+            };
+            if before.source.lines()[anchor.before].ending
+                == after.source.lines()[anchor.after].ending
+            {
+                facts.exact.push(link);
+            } else {
+                facts.ending_edits.push(link);
+            }
         }
         before_start = anchor.before.saturating_add(1);
         after_start = anchor.after.saturating_add(1);
     }
-    (line_links, false)
+    facts
 }
 
-/// Every physical source delta must belong to a visible, non-stable review unit.
-fn projection_covers_source_changes(pair: &ProjectionPair<'_, '_>, graph: &Correspondence) -> bool {
-    let mut before_covered = vec![false; pair.before.source.lines().len()];
-    let mut after_covered = vec![false; pair.after.source.lines().len()];
-    for edit in &graph.units {
-        match edit {
-            UnitEdit::Matched(unit)
-                if unit.relation == ContentRelation::SourceEqual
-                    && unit.placement == Placement::Stable => {}
-            UnitEdit::Matched(unit) => {
-                mark_unit_lines(&pair.before, unit.before, &mut before_covered);
-                mark_unit_lines(&pair.after, unit.after, &mut after_covered);
-            }
-            UnitEdit::Removed { before } => {
-                mark_unit_lines(&pair.before, *before, &mut before_covered);
-            }
-            UnitEdit::Added { after } => {
-                mark_unit_lines(&pair.after, *after, &mut after_covered);
-            }
+#[derive(Clone, Debug)]
+struct UnitLineGeometry {
+    before: Range<usize>,
+    after: Range<usize>,
+    changed: bool,
+    expands_fallback: bool,
+}
+
+/// Retain syntax everywhere except concrete physical regions it cannot own exactly.
+fn local_line_fallbacks(
+    pair: &ProjectionPair<'_, '_>,
+    graph: &Correspondence,
+    mut fallbacks: Vec<LineFallback>,
+) -> Vec<LineFallback> {
+    // A move producer can own an unmatched EOF terminator without borrowing
+    // the empty global-LCS coordinate on the opposite revision.
+    fallbacks.retain(|fallback| !move_owns_missing_terminator(pair, graph, fallback));
+    let units = graph
+        .units
+        .iter()
+        .map(|edit| unit_line_geometry(pair, graph, edit))
+        .collect::<Vec<_>>();
+    let mut before_claims = vec![0_u16; pair.before.source.lines().len()];
+    let mut after_claims = vec![0_u16; pair.after.source.lines().len()];
+    for unit in units
+        .iter()
+        .filter(|unit| unit.changed || unit_lines_are_source_equal(pair, unit))
+    {
+        increment_claims(&mut before_claims, unit.before.clone());
+        increment_claims(&mut after_claims, unit.after.clone());
+    }
+    claim_paired_adjacent_layout(pair, graph, &mut before_claims, &mut after_claims);
+
+    let checkpoints = physical_line_checkpoints(graph);
+    let mut before_start = 0;
+    let mut after_start = 0;
+    for checkpoint in checkpoints.into_iter().chain(std::iter::once(LineLink {
+        before: before_claims.len(),
+        after: after_claims.len(),
+    })) {
+        fallbacks.extend(unclaimed_gap_fallbacks(
+            before_start..checkpoint.before,
+            after_start..checkpoint.after,
+            &before_claims,
+            &after_claims,
+        ));
+        before_start = checkpoint.before.saturating_add(1);
+        after_start = checkpoint.after.saturating_add(1);
+    }
+
+    for link in &graph.line_ending_edits {
+        if move_owns_line_ending(pair, graph, *link) {
+            continue;
         }
+        fallbacks.push(LineFallback {
+            before: link.before..link.before + 1,
+            after: link.after..link.after + 1,
+        });
     }
-
-    let mut before_exact = vec![false; before_covered.len()];
-    let mut after_exact = vec![false; after_covered.len()];
-    for link in &graph.line_links {
-        before_exact[link.before] = true;
-        after_exact[link.after] = true;
-    }
-    before_exact
-        .into_iter()
-        .zip(before_covered)
-        .all(|(exact, covered)| exact || covered)
-        && after_exact
-            .into_iter()
-            .zip(after_covered)
-            .all(|(exact, covered)| exact || covered)
+    fallbacks.extend(conflicting_unit_fallbacks(pair, &units));
+    close_fallbacks_over_changed_units(&mut fallbacks, &units);
+    normalize_line_fallbacks(fallbacks)
 }
 
-/// Independent review units may not claim the same physical row twice.
-fn changed_units_are_line_disjoint(pair: &ProjectionPair<'_, '_>, graph: &Correspondence) -> bool {
-    let mut before = vec![false; pair.before.source.lines().len()];
-    let mut after = vec![false; pair.after.source.lines().len()];
-    for edit in &graph.units {
-        let (before_unit, after_unit) = match edit {
-            UnitEdit::Matched(unit)
-                if unit.relation == ContentRelation::SourceEqual
-                    && unit.placement == Placement::Stable =>
-            {
-                continue;
-            }
-            UnitEdit::Matched(unit) => (Some(unit.before), Some(unit.after)),
-            UnitEdit::Removed { before } => (Some(*before), None),
-            UnitEdit::Added { after } => (None, Some(*after)),
-        };
-        if before_unit.is_some_and(|unit| !claim_unit_lines(&pair.before, unit, &mut before))
-            || after_unit.is_some_and(|unit| !claim_unit_lines(&pair.after, unit, &mut after))
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn claim_unit_lines(projection: &Projection<'_>, unit: NodeId, claimed: &mut [bool]) -> bool {
-    let lines = projection.node(unit).lines.clone();
-    let start = lines.start.saturating_sub(1).min(claimed.len());
-    let end = lines.end.saturating_sub(1).min(claimed.len());
-    let lines = &mut claimed[start.min(end)..end];
-    if lines.iter().any(|claimed| *claimed) {
+fn move_owns_missing_terminator(
+    pair: &ProjectionPair<'_, '_>,
+    graph: &Correspondence,
+    fallback: &LineFallback,
+) -> bool {
+    if fallback.before.is_empty() == fallback.after.is_empty() {
         return false;
     }
-    lines.fill(true);
-    true
+    graph.units.iter().any(|edit| {
+        let UnitEdit::Matched(unit) = edit else {
+            return false;
+        };
+        if unit.placement != Placement::Reordered || !unit.relation.full_equal() {
+            return false;
+        }
+        if fallback.after.is_empty() {
+            return range_contains(
+                &zero_based_lines(&pair.before, unit.before),
+                &fallback.before,
+            );
+        }
+        range_contains(&zero_based_lines(&pair.after, unit.after), &fallback.after)
+    })
 }
 
-fn mark_unit_lines(projection: &Projection<'_>, unit: NodeId, covered: &mut [bool]) {
-    let node = projection.node(unit);
-    mark_lines(covered, node.lines.clone());
-    let layout = node
-        .review
-        .as_ref()
-        .expect("review node owns review metadata")
-        .layout;
-    if layout != LayoutOwnership::AdjacentBlankLines {
+fn range_contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+/// Exact reordered units render their own concrete terminator facts beside the move.
+fn move_owns_line_ending(
+    pair: &ProjectionPair<'_, '_>,
+    graph: &Correspondence,
+    link: LineLink,
+) -> bool {
+    graph.units.iter().any(|edit| {
+        let UnitEdit::Matched(unit) = edit else {
+            return false;
+        };
+        unit.placement == Placement::Reordered
+            && unit.relation.full_equal()
+            && zero_based_lines(&pair.before, unit.before).contains(&link.before)
+            && zero_based_lines(&pair.after, unit.after).contains(&link.after)
+    })
+}
+
+fn unit_line_geometry(
+    pair: &ProjectionPair<'_, '_>,
+    graph: &Correspondence,
+    edit: &UnitEdit,
+) -> UnitLineGeometry {
+    let mut geometry = match edit {
+        UnitEdit::Matched(unit) => UnitLineGeometry {
+            before: zero_based_lines(&pair.before, unit.before),
+            after: zero_based_lines(&pair.after, unit.after),
+            changed: unit.relation != ContentRelation::SourceEqual
+                || unit.placement != Placement::Stable,
+            expands_fallback: true,
+        },
+        UnitEdit::Removed { before } => UnitLineGeometry {
+            before: zero_based_lines(&pair.before, *before),
+            after: 0..0,
+            changed: true,
+            expands_fallback: true,
+        },
+        UnitEdit::Added { after } => UnitLineGeometry {
+            before: 0..0,
+            after: zero_based_lines(&pair.after, *after),
+            changed: true,
+            expands_fallback: true,
+        },
+    };
+    geometry.expands_fallback &= !unit_lines_are_physically_paired(graph, &geometry);
+    geometry
+}
+
+fn unit_lines_are_physically_paired(graph: &Correspondence, unit: &UnitLineGeometry) -> bool {
+    if unit.before.len() != unit.after.len() {
+        return false;
+    }
+    let mut pairs = graph
+        .line_links_in(unit.before.clone(), unit.after.clone())
+        .chain(graph.line_ending_edits_in(unit.before.clone(), unit.after.clone()))
+        .collect::<Vec<_>>();
+    pairs.sort_unstable_by_key(|link| (link.before, link.after));
+    pairs.len() == unit.before.len()
+        && pairs.iter().enumerate().all(|(offset, link)| {
+            link.before == unit.before.start + offset && link.after == unit.after.start + offset
+        })
+}
+
+/// Stable semantic rows may bypass global monotone alignment only when their full source agrees.
+fn unit_lines_are_source_equal(pair: &ProjectionPair<'_, '_>, unit: &UnitLineGeometry) -> bool {
+    unit.before.len() == unit.after.len()
+        && unit
+            .before
+            .clone()
+            .zip(unit.after.clone())
+            .all(|(before, after)| {
+                let before = &pair.before.source.lines()[before];
+                let after = &pair.after.source.lines()[after];
+                pair.before.source.full_text(before) == pair.after.source.full_text(after)
+            })
+}
+
+fn zero_based_lines(projection: &Projection<'_>, node: NodeId) -> Range<usize> {
+    let lines = projection.node(node).lines.clone();
+    let start = lines
+        .start
+        .saturating_sub(1)
+        .min(projection.source.lines().len());
+    let end = lines
+        .end
+        .saturating_sub(1)
+        .min(projection.source.lines().len());
+    start.min(end)..end
+}
+
+fn increment_claims(claims: &mut [u16], lines: Range<usize>) {
+    for claim in &mut claims[lines] {
+        *claim = claim.saturating_add(1);
+    }
+}
+
+/// Equal blank separators may travel with their matched owner without becoming edit signal.
+fn claim_paired_adjacent_layout(
+    pair: &ProjectionPair<'_, '_>,
+    graph: &Correspondence,
+    before_claims: &mut [u16],
+    after_claims: &mut [u16],
+) {
+    for edit in &graph.units {
+        let UnitEdit::Matched(unit) = edit else {
+            continue;
+        };
+        let before = pair.before.node(unit.before);
+        let after = pair.after.node(unit.after);
+        let before_layout = before.review.as_ref().map(|review| review.layout);
+        let after_layout = after.review.as_ref().map(|review| review.layout);
+        if before_layout != Some(LayoutOwnership::AdjacentBlankLines)
+            || after_layout != Some(LayoutOwnership::AdjacentBlankLines)
+        {
+            continue;
+        }
+
+        let before_lines = zero_based_lines(&pair.before, unit.before);
+        let after_lines = zero_based_lines(&pair.after, unit.after);
+        let before_leading = adjacent_blank_lines(&pair.before, before_lines.start, true);
+        let after_leading = adjacent_blank_lines(&pair.after, after_lines.start, true);
+        let before_trailing = adjacent_blank_lines(&pair.before, before_lines.end, false);
+        let after_trailing = adjacent_blank_lines(&pair.after, after_lines.end, false);
+        if unit.placement == Placement::Reordered {
+            // A moved owner may carry its separator from one physical side to the other.
+            let before_adjacent = before_leading
+                .iter()
+                .rev()
+                .chain(&before_trailing)
+                .copied()
+                .collect::<Vec<_>>();
+            let after_adjacent = after_leading
+                .iter()
+                .rev()
+                .chain(&after_trailing)
+                .copied()
+                .collect::<Vec<_>>();
+            claim_equal_layout_run(
+                &pair.before,
+                &pair.after,
+                &before_adjacent,
+                &after_adjacent,
+                before_claims,
+                after_claims,
+            );
+            continue;
+        }
+
+        claim_equal_layout_run(
+            &pair.before,
+            &pair.after,
+            &before_leading,
+            &after_leading,
+            before_claims,
+            after_claims,
+        );
+        claim_equal_layout_run(
+            &pair.before,
+            &pair.after,
+            &before_trailing,
+            &after_trailing,
+            before_claims,
+            after_claims,
+        );
+    }
+}
+
+fn adjacent_blank_lines(projection: &Projection<'_>, boundary: usize, before: bool) -> Vec<usize> {
+    let mut lines = Vec::new();
+    if before {
+        let mut index = boundary;
+        while let Some(previous) = index.checked_sub(1) {
+            if !source_line_is_blank(projection, previous) {
+                break;
+            }
+            lines.push(previous);
+            index = previous;
+        }
+        lines.reverse();
+        return lines;
+    }
+
+    let mut index = boundary;
+    while source_line_is_blank(projection, index) {
+        lines.push(index);
+        index += 1;
+    }
+    lines
+}
+
+fn source_line_is_blank(projection: &Projection<'_>, index: usize) -> bool {
+    projection
+        .source
+        .lines()
+        .get(index)
+        .is_some_and(|line| projection.source.text(line).trim().is_empty())
+}
+
+fn claim_equal_layout_run(
+    before: &Projection<'_>,
+    after: &Projection<'_>,
+    before_lines: &[usize],
+    after_lines: &[usize],
+    before_claims: &mut [u16],
+    after_claims: &mut [u16],
+) {
+    if before_lines.len() != after_lines.len()
+        || !before_lines
+            .iter()
+            .zip(after_lines)
+            .all(|(before_index, after_index)| {
+                let before_line = &before.source.lines()[*before_index];
+                let after_line = &after.source.lines()[*after_index];
+                before.source.full_text(before_line) == after.source.full_text(after_line)
+            })
+    {
         return;
     }
 
-    if let Some(before) = node.lines.start.checked_sub(1)
-        && source_line_is_blank(projection, before)
+    for (before_index, after_index) in before_lines
+        .iter()
+        .copied()
+        .zip(after_lines.iter().copied())
     {
-        mark_lines(covered, before..before + 1);
-    }
-    if source_line_is_blank(projection, node.lines.end) {
-        mark_lines(covered, node.lines.end..node.lines.end + 1);
+        let before_line = &before.source.lines()[before_index];
+        let after_line = &after.source.lines()[after_index];
+        debug_assert_eq!(
+            before.source.full_text(before_line),
+            after.source.full_text(after_line)
+        );
+        before_claims[before_index] = before_claims[before_index].saturating_add(1);
+        after_claims[after_index] = after_claims[after_index].saturating_add(1);
     }
 }
 
-fn mark_lines(covered: &mut [bool], lines: Range<usize>) {
-    let start = lines.start.saturating_sub(1).min(covered.len());
-    let end = lines.end.saturating_sub(1).min(covered.len());
-    covered[start.min(end)..end].fill(true);
+fn physical_line_checkpoints(graph: &Correspondence) -> Vec<LineLink> {
+    let mut checkpoints = graph.line_links.clone();
+    checkpoints.extend(&graph.line_ending_edits);
+    checkpoints.sort_unstable_by_key(|link| (link.before, link.after));
+    checkpoints
 }
 
-fn source_line_is_blank(projection: &Projection<'_>, number: usize) -> bool {
-    let Some(line) = projection.source.line(number) else {
+fn unclaimed_gap_fallbacks(
+    before: Range<usize>,
+    after: Range<usize>,
+    before_claims: &[u16],
+    after_claims: &[u16],
+) -> Vec<LineFallback> {
+    let before_runs = unclaimed_runs(before.clone(), before_claims);
+    let after_runs = unclaimed_runs(after.clone(), after_claims);
+    if before_runs.is_empty() && after_runs.is_empty() {
+        return Vec::new();
+    }
+    if before_runs.len() == after_runs.len() {
+        return before_runs
+            .into_iter()
+            .zip(after_runs)
+            .map(|(before, after)| LineFallback { before, after })
+            .collect();
+    }
+    if before_runs.is_empty() {
+        return after_runs
+            .into_iter()
+            .map(|run| LineFallback {
+                before: empty_counterpart(&run, &after, &before),
+                after: run,
+            })
+            .collect();
+    }
+    if after_runs.is_empty() {
+        return before_runs
+            .into_iter()
+            .map(|run| LineFallback {
+                before: run.clone(),
+                after: empty_counterpart(&run, &before, &after),
+            })
+            .collect();
+    }
+
+    // Ambiguous interleaving cannot be assigned locally without borrowing claimed payload.
+    vec![LineFallback { before, after }]
+}
+
+fn unclaimed_runs(lines: Range<usize>, claims: &[u16]) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for line in lines.clone() {
+        if claims[line] == 0 {
+            start.get_or_insert(line);
+            continue;
+        }
+        if let Some(start) = start.take() {
+            runs.push(start..line);
+        }
+    }
+    if let Some(start) = start {
+        runs.push(start..lines.end);
+    }
+    runs
+}
+
+fn empty_counterpart(
+    run: &Range<usize>,
+    own_gap: &Range<usize>,
+    other_gap: &Range<usize>,
+) -> Range<usize> {
+    let boundary = if run.start == own_gap.start {
+        other_gap.start
+    } else if run.end == own_gap.end {
+        other_gap.end
+    } else {
+        // Internal unmatched layout has no trustworthy cross-revision coordinate.
+        other_gap.start + other_gap.len().saturating_mul(run.start - own_gap.start) / own_gap.len()
+    };
+    boundary..boundary
+}
+
+fn conflicting_unit_fallbacks(
+    pair: &ProjectionPair<'_, '_>,
+    units: &[UnitLineGeometry],
+) -> Vec<LineFallback> {
+    let mut before_owner = vec![None; pair.before.source.lines().len()];
+    let mut after_owner = vec![None; pair.after.source.lines().len()];
+    let mut conflicts = HashSet::new();
+    for (index, unit) in units.iter().enumerate() {
+        record_claim_conflicts(
+            &mut before_owner,
+            unit.before.clone(),
+            index,
+            &mut conflicts,
+        );
+        record_claim_conflicts(&mut after_owner, unit.after.clone(), index, &mut conflicts);
+    }
+    conflicts
+        .into_iter()
+        .filter(|(left, right)| units[*left].changed || units[*right].changed)
+        .map(|(left, right)| LineFallback {
+            before: range_union(&units[left].before, &units[right].before),
+            after: range_union(&units[left].after, &units[right].after),
+        })
+        .collect()
+}
+
+fn record_claim_conflicts(
+    owners: &mut [Option<usize>],
+    lines: Range<usize>,
+    owner: usize,
+    conflicts: &mut HashSet<(usize, usize)>,
+) {
+    for line in lines {
+        let Some(previous) = owners[line].replace(owner) else {
+            continue;
+        };
+        if previous != owner {
+            conflicts.insert((previous.min(owner), previous.max(owner)));
+        }
+    }
+}
+
+fn close_fallbacks_over_changed_units(
+    fallbacks: &mut Vec<LineFallback>,
+    units: &[UnitLineGeometry],
+) {
+    let fallback_count = fallbacks.len();
+    let mut regions = std::mem::take(fallbacks);
+    regions.extend(
+        units
+            .iter()
+            .filter(|unit| unit.changed && unit.expands_fallback)
+            .map(|unit| LineFallback {
+                before: unit.before.clone(),
+                after: unit.after.clone(),
+            }),
+    );
+    if regions.len() == fallback_count {
+        *fallbacks = regions;
+        return;
+    }
+    let mut parents = (0..regions.len()).collect::<Vec<_>>();
+    close_fallback_components(&regions, &mut parents);
+    let fallback_roots = (0..fallback_count)
+        .map(|index| fallback_component_root(&mut parents, index))
+        .collect::<HashSet<_>>();
+    let components = fallback_component_ranges(&regions, &mut parents);
+    *fallbacks = components
+        .into_iter()
+        .filter_map(|(root, fallback)| fallback_roots.contains(&root).then_some(fallback))
+        .collect();
+    sort_line_fallbacks(fallbacks);
+}
+
+fn normalize_line_fallbacks(mut fallbacks: Vec<LineFallback>) -> Vec<LineFallback> {
+    fallbacks.retain(|fallback| !fallback.before.is_empty() || !fallback.after.is_empty());
+    let mut parents = (0..fallbacks.len()).collect::<Vec<_>>();
+    close_fallback_components(&fallbacks, &mut parents);
+    let mut normalized = fallback_component_ranges(&fallbacks, &mut parents)
+        .into_iter()
+        .map(|(_, fallback)| fallback)
+        .collect::<Vec<_>>();
+    sort_line_fallbacks(&mut normalized);
+    normalized
+}
+
+/// Close cross-revision interval components without comparing every fallback to every unit.
+fn close_fallback_components(fallbacks: &[LineFallback], parents: &mut [usize]) {
+    const MAX_CLOSURE_PASSES: usize = 16;
+
+    for pass in 0.. {
+        let components = fallback_component_ranges(fallbacks, parents);
+        let changed = union_overlapping_fallbacks(&components, parents, true)
+            | union_overlapping_fallbacks(&components, parents, false);
+        if !changed {
+            break;
+        }
+        if pass + 1 == MAX_CLOSURE_PASSES {
+            // Adversarial cross-revision interleaving prefers one conservative region to
+            // unbounded normalization work or overlapping display ownership.
+            let Some((first, _)) = components.first() else {
+                break;
+            };
+            for (root, _) in components.iter().skip(1) {
+                union_fallback_components(parents, *first, *root);
+            }
+            break;
+        }
+    }
+}
+
+fn sort_line_fallbacks(fallbacks: &mut [LineFallback]) {
+    fallbacks.sort_by_key(|fallback| {
+        (
+            fallback.after.start,
+            fallback.before.start,
+            fallback.after.end,
+            fallback.before.end,
+        )
+    });
+}
+
+/// Either revision may connect regions whose order is interleaved in the other revision.
+fn union_overlapping_fallbacks(
+    components: &[(usize, LineFallback)],
+    parents: &mut [usize],
+    before_side: bool,
+) -> bool {
+    let range = |index: usize| {
+        if before_side {
+            &components[index].1.before
+        } else {
+            &components[index].1.after
+        }
+    };
+    let mut indices = (0..components.len())
+        .filter(|index| !range(*index).is_empty())
+        .collect::<Vec<_>>();
+    indices.sort_unstable_by_key(|index| (range(*index).start, range(*index).end));
+    let Some(mut representative) = indices.first().copied() else {
         return false;
     };
-    projection.source.text(line).trim().is_empty()
+    let mut end = range(representative).end;
+    let mut changed = false;
+    for index in indices.into_iter().skip(1) {
+        let current = range(index);
+        if current.start >= end {
+            representative = index;
+            end = current.end;
+            continue;
+        }
+        changed |=
+            union_fallback_components(parents, components[representative].0, components[index].0);
+        end = end.max(current.end);
+    }
+    changed
+}
+
+fn fallback_component_ranges(
+    fallbacks: &[LineFallback],
+    parents: &mut [usize],
+) -> Vec<(usize, LineFallback)> {
+    let mut components = HashMap::<usize, LineFallback>::new();
+    for (index, fallback) in fallbacks.iter().enumerate() {
+        let root = fallback_component_root(parents, index);
+        let component = components.entry(root).or_insert_with(|| fallback.clone());
+        component.before = range_union(&component.before, &fallback.before);
+        component.after = range_union(&component.after, &fallback.after);
+    }
+    components.into_iter().collect()
+}
+
+fn union_fallback_components(parents: &mut [usize], left: usize, right: usize) -> bool {
+    let left = fallback_component_root(parents, left);
+    let right = fallback_component_root(parents, right);
+    if left == right {
+        return false;
+    }
+    parents[right] = left;
+    true
+}
+
+fn fallback_component_root(parents: &mut [usize], mut index: usize) -> usize {
+    let mut root = index;
+    while parents[root] != root {
+        root = parents[root];
+    }
+    while parents[index] != index {
+        let parent = parents[index];
+        parents[index] = root;
+        index = parent;
+    }
+    root
+}
+
+fn range_union(left: &Range<usize>, right: &Range<usize>) -> Range<usize> {
+    if left.is_empty() && right.is_empty() {
+        return left.clone();
+    }
+    if left.is_empty() {
+        return right.clone();
+    }
+    if right.is_empty() {
+        return left.clone();
+    }
+    left.start.min(right.start)..left.end.max(right.end)
 }
 
 fn unit_records<'source>(
@@ -616,7 +1156,7 @@ fn unit_records<'source>(
                     .is_none()
                     .then(|| projection.identity_text(id))
                     .flatten(),
-                attachment: node.attachment,
+                decoration_owner: node.decoration_owner,
                 fingerprint,
                 shape: fingerprint.shape,
                 evidence: unit_evidence(projection, fingerprints, id),
@@ -662,87 +1202,82 @@ fn pair_units(
     let mut before_match = vec![None; before.len()];
     let mut after_match = vec![None; after.len()];
 
-    let before_root = before.iter().position(|unit| unit.id == before_root);
-    let after_root = after.iter().position(|unit| unit.id == after_root);
-    if let (Some(before_root), Some(after_root)) = (before_root, after_root) {
-        link_unit_indices(before_root, after_root, &mut before_match, &mut after_match);
+    let before_root_unit = before.iter().position(|unit| unit.id == before_root);
+    let after_root_unit = after.iter().position(|unit| unit.id == after_root);
+    if let (Some(before_root_unit), Some(after_root_unit)) = (before_root_unit, after_root_unit) {
+        link_unit_indices(
+            before_root_unit,
+            after_root_unit,
+            &mut before_match,
+            &mut after_match,
+        );
     }
 
     pair_keyed_units(before, after, &mut before_match, &mut after_match);
-    pair_following_attachments(before, after, &mut before_match, &mut after_match);
     pair_unkeyed_units(before, after, &mut before_match, &mut after_match);
     pair_compatible_units(before, after, &mut before_match, &mut after_match);
+    pair_decorated_units(
+        before,
+        after,
+        before_root,
+        after_root,
+        &mut before_match,
+        &mut after_match,
+    );
     (before_match, after_match)
 }
 
-/// Repeated anonymous prefixes inherit the evidence of the definition they decorate.
-fn pair_following_attachments(
+/// Decorations pair only after their semantic owners have established correspondence.
+fn pair_decorated_units(
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
+    before_root: NodeId,
+    after_root: NodeId,
     before_match: &mut [Option<usize>],
     after_match: &mut [Option<usize>],
 ) {
-    let before_owners = following_attachment_owners(before);
-    let after_owners = following_attachment_owners(after);
-    let mut before_groups = HashMap::<FingerprintId, Vec<usize>>::new();
-    for (index, unit) in before.iter().enumerate().filter(|(index, unit)| {
-        before_match[*index].is_none()
-            && unit.attachment == SiblingAttachment::Following
-            && before_owners[*index].is_some()
-    }) {
-        before_groups
-            .entry(unit.fingerprint.full)
-            .or_default()
-            .push(index);
-    }
-    let mut after_groups = HashMap::<FingerprintId, Vec<usize>>::new();
-    for (index, unit) in after.iter().enumerate().filter(|(index, unit)| {
-        after_match[*index].is_none()
-            && unit.attachment == SiblingAttachment::Following
-            && after_owners[*index].is_some()
-    }) {
-        after_groups
-            .entry(unit.fingerprint.full)
-            .or_default()
-            .push(index);
-    }
-
-    for (fingerprint, before_group) in before_groups {
-        let Some(after_group) = after_groups.get(&fingerprint) else {
-            continue;
-        };
-        let before_owner_group = before_group
+    let mut owner_pairs = before_match
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(before_owner, after_owner)| {
+            after_owner.map(|after_owner| (before_owner, after_owner))
+        })
+        .map(|(before_owner, after_owner)| (before[before_owner].id, after[after_owner].id))
+        .collect::<Vec<_>>();
+    owner_pairs.push((before_root, after_root));
+    owner_pairs.sort_unstable();
+    owner_pairs.dedup();
+    for (before_owner_id, after_owner_id) in owner_pairs {
+        let before_group = before
             .iter()
-            .map(|index| before_owners[*index].expect("attachment candidate has an owner"))
+            .enumerate()
+            .filter(|(index, unit)| {
+                before_match[*index].is_none() && unit.decoration_owner == Some(before_owner_id)
+            })
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        let after_owner_group = after_group
+        let after_group = after
             .iter()
-            .map(|index| after_owners[*index].expect("attachment candidate has an owner"))
+            .enumerate()
+            .filter(|(index, unit)| {
+                after_match[*index].is_none() && unit.decoration_owner == Some(after_owner_id)
+            })
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        if compatible_alignment_exceeds_budget(
-            before,
-            after,
-            &before_owner_group,
-            &after_owner_group,
-        ) {
+        if before_group.is_empty() || after_group.is_empty() {
             continue;
         }
 
-        let matches = reciprocal_confident_matches(
-            before_group.len(),
-            after_group.len(),
-            |before_index, after_index| {
-                let before_owner = before_owner_group[before_index];
-                let after_owner = after_owner_group[after_index];
-                if before_match[before_owner].is_some_and(|matched| matched != after_owner)
-                    || after_match[after_owner].is_some_and(|matched| matched != before_owner)
-                {
-                    return 0;
-                }
-                unit_similarity(&before[before_owner], &after[after_owner])
-            },
-        );
-        for edge in matches {
+        let before_exact = before_group
+            .iter()
+            .map(|index| before[*index].fingerprint.full)
+            .collect::<Vec<_>>();
+        let after_exact = after_group
+            .iter()
+            .map(|index| after[*index].fingerprint.full)
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_exact, &after_exact) {
             link_unit_indices(
                 before_group[edge.before],
                 after_group[edge.after],
@@ -750,20 +1285,61 @@ fn pair_following_attachments(
                 after_match,
             );
         }
-    }
-}
 
-fn following_attachment_owners(units: &[UnitRecord<'_>]) -> Vec<Option<usize>> {
-    let mut owners = vec![None; units.len()];
-    let mut following = None;
-    for (index, unit) in units.iter().enumerate().rev() {
-        if unit.attachment == SiblingAttachment::Following {
-            owners[index] = following;
-        } else {
-            following = Some(index);
+        let remaining_before = before_group
+            .iter()
+            .copied()
+            .filter(|index| before_match[*index].is_none())
+            .collect::<Vec<_>>();
+        let remaining_after = after_group
+            .iter()
+            .copied()
+            .filter(|index| after_match[*index].is_none())
+            .collect::<Vec<_>>();
+        let before_shapes = remaining_before
+            .iter()
+            .map(|index| (before[*index].kind, before[*index].shape))
+            .collect::<Vec<_>>();
+        let after_shapes = remaining_after
+            .iter()
+            .map(|index| (after[*index].kind, after[*index].shape))
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_shapes, &after_shapes) {
+            link_unit_indices(
+                remaining_before[edge.before],
+                remaining_after[edge.after],
+                before_match,
+                after_match,
+            );
+        }
+
+        let remaining_before = before_group
+            .iter()
+            .copied()
+            .filter(|index| before_match[*index].is_none())
+            .collect::<Vec<_>>();
+        let remaining_after = after_group
+            .iter()
+            .copied()
+            .filter(|index| after_match[*index].is_none())
+            .collect::<Vec<_>>();
+        let before_kinds = remaining_before
+            .iter()
+            .map(|index| before[*index].kind)
+            .collect::<Vec<_>>();
+        let after_kinds = remaining_after
+            .iter()
+            .map(|index| after[*index].kind)
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_kinds, &after_kinds) {
+            link_unit_indices(
+                remaining_before[edge.before],
+                remaining_after[edge.after],
+                before_match,
+                after_match,
+            );
         }
     }
-    owners
 }
 
 fn pair_keyed_units(
@@ -774,7 +1350,7 @@ fn pair_keyed_units(
 ) {
     let mut before_groups = HashMap::<UnitKey<'_>, Vec<usize>>::new();
     for (index, unit) in before.iter().enumerate() {
-        if before_match[index].is_some() {
+        if before_match[index].is_some() || unit.decoration_owner.is_some() {
             continue;
         }
         let Some(identity) = unit.identity else {
@@ -791,7 +1367,7 @@ fn pair_keyed_units(
 
     let mut after_groups = HashMap::<UnitKey<'_>, Vec<usize>>::new();
     for (index, unit) in after.iter().enumerate() {
-        if after_match[index].is_some() {
+        if after_match[index].is_some() || unit.decoration_owner.is_some() {
             continue;
         }
         let Some(identity) = unit.identity else {
@@ -849,13 +1425,21 @@ fn pair_unkeyed_units(
     let before_indices = before
         .iter()
         .enumerate()
-        .filter(|(index, unit)| before_match[*index].is_none() && unit.identity.is_none())
+        .filter(|(index, unit)| {
+            before_match[*index].is_none()
+                && unit.identity.is_none()
+                && unit.decoration_owner.is_none()
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let after_indices = after
         .iter()
         .enumerate()
-        .filter(|(index, unit)| after_match[*index].is_none() && unit.identity.is_none())
+        .filter(|(index, unit)| {
+            after_match[*index].is_none()
+                && unit.identity.is_none()
+                && unit.decoration_owner.is_none()
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let before_values = before_indices
@@ -883,7 +1467,7 @@ fn pair_compatible_units(
     before_match: &mut [Option<usize>],
     after_match: &mut [Option<usize>],
 ) {
-    let stable = ordered_unit_anchors(before_match);
+    let stable = ordered_unit_anchors(before_match, before);
     let mut anchors = before_match
         .iter()
         .enumerate()
@@ -898,10 +1482,14 @@ fn pair_compatible_units(
     let mut after_start = 0;
     for (before_end, after_end) in anchors {
         let before_indices = (before_start..before_end)
-            .filter(|index| before_match[*index].is_none())
+            .filter(|index| {
+                before_match[*index].is_none() && before[*index].decoration_owner.is_none()
+            })
             .collect::<Vec<_>>();
         let after_indices = (after_start..after_end)
-            .filter(|index| after_match[*index].is_none())
+            .filter(|index| {
+                after_match[*index].is_none() && after[*index].decoration_owner.is_none()
+            })
             .collect::<Vec<_>>();
         for edge in compatible_unit_matches(before, after, &before_indices, &after_indices) {
             link_unit_indices(
@@ -1231,6 +1819,9 @@ fn stable_unit_matches(
         .enumerate()
         .filter_map(|(before_index, after_index)| {
             let after_index = (*after_index)?;
+            if before[before_index].decoration_owner.is_some() {
+                return None;
+            }
             let mode = ReviewMode::reconcile(before[before_index].mode, after[after_index].mode);
             mode.tracks_movement()
                 .then_some((before_index, after_index))
@@ -1264,21 +1855,86 @@ fn stable_unit_matches(
     {
         stable[before_root] = true;
     }
+
+    let before_by_id = before
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| (unit.id, index))
+        .collect::<HashMap<_, _>>();
+    for (before_index, unit) in before.iter().enumerate() {
+        let Some(owner) = unit.decoration_owner else {
+            continue;
+        };
+        let Some(owner) = before_by_id.get(&owner).copied() else {
+            // Root-owned inner documentation follows the stable graph frame,
+            // which is not itself necessarily promoted to a review unit.
+            if owner.index() == 0 && before_match[before_index].is_some() {
+                stable[before_index] = true;
+            }
+            continue;
+        };
+        if before_match[before_index].is_some() {
+            stable[before_index] = stable[owner];
+        }
+    }
     stable
 }
 
 /// Non-crossing anchors used only to serialize the merged edit script.
-fn ordered_unit_anchors(before_match: &[Option<usize>]) -> Vec<bool> {
+fn ordered_unit_anchors(before_match: &[Option<usize>], before: &[UnitRecord<'_>]) -> Vec<bool> {
     let matched = before_match
         .iter()
         .enumerate()
-        .filter_map(|(before, after)| after.map(|after| (before, after)))
+        .filter_map(|(before_index, after)| {
+            let after = (*after)?;
+            before[before_index]
+                .decoration_owner
+                .is_none()
+                .then_some((before_index, after))
+        })
         .collect::<Vec<_>>();
     let after_order = matched.iter().map(|(_, after)| *after).collect::<Vec<_>>();
     let members = increasing_subsequence_members(&after_order);
     let mut anchors = vec![false; before_match.len()];
     for ((before, _), member) in matched.into_iter().zip(members) {
         anchors[before] = member;
+    }
+    anchors
+}
+
+fn ordered_script_anchors(
+    before_match: &[Option<usize>],
+    before: &[UnitRecord<'_>],
+    stable: &[bool],
+) -> Vec<bool> {
+    let mut anchors = ordered_unit_anchors(before_match, before);
+    // Stable decorations may serialize inside the semantic anchors' gaps, but
+    // never participate in choosing those anchors.
+    for before_index in 0..before_match.len() {
+        let Some(after_index) = before_match[before_index] else {
+            continue;
+        };
+        if before[before_index].decoration_owner.is_none() || !stable[before_index] {
+            continue;
+        }
+        let previous = anchors[..before_index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, anchor)| anchor.then_some(before_match[index]).flatten());
+        let next = anchors[before_index + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(offset, anchor)| {
+                anchor
+                    .then_some(before_match[before_index + 1 + offset])
+                    .flatten()
+            });
+        if previous.is_none_or(|previous| previous < after_index)
+            && next.is_none_or(|next| after_index < next)
+        {
+            anchors[before_index] = true;
+        }
     }
     anchors
 }
@@ -1304,7 +1960,8 @@ impl CorrespondenceBuilder<'_, '_, '_> {
     }
 
     fn unit_script(&mut self) -> Vec<UnitEdit> {
-        let script_anchors = ordered_unit_anchors(self.before_match);
+        let script_anchors =
+            ordered_script_anchors(self.before_match, self.before_units, self.stable);
         let mut anchors = self
             .before_match
             .iter()
@@ -1391,7 +2048,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         };
         let leaf_start = self.graph.leaf_links.len();
         let composite_start = self.graph.composites.len();
-        self.link_unit_contents(before, after);
+        self.link_unit_contents(before, after, placement);
         let mode = ReviewMode::reconcile(
             self.before_units[before_index].mode,
             self.after_units[after_index].mode,
@@ -1425,6 +2082,8 @@ enum ParentSlot {
 struct ContextualLeafKey {
     leaf: ExactLeafKey,
     parent: ParentSlot,
+    decorated: bool,
+    decoration_owner: Option<NodeId>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -1440,6 +2099,7 @@ struct LeafShape {
 /// Actual same-context composite pairing used to judge parent changes.
 struct ContextLinks {
     before: HashMap<NodeId, NodeId>,
+    placement: HashMap<NodeId, Placement>,
 }
 
 /// Parent correspondence inside one matched review unit.
@@ -1486,6 +2146,23 @@ impl UnitContext<'_, '_, '_> {
         }
         self.pair.after.node(after).parent.map(ParentSlot::Node)
     }
+
+    fn desired_after_decoration_owner(&self, before: NodeId) -> Option<NodeId> {
+        let owner = self.pair.before.node(before).decoration_owner?;
+        if owner == self.before_unit {
+            return Some(self.after_unit);
+        }
+        self.parents.before.get(&owner).copied()
+    }
+
+    fn after_decoration_owner(&self, after: NodeId) -> Option<NodeId> {
+        self.pair.after.node(after).decoration_owner
+    }
+
+    fn decoration_placement(&self, before: NodeId) -> Option<Placement> {
+        let owner = self.pair.before.node(before).decoration_owner?;
+        self.parents.placement.get(&owner).copied()
+    }
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -1508,7 +2185,12 @@ struct ExactContextIdentity<'source> {
 }
 
 impl CorrespondenceBuilder<'_, '_, '_> {
-    fn link_unit_contents(&mut self, before_unit: NodeId, after_unit: NodeId) {
+    fn link_unit_contents(
+        &mut self,
+        before_unit: NodeId,
+        after_unit: NodeId,
+        placement: Placement,
+    ) {
         let pair = self.pair;
         let before_composites = descendant_composites(&pair.before, before_unit);
         let after_composites = descendant_composites(&pair.after, after_unit);
@@ -1516,6 +2198,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             pair,
             before_unit,
             after_unit,
+            placement,
             self.before_fingerprints,
             self.after_fingerprints,
         );
@@ -1526,7 +2209,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             after_unit,
         };
         let exact_composites = exact_composite_matches(
-            &parents,
+            &context,
             &before_composites,
             &after_composites,
             self.before_fingerprints,
@@ -1584,6 +2267,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             .map(|(edge, placement)| {
                 let before = before_composites[edge.before];
                 let after = after_composites[edge.after];
+                let placement = context.decoration_placement(before).unwrap_or(placement);
                 NodeLink {
                     before,
                     after,
@@ -1645,6 +2329,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         for (edge, placement) in exact_leaves.into_iter().zip(placements) {
             let before = before_leaves[edge.before];
             let after = after_leaves[edge.after];
+            let placement = context.decoration_placement(before).unwrap_or(placement);
             self.push_leaf_link(LeafLink {
                 before,
                 after,
@@ -1670,7 +2355,62 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             .iter()
             .map(|id| leaf_shape(&pair.after, *id))
             .collect::<Vec<_>>();
-        for edge in ordered_matches(&before_shapes, &after_shapes) {
+        let decorated = decorated_leaf_matches(
+            &context,
+            &before_remaining,
+            &after_remaining,
+            &before_shapes,
+            &after_shapes,
+        );
+        let mut before_claimed = vec![false; before_remaining.len()];
+        let mut after_claimed = vec![false; after_remaining.len()];
+        for edge in decorated {
+            before_claimed[edge.before] = true;
+            after_claimed[edge.after] = true;
+            let before = before_remaining[edge.before];
+            let after = after_remaining[edge.after];
+            let placement = context
+                .decoration_placement(before)
+                .expect("a decoration match requires a linked semantic owner");
+            self.push_leaf_link(LeafLink {
+                before,
+                after,
+                relation: LeafRelation::Modified,
+                placement,
+                reparented: !context.parents_are_linked(before, after),
+            });
+        }
+
+        let plain_before = (0..before_remaining.len())
+            .filter(|index| {
+                !before_claimed[*index]
+                    && pair
+                        .before
+                        .node(before_remaining[*index])
+                        .decoration_owner
+                        .is_none()
+            })
+            .collect::<Vec<_>>();
+        let plain_after = (0..after_remaining.len())
+            .filter(|index| {
+                !after_claimed[*index]
+                    && pair
+                        .after
+                        .node(after_remaining[*index])
+                        .decoration_owner
+                        .is_none()
+            })
+            .collect::<Vec<_>>();
+        let plain_before_shapes = plain_before
+            .iter()
+            .map(|index| before_shapes[*index])
+            .collect::<Vec<_>>();
+        let plain_after_shapes = plain_after
+            .iter()
+            .map(|index| after_shapes[*index])
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&plain_before_shapes, &plain_after_shapes) {
+            let edge = OrderedMatch::new(plain_before[edge.before], plain_after[edge.after]);
             let before = before_remaining[edge.before];
             let after = after_remaining[edge.after];
             self.push_leaf_link(LeafLink {
@@ -1691,7 +2431,7 @@ struct LeafCandidates<'input> {
 
 /// Exact context pairs win before duplicate composite payloads use global FIFO order.
 fn exact_composite_matches(
-    context: &ContextLinks,
+    context: &UnitContext<'_, '_, '_>,
     before: &[NodeId],
     after: &[NodeId],
     before_fingerprints: &[NodeFingerprints],
@@ -1706,7 +2446,7 @@ fn exact_composite_matches(
     let mut before_match = vec![None; before.len()];
     let mut after_match = vec![None; after.len()];
     for (before_index, before_id) in before.iter().copied().enumerate() {
-        let Some(after_id) = context.before.get(&before_id) else {
+        let Some(after_id) = context.parents.before.get(&before_id) else {
             continue;
         };
         let Some(after_index) = after_indices.get(after_id).copied() else {
@@ -1722,10 +2462,26 @@ fn exact_composite_matches(
     }
 
     let remaining_before = (0..before.len())
-        .filter(|index| before_match[*index].is_none())
+        .filter(|index| {
+            before_match[*index].is_none()
+                && context
+                    .pair
+                    .before
+                    .node(before[*index])
+                    .decoration_owner
+                    .is_none()
+        })
         .collect::<Vec<_>>();
     let remaining_after = (0..after.len())
-        .filter(|index| after_match[*index].is_none())
+        .filter(|index| {
+            after_match[*index].is_none()
+                && context
+                    .pair
+                    .after
+                    .node(after[*index])
+                    .decoration_owner
+                    .is_none()
+        })
         .collect::<Vec<_>>();
     let before_values = remaining_before
         .iter()
@@ -1767,6 +2523,8 @@ fn exact_leaf_matches(
             .entry(ContextualLeafKey {
                 leaf: after.keys[after_index],
                 parent,
+                decorated: context.pair.after.node(after_id).decoration_owner.is_some(),
+                decoration_owner: context.after_decoration_owner(after_id),
             })
             .or_default()
             .push_back(after_index);
@@ -1784,6 +2542,13 @@ fn exact_leaf_matches(
                 .get_mut(&ContextualLeafKey {
                     leaf: before_key,
                     parent,
+                    decorated: context
+                        .pair
+                        .before
+                        .node(before_id)
+                        .decoration_owner
+                        .is_some(),
+                    decoration_owner: context.desired_after_decoration_owner(before_id),
                 })?
                 .pop_front()
         });
@@ -1795,10 +2560,26 @@ fn exact_leaf_matches(
     }
 
     let remaining_before = (0..before.nodes.len())
-        .filter(|index| before_match[*index].is_none())
+        .filter(|index| {
+            before_match[*index].is_none()
+                && context
+                    .pair
+                    .before
+                    .node(before.nodes[*index])
+                    .decoration_owner
+                    .is_none()
+        })
         .collect::<Vec<_>>();
     let remaining_after = (0..after.nodes.len())
-        .filter(|index| after_match[*index].is_none())
+        .filter(|index| {
+            after_match[*index].is_none()
+                && context
+                    .pair
+                    .after
+                    .node(after.nodes[*index])
+                    .decoration_owner
+                    .is_none()
+        })
         .collect::<Vec<_>>();
     let before_values = remaining_before
         .iter()
@@ -1819,6 +2600,39 @@ fn exact_leaf_matches(
         .into_iter()
         .enumerate()
         .filter_map(|(before, after)| after.map(|after| OrderedMatch::new(before, after)))
+        .collect()
+}
+
+/// Modified documentation leaves remain inside the correspondence of their semantic owner.
+fn decorated_leaf_matches(
+    context: &UnitContext<'_, '_, '_>,
+    before: &[NodeId],
+    after: &[NodeId],
+    before_shapes: &[LeafShape],
+    after_shapes: &[LeafShape],
+) -> Vec<OrderedMatch> {
+    let mut after_groups = HashMap::<(NodeId, LeafShape), VecDeque<usize>>::new();
+    for (index, id) in after.iter().copied().enumerate() {
+        let Some(owner) = context.after_decoration_owner(id) else {
+            continue;
+        };
+        after_groups
+            .entry((owner, after_shapes[index]))
+            .or_default()
+            .push_back(index);
+    }
+
+    before
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(before, id)| {
+            let owner = context.desired_after_decoration_owner(id)?;
+            let after = after_groups
+                .get_mut(&(owner, before_shapes[before]))?
+                .pop_front()?;
+            Some(OrderedMatch::new(before, after))
+        })
         .collect()
 }
 
@@ -1851,28 +2665,32 @@ fn contextual_links(
     pair: &ProjectionPair<'_, '_>,
     before_unit: NodeId,
     after_unit: NodeId,
+    unit_placement: Placement,
     before_fingerprints: &[NodeFingerprints],
     after_fingerprints: &[NodeFingerprints],
 ) -> ContextLinks {
     let mut links = ContextLinks {
         before: HashMap::new(),
+        placement: HashMap::new(),
     };
-    link_context(before_unit, after_unit, &mut links);
+    link_context(before_unit, after_unit, unit_placement, &mut links);
     let mut pending = VecDeque::from([(before_unit, after_unit)]);
     while let Some((before_parent, after_parent)) = pending.pop_front() {
         let before_children = direct_composites(&pair.before, before_parent);
         let after_children = direct_composites(&pair.after, after_parent);
         let pairs = contextual_child_matches(
             pair,
+            &links,
             &before_children,
             &after_children,
             before_fingerprints,
             after_fingerprints,
         );
-        for edge in pairs {
+        let placements = contextual_match_placements(pair, &before_children, &pairs, &links);
+        for (edge, placement) in pairs.into_iter().zip(placements) {
             let before = before_children[edge.before];
             let after = after_children[edge.after];
-            link_context(before, after, &mut links);
+            link_context(before, after, placement, &mut links);
             pending.push_back((before, after));
         }
     }
@@ -1881,6 +2699,7 @@ fn contextual_links(
 
 fn contextual_child_matches(
     pair: &ProjectionPair<'_, '_>,
+    context: &ContextLinks,
     before: &[NodeId],
     after: &[NodeId],
     before_fingerprints: &[NodeFingerprints],
@@ -1953,14 +2772,19 @@ fn contextual_child_matches(
         after_match[edge.after] = Some(edge.before);
     }
 
-    for edge in following_attachment_matches(
+    for edge in decoration_matches(
         pair,
-        before,
-        after,
-        &before_match,
-        &after_match,
-        before_fingerprints,
-        after_fingerprints,
+        context,
+        ContextCandidates {
+            nodes: before,
+            matched: &before_match,
+            fingerprints: before_fingerprints,
+        },
+        ContextCandidates {
+            nodes: after,
+            matched: &after_match,
+            fingerprints: after_fingerprints,
+        },
     ) {
         before_match[edge.before] = Some(edge.after);
         after_match[edge.after] = Some(edge.before);
@@ -1968,12 +2792,16 @@ fn contextual_child_matches(
 
     let remaining_before = (0..before.len())
         .filter(|index| {
-            before_match[*index].is_none() && pair.before.identity_text(before[*index]).is_none()
+            before_match[*index].is_none()
+                && pair.before.identity_text(before[*index]).is_none()
+                && pair.before.node(before[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let remaining_after = (0..after.len())
         .filter(|index| {
-            after_match[*index].is_none() && pair.after.identity_text(after[*index]).is_none()
+            after_match[*index].is_none()
+                && pair.after.identity_text(after[*index]).is_none()
+                && pair.after.node(after[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let before_shapes = remaining_before
@@ -1998,79 +2826,136 @@ fn contextual_child_matches(
         .collect()
 }
 
-/// Anonymous prefix siblings inherit the local context of their linked following definition.
-fn following_attachment_matches(
-    pair: &ProjectionPair<'_, '_>,
-    before: &[NodeId],
-    after: &[NodeId],
-    before_match: &[Option<usize>],
-    after_match: &[Option<usize>],
-    before_fingerprints: &[NodeFingerprints],
-    after_fingerprints: &[NodeFingerprints],
-) -> Vec<OrderedMatch> {
-    let mut matches = Vec::new();
-    for (before_anchor, after_anchor) in before_match.iter().copied().enumerate() {
-        let Some(after_anchor) = after_anchor else {
-            continue;
-        };
-        if pair.before.identity_text(before[before_anchor]).is_none()
-            || pair.after.identity_text(after[after_anchor]).is_none()
-        {
-            continue;
-        }
-
-        let before_prefix =
-            following_attachment_prefix(&pair.before, before, before_anchor, before_match);
-        let after_prefix =
-            following_attachment_prefix(&pair.after, after, after_anchor, after_match);
-        let before_shapes = before_prefix
-            .iter()
-            .map(|index| {
-                (
-                    context_shape(&pair.before, before[*index]),
-                    before_fingerprints[before[*index].index()].shape,
-                )
-            })
-            .collect::<Vec<_>>();
-        let after_shapes = after_prefix
-            .iter()
-            .map(|index| {
-                (
-                    context_shape(&pair.after, after[*index]),
-                    after_fingerprints[after[*index].index()].shape,
-                )
-            })
-            .collect::<Vec<_>>();
-        matches.extend(
-            ordered_matches(&before_shapes, &after_shapes)
-                .into_iter()
-                .map(|edge| {
-                    OrderedMatch::new(before_prefix[edge.before], after_prefix[edge.after])
-                }),
-        );
-    }
-    matches
+struct ContextCandidates<'input> {
+    nodes: &'input [NodeId],
+    matched: &'input [Option<usize>],
+    fingerprints: &'input [NodeFingerprints],
 }
 
-/// Attachment runs are collected nearest-first so inserted prefixes stay with their owner.
-fn following_attachment_prefix(
-    projection: &Projection<'_>,
-    siblings: &[NodeId],
-    anchor: usize,
-    matched: &[Option<usize>],
-) -> Vec<usize> {
-    let mut prefix = Vec::new();
-    let mut index = anchor;
-    while let Some(previous) = index.checked_sub(1) {
-        if matched[previous].is_some()
-            || projection.node(siblings[previous]).attachment != SiblingAttachment::Following
-        {
-            break;
+/// Decorations are aligned only inside one already-linked semantic owner pair.
+fn decoration_matches(
+    pair: &ProjectionPair<'_, '_>,
+    context: &ContextLinks,
+    before: ContextCandidates<'_>,
+    after: ContextCandidates<'_>,
+) -> Vec<OrderedMatch> {
+    let mut matches = Vec::new();
+    let mut owner_pairs = context
+        .before
+        .iter()
+        .map(|(before, after)| (*before, *after))
+        .chain(before.matched.iter().copied().enumerate().filter_map(
+            |(before_index, after_index)| {
+                let after_index = after_index?;
+                Some((before.nodes[before_index], after.nodes[after_index]))
+            },
+        ))
+        .collect::<Vec<_>>();
+    owner_pairs.sort_unstable();
+    owner_pairs.dedup();
+    for (before_owner, after_owner) in owner_pairs {
+        let before_group = before
+            .nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, id)| {
+                before.matched[*index].is_none()
+                    && pair.before.node(*id).decoration_owner == Some(before_owner)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let after_group = after
+            .nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, id)| {
+                after.matched[*index].is_none()
+                    && pair.after.node(*id).decoration_owner == Some(after_owner)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let before_exact = before_group
+            .iter()
+            .map(|index| before.fingerprints[before.nodes[*index].index()].full)
+            .collect::<Vec<_>>();
+        let after_exact = after_group
+            .iter()
+            .map(|index| after.fingerprints[after.nodes[*index].index()].full)
+            .collect::<Vec<_>>();
+        let exact = ordered_matches(&before_exact, &after_exact);
+        let mut before_claimed = vec![false; before_group.len()];
+        let mut after_claimed = vec![false; after_group.len()];
+        for edge in exact {
+            before_claimed[edge.before] = true;
+            after_claimed[edge.after] = true;
+            matches.push(OrderedMatch::new(
+                before_group[edge.before],
+                after_group[edge.after],
+            ));
         }
-        prefix.push(previous);
-        index = previous;
+
+        let before_remaining = (0..before_group.len())
+            .filter(|index| !before_claimed[*index])
+            .collect::<Vec<_>>();
+        let after_remaining = (0..after_group.len())
+            .filter(|index| !after_claimed[*index])
+            .collect::<Vec<_>>();
+        let before_shapes = before_remaining
+            .iter()
+            .map(|index| {
+                let id = before.nodes[before_group[*index]];
+                (
+                    context_shape(&pair.before, id),
+                    before.fingerprints[id.index()].shape,
+                )
+            })
+            .collect::<Vec<_>>();
+        let after_shapes = after_remaining
+            .iter()
+            .map(|index| {
+                let id = after.nodes[after_group[*index]];
+                (
+                    context_shape(&pair.after, id),
+                    after.fingerprints[id.index()].shape,
+                )
+            })
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_shapes, &after_shapes) {
+            let before_index = before_remaining[edge.before];
+            let after_index = after_remaining[edge.after];
+            before_claimed[before_index] = true;
+            after_claimed[after_index] = true;
+            matches.push(OrderedMatch::new(
+                before_group[before_index],
+                after_group[after_index],
+            ));
+        }
+
+        let before_remaining = (0..before_group.len())
+            .filter(|index| !before_claimed[*index])
+            .collect::<Vec<_>>();
+        let after_remaining = (0..after_group.len())
+            .filter(|index| !after_claimed[*index])
+            .collect::<Vec<_>>();
+        let before_context = before_remaining
+            .iter()
+            .map(|index| context_shape(&pair.before, before.nodes[before_group[*index]]))
+            .collect::<Vec<_>>();
+        let after_context = after_remaining
+            .iter()
+            .map(|index| context_shape(&pair.after, after.nodes[after_group[*index]]))
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_context, &after_context) {
+            matches.push(OrderedMatch::new(
+                before_group[before_remaining[edge.before]],
+                after_group[after_remaining[edge.after]],
+            ));
+        }
     }
-    prefix
+    matches.sort_by_key(|edge| edge.before);
+    matches
 }
 
 /// Renamed identity-bearing siblings link only on reciprocal exact-subtree evidence.
@@ -2085,12 +2970,16 @@ fn confident_renamed_context_matches(
 ) -> Vec<OrderedMatch> {
     let before_candidates = (0..before.len())
         .filter(|index| {
-            before_match[*index].is_none() && pair.before.identity_text(before[*index]).is_some()
+            before_match[*index].is_none()
+                && pair.before.identity_text(before[*index]).is_some()
+                && pair.before.node(before[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let after_candidates = (0..after.len())
         .filter(|index| {
-            after_match[*index].is_none() && pair.after.identity_text(after[*index]).is_some()
+            after_match[*index].is_none()
+                && pair.after.identity_text(after[*index]).is_some()
+                && pair.after.node(after[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let cells = before_candidates
@@ -2147,7 +3036,7 @@ fn context_record<'source>(
         id,
         kind: node.kind,
         identity: projection.identity_text(id),
-        attachment: node.attachment,
+        decoration_owner: node.decoration_owner,
         fingerprint,
         shape: fingerprint.shape,
         evidence: unit_evidence(projection, fingerprints, id),
@@ -2185,9 +3074,55 @@ fn context_shape(projection: &Projection<'_>, id: NodeId) -> ContextShape {
     }
 }
 
-fn link_context(before: NodeId, after: NodeId, links: &mut ContextLinks) {
+/// Movement is decided by semantic siblings; each decoration inherits its owner's result.
+fn contextual_match_placements(
+    pair: &ProjectionPair<'_, '_>,
+    before: &[NodeId],
+    matches: &[OrderedMatch],
+    links: &ContextLinks,
+) -> Vec<Placement> {
+    let semantic = matches
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, edge)| {
+            pair.before
+                .node(before[edge.before])
+                .decoration_owner
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+    let semantic_edges = semantic.iter().map(|(_, edge)| *edge).collect::<Vec<_>>();
+    let semantic_placements = match_placements(&semantic_edges);
+    let mut placements = vec![None; matches.len()];
+    let mut owner_placements = links.placement.clone();
+    for ((match_index, edge), placement) in semantic.into_iter().zip(semantic_placements) {
+        placements[match_index] = Some(placement);
+        owner_placements.insert(before[edge.before], placement);
+    }
+    for (match_index, edge) in matches.iter().enumerate() {
+        if placements[match_index].is_some() {
+            continue;
+        }
+        let before = before[edge.before];
+        let owner = pair
+            .before
+            .node(before)
+            .decoration_owner
+            .expect("only decorations are excluded from semantic placement");
+        placements[match_index] = owner_placements.get(&owner).copied();
+    }
+    placements
+        .into_iter()
+        .map(|placement| placement.expect("a matched decoration requires a matched owner"))
+        .collect()
+}
+
+fn link_context(before: NodeId, after: NodeId, placement: Placement, links: &mut ContextLinks) {
     let previous_after = links.before.insert(before, after);
     debug_assert!(previous_after.is_none());
+    let previous_placement = links.placement.insert(before, placement);
+    debug_assert!(previous_placement.is_none());
 }
 
 fn mark_subtree(projection: &Projection<'_>, root: NodeId, marked: &mut HashSet<NodeId>) {
