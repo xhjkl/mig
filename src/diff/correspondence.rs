@@ -2401,24 +2401,37 @@ impl CorrespondenceBuilder<'_, '_, '_> {
                         .is_none()
             })
             .collect::<Vec<_>>();
-        let plain_before_shapes = plain_before
-            .iter()
-            .map(|index| before_shapes[*index])
-            .collect::<Vec<_>>();
-        let plain_after_shapes = plain_after
-            .iter()
-            .map(|index| after_shapes[*index])
-            .collect::<Vec<_>>();
-        for edge in ordered_matches(&plain_before_shapes, &plain_after_shapes) {
-            let edge = OrderedMatch::new(plain_before[edge.before], plain_after[edge.after]);
-            let before = before_remaining[edge.before];
-            let after = after_remaining[edge.after];
+        // Exact content may prove reparenting; shape-only edits need a parent pair
+        // established by the contextual composite walk above.
+        let mut contextual_after = HashMap::<(ParentSlot, LeafShape), VecDeque<usize>>::new();
+        for after_index in plain_after {
+            let after = after_remaining[after_index];
+            let Some(parent) = context.after_parent(after) else {
+                continue;
+            };
+            contextual_after
+                .entry((parent, after_shapes[after_index]))
+                .or_default()
+                .push_back(after_index);
+        }
+        for before_index in plain_before {
+            let before = before_remaining[before_index];
+            let Some(parent) = context.desired_after_parent(before) else {
+                continue;
+            };
+            let Some(after_index) = contextual_after
+                .get_mut(&(parent, before_shapes[before_index]))
+                .and_then(VecDeque::pop_front)
+            else {
+                continue;
+            };
+            let after = after_remaining[after_index];
             self.push_leaf_link(LeafLink {
                 before,
                 after,
                 relation: LeafRelation::Modified,
                 placement: Placement::Stable,
-                reparented: !context.parents_are_linked(before, after),
+                reparented: false,
             });
         }
     }

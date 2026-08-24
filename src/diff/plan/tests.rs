@@ -966,7 +966,7 @@ fn unrelated_delimiter_cannot_split_a_structural_replacement() {
 }
 
 #[test]
-fn changed_chain_repeats_inside_one_ordered_replacement_without_duplicate_source_rows() {
+fn changed_chain_limits_replacement_to_linked_parent_context() {
     let before = concat!(
         "fn annotate(node: Node) {\n",
         "    if node.kind() == \"use_declaration\" {\n",
@@ -989,6 +989,15 @@ fn changed_chain_repeats_inside_one_ordered_replacement_without_duplicate_source
         "}\n",
     );
     let hunks = planned("rust.rs", before, after);
+    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+        matches!(
+            row,
+            DiffRow::Line(line)
+                if line.number == 2
+                    && line.has_changes()
+                    && line_text(line).contains("is_bodyless_module")
+        )
+    }));
     let replacement = hunks
         .iter()
         .flat_map(|hunk| &hunk.rows)
@@ -1008,16 +1017,8 @@ fn changed_chain_repeats_inside_one_ordered_replacement_without_duplicate_source
     assert_eq!(
         replacement,
         [
-            ('-', 2, "if node.kind() == \"use_declaration\" {".to_owned()),
-            ('-', 3, "let identity = node".to_owned()),
             ('-', 4, ".child_by_field_name(\"argument\")".to_owned()),
             ('-', 5, ".map(|argument| argument.byte_range());".to_owned(),),
-            (
-                '+',
-                2,
-                "if node.kind() == \"use_declaration\" || is_bodyless_module(node) {".to_owned(),
-            ),
-            ('+', 3, "let identity = node".to_owned()),
             ('+', 4, ".child_by_field_name(\"argument\")".to_owned()),
             (
                 '+',
@@ -1028,6 +1029,120 @@ fn changed_chain_repeats_inside_one_ordered_replacement_without_duplicate_source
         ],
         "{hunks:#?}",
     );
+}
+
+#[test]
+fn changed_loop_pattern_does_not_pair_with_an_inserted_parameter() {
+    let before = concat!(
+        "fn contextual_links(\n",
+        "    pair: &ProjectionPair<'_, '_>,\n",
+        "    before_unit: NodeId,\n",
+        "    after_unit: NodeId,\n",
+        "    before_fingerprints: &[NodeFingerprints],\n",
+        "    after_fingerprints: &[NodeFingerprints],\n",
+        ") -> ContextLinks {\n",
+        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
+        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
+        "        let pairs = contextual_child_matches(pair, before_parent, after_parent);\n",
+        "        for edge in pairs {\n",
+        "            link_context(edge);\n",
+        "        }\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn contextual_links(\n",
+        "    pair: &ProjectionPair<'_, '_>,\n",
+        "    before_unit: NodeId,\n",
+        "    after_unit: NodeId,\n",
+        "    unit_placement: Placement,\n",
+        "    before_fingerprints: &[NodeFingerprints],\n",
+        "    after_fingerprints: &[NodeFingerprints],\n",
+        ") -> ContextLinks {\n",
+        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
+        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
+        "        let pairs = contextual_child_matches(pair, before_parent, after_parent);\n",
+        "        let placements = contextual_match_placements(&pairs);\n",
+        "        for (edge, placement) in pairs.into_iter().zip(placements) {\n",
+        "            link_context(edge, placement);\n",
+        "        }\n",
+        "    }\n",
+        "}\n",
+    );
+    let hunks = planned("correspondence.rs", before, after);
+    let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
+    let old_loop = rows
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                DiffRow::LineChange {
+                    before: Some(line),
+                    ..
+                } if line_text(line).contains("for edge in pairs")
+            )
+        })
+        .expect("old loop header remains visible");
+    let parameter = rows
+        .iter()
+        .position(|row| {
+            current_line(row)
+                .is_some_and(|line| line_text(line).contains("unit_placement: Placement"))
+        })
+        .expect("inserted parameter remains visible");
+
+    assert!(parameter < old_loop, "{hunks:#?}");
+    assert!(!rows.iter().any(|row| {
+        matches!(
+            row,
+            DiffRow::LineChange {
+                before: Some(before),
+                after: Some(after),
+            } if line_text(before).contains("for edge in pairs")
+                && line_text(after).contains("unit_placement: Placement")
+        )
+    }));
+}
+
+#[test]
+fn reordered_links_cannot_veto_stable_display_anchors() {
+    let before = "fn run() {\n    alpha();\n    beta();\n}\n";
+    let after = "fn run() {\n    beta();\n    alpha();\n}\n";
+    let pair = project_pair(Path::new("run.rs"), before, after, false).unwrap();
+    let node_on_line = |projection: &Projection<'_>, line: usize| {
+        projection
+            .nodes
+            .iter()
+            .position(|node| node.kind == "expression_statement" && node.lines.start == line)
+            .map(NodeId::new)
+            .expect("statement on source line")
+    };
+    let links = [
+        NodeLink {
+            before: node_on_line(&pair.before, 2),
+            after: node_on_line(&pair.after, 3),
+            placement: Placement::Stable,
+            reparented: false,
+        },
+        NodeLink {
+            before: node_on_line(&pair.before, 3),
+            after: node_on_line(&pair.after, 2),
+            placement: Placement::Reordered,
+            reparented: false,
+        },
+    ];
+    let facts = AnchorFacts::new(&pair);
+
+    let retained = retained_regions(&pair, &facts, &links, &(0..4), &(0..4));
+
+    assert!(matches!(
+        retained.as_slice(),
+        [RetainedRegion {
+            before,
+            after,
+            retention: Retention::Exact,
+        }] if *before == (1..2) && *after == (2..3)
+    ));
 }
 
 #[test]

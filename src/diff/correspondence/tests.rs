@@ -142,6 +142,73 @@ fn increasing_subsequence_membership_tracks_occurrences_not_values() {
 }
 
 #[test]
+fn modified_leaf_shapes_stay_inside_linked_parent_contexts() {
+    let before = concat!(
+        "fn contextual_links(\n",
+        "    pair: &ProjectionPair<'_, '_>,\n",
+        "    before_unit: NodeId,\n",
+        "    after_unit: NodeId,\n",
+        "    before_fingerprints: &[NodeFingerprints],\n",
+        "    after_fingerprints: &[NodeFingerprints],\n",
+        ") -> ContextLinks {\n",
+        "    let mut links = ContextLinks { before: HashMap::new() };\n",
+        "    link_context(before_unit, after_unit, &mut links);\n",
+        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
+        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
+        "        let before_children = direct_composites(&pair.before, before_parent);\n",
+        "        let after_children = direct_composites(&pair.after, after_parent);\n",
+        "        let pairs = contextual_child_matches(pair, &before_children, &after_children, before_fingerprints, after_fingerprints);\n",
+        "        for edge in pairs {\n",
+        "            let before = before_children[edge.before];\n",
+        "            let after = after_children[edge.after];\n",
+        "            link_context(before, after, &mut links);\n",
+        "            pending.push_back((before, after));\n",
+        "        }\n",
+        "    }\n",
+        "    links\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn contextual_links(\n",
+        "    pair: &ProjectionPair<'_, '_>,\n",
+        "    before_unit: NodeId,\n",
+        "    after_unit: NodeId,\n",
+        "    unit_placement: Placement,\n",
+        "    before_fingerprints: &[NodeFingerprints],\n",
+        "    after_fingerprints: &[NodeFingerprints],\n",
+        ") -> ContextLinks {\n",
+        "    let mut links = ContextLinks { before: HashMap::new(), placement: HashMap::new() };\n",
+        "    link_context(before_unit, after_unit, unit_placement, &mut links);\n",
+        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
+        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
+        "        let before_children = direct_composites(&pair.before, before_parent);\n",
+        "        let after_children = direct_composites(&pair.after, after_parent);\n",
+        "        let pairs = contextual_child_matches(pair, &links, &before_children, &after_children, before_fingerprints, after_fingerprints);\n",
+        "        let placements = contextual_match_placements(pair, &before_children, &pairs, &links);\n",
+        "        for (edge, placement) in pairs.into_iter().zip(placements) {\n",
+        "            let before = before_children[edge.before];\n",
+        "            let after = after_children[edge.after];\n",
+        "            link_context(before, after, placement, &mut links);\n",
+        "            pending.push_back((before, after));\n",
+        "        }\n",
+        "    }\n",
+        "    links\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("correspondence.rs"), before, after, false).unwrap();
+    let graph = correspond(&pair);
+
+    assert!(!graph.leaf_links.iter().any(|link| {
+        let before = pair.before.node(link.before);
+        let after = pair.after.node(link.after);
+        before.lines.start == 15
+            && pair.before.leaf_text(link.before) == Some("edge")
+            && after.lines.start == 5
+            && pair.after.leaf_text(link.after) == Some("unit_placement")
+    }));
+}
+
+#[test]
 fn line_projection_is_the_same_ordered_unit_graph() {
     let pair = project_pair(
         Path::new("notes.txt"),
@@ -1075,7 +1142,7 @@ fn renamed_nested_definition_preserves_parent_links_for_exact_body_leaves() {
 }
 
 #[test]
-fn ambiguous_nested_renames_do_not_gain_fifo_parent_links() {
+fn ambiguous_nested_renames_remain_unlinked_without_parent_correspondence() {
     let before = concat!(
         "mod tests {\n",
         "    fn old_alpha() { shared(); }\n",
@@ -1106,8 +1173,7 @@ fn ambiguous_nested_renames_do_not_gain_fifo_parent_links() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(renamed.len(), 2);
-    assert!(renamed.iter().all(|link| link.reparented));
+    assert!(renamed.is_empty());
 }
 
 #[test]

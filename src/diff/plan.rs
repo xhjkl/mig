@@ -2216,18 +2216,20 @@ fn retained_regions(
     before_region: &Range<usize>,
     after_region: &Range<usize>,
 ) -> Vec<RetainedRegion> {
-    // Decorations follow semantic owners; neither they nor their descendants
-    // may introduce checkpoints or make semantic links appear crossed.
+    // Only locally eligible anchors vote on global order. Decorations follow
+    // semantic owners, and reordered links cannot partition stable source.
     let composites = composites
         .iter()
         .copied()
-        .filter(|link| !link_belongs_to_decoration(pair, *link))
+        .filter(|link| {
+            link.placement == Placement::Stable && !link_belongs_to_decoration(pair, *link)
+        })
         .collect::<Vec<_>>();
     let crossed = structural_link_crossings(pair, &composites);
     let mut candidates = composites
         .into_iter()
         .zip(crossed)
-        .filter(|(link, crossed)| link.placement == Placement::Stable && !crossed)
+        .filter(|(_, crossed)| !crossed)
         .filter_map(|(link, _)| {
             retained_region(pair, anchor_facts, link, before_region, after_region)
         })
