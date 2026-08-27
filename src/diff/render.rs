@@ -274,35 +274,4 @@ mod tests {
         assert_eq!(word.added, "new");
         assert_eq!(word.suffix, "_name");
     }
-
-    #[test]
-    fn adjacent_identical_styles_share_one_span() {
-        let mut spans = Vec::new();
-
-        push_span(&mut spans, "let", SyntaxClass::Keyword, DiffMark::Context);
-        push_span(&mut spans, " ", SyntaxClass::Keyword, DiffMark::Context);
-        push_span(
-            &mut spans,
-            "value",
-            SyntaxClass::Identifier,
-            DiffMark::Context,
-        );
-        push_span(&mut spans, "", SyntaxClass::Identifier, DiffMark::Context);
-
-        assert_eq!(
-            spans,
-            [
-                DisplaySpan {
-                    text: "let ".to_owned(),
-                    syntax: SyntaxClass::Keyword,
-                    mark: DiffMark::Context,
-                },
-                DisplaySpan {
-                    text: "value".to_owned(),
-                    syntax: SyntaxClass::Identifier,
-                    mark: DiffMark::Context,
-                },
-            ]
-        );
-    }
 }

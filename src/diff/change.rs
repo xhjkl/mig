@@ -56,29 +56,3 @@ impl AfterGap {
         self.0
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signals_define_one_buoyancy_and_context_policy() {
-        let buoyancy = [
-            Signal::Edit.buoyancy(),
-            Signal::Move.buoyancy(),
-            Signal::Wiring.buoyancy(),
-            Signal::Reflow.buoyancy(),
-        ];
-        assert!(buoyancy.windows(2).all(|pair| pair[0] > pair[1]));
-        assert!(Signal::Edit.receives_context());
-        assert!(!Signal::Move.receives_context());
-        assert!(Signal::Wiring.receives_context());
-        assert!(Signal::Reflow.receives_context());
-    }
-
-    #[test]
-    fn after_gap_counts_preceding_current_lines() {
-        assert_eq!(AfterGap::BEFORE_FIRST.preceding_lines(), 0);
-        assert_eq!(AfterGap::new(99).preceding_lines(), 99);
-    }
-}

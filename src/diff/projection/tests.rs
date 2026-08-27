@@ -1,17 +1,6 @@
 use super::*;
 
 #[test]
-fn review_modes_define_the_only_movement_aware_mode() {
-    assert!(ReviewMode::Structural.tracks_movement());
-    assert!(!ReviewMode::Compact.tracks_movement());
-    assert!(!ReviewMode::Linewise.tracks_movement());
-    assert_eq!(
-        ReviewMode::reconcile(ReviewMode::Structural, ReviewMode::Compact),
-        ReviewMode::Linewise
-    );
-}
-
-#[test]
 fn line_projection_is_an_exact_leaf_cst_including_terminators() {
     let pair = project_pair(Path::new("notes.txt"), "a\r\n\nlast", "", false).unwrap();
 

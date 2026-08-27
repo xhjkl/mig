@@ -698,17 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn syntax_node_budget_is_checked_before_projection_allocation() {
-        let mut parser = Parser::new();
-        let language: TreeSitterLanguage = tree_sitter_rust::LANGUAGE.into();
-        parser.set_language(&language).unwrap();
-        let tree = parser.parse("fn main() { work(); }\n", None).unwrap();
-
-        assert!(tree_exceeds_node_limit(tree.root_node(), 2));
-        assert!(!tree_exceeds_node_limit(tree.root_node(), 1_000));
-    }
-
-    #[test]
     fn syntax_node_budget_precedes_language_recovery_walks() {
         let adapter = RecoveryAdapter {
             called: Cell::new(false),

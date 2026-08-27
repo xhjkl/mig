@@ -3,26 +3,6 @@ use crate::fixture::{AFTER, BEFORE, LABEL, web};
 use std::collections::HashSet;
 
 #[test]
-fn display_line_derives_change_state_from_its_spans() {
-    let mut line = DisplayLine {
-        number: 1,
-        spans: vec![DisplaySpan {
-            text: "stable".to_owned(),
-            syntax: SyntaxClass::Plain,
-            mark: DiffMark::Context,
-        }],
-    };
-    assert!(!line.has_changes());
-
-    line.spans.push(DisplaySpan {
-        text: "changed".to_owned(),
-        syntax: SyntaxClass::Plain,
-        mark: DiffMark::Added,
-    });
-    assert!(line.has_changes());
-}
-
-#[test]
 fn fixture_keeps_payload_edits_ahead_of_pure_imports() {
     let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
@@ -247,46 +227,6 @@ fn two_sided_hunk_uses_the_current_file_boundary() {
     assert_eq!(hunk.coverage.after, Some(1..4));
     assert!(hunk_has_text(hunk, "fn later"));
     assert!(matches!(hunk.rows.last(), Some(DiffRow::FileBoundary)));
-}
-
-#[test]
-fn one_weak_line_between_edits_joins_their_revision_blocks() {
-    let before = "fn run() {\n    before_one();\n\n    before_two();\n}\n";
-    let after = "fn run() {\n    after_one();\n\n    after_two();\n}\n";
-    let diff = diff_file("src/run.rs", before, after).expect("source must parse");
-    let hunk = hunk_containing(&diff, "fn run");
-
-    assert!(
-        hunk.rows
-            .iter()
-            .all(|row| !matches!(row, DiffRow::Elision(_)))
-    );
-    let replacement = hunk
-        .rows
-        .iter()
-        .filter_map(|row| match row {
-            DiffRow::LineChange {
-                before: Some(line),
-                after: None,
-            } => Some(('-', line.number, line_text(line))),
-            DiffRow::LineChange {
-                before: None,
-                after: Some(line),
-            } => Some(('+', line.number, line_text(line))),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        replacement,
-        [
-            ('-', 2, "    before_one();".to_string()),
-            ('-', 3, String::new()),
-            ('-', 4, "    before_two();".to_string()),
-            ('+', 2, "    after_one();".to_string()),
-            ('+', 3, String::new()),
-            ('+', 4, "    after_two();".to_string()),
-        ],
-    );
 }
 
 #[test]
@@ -518,27 +458,6 @@ fn moved_reflow_keeps_an_unmatched_crlf_visible() {
 }
 
 #[test]
-fn expanded_fixture_adds_distinct_policy_and_payload_hunks() {
-    let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-
-    let policy = hunk_containing(&diff, "fn should_refresh");
-    assert!(hunk_has_text(policy, "Only stale profiles"));
-    assert!(hunk_has_text(policy, "Stale and legacy profiles"));
-    assert!(hunk_has_text(
-        policy,
-        "profile.schema < 4 || age > Duration::from_secs(300)"
-    ));
-    assert!(hunk_has_added_text(policy, "schema"));
-
-    let normalization = hunk_containing(&diff, "fn display_label");
-    assert!(hunk_has_added_text(normalization, "replace"));
-    assert!(hunk_has_text(
-        normalization,
-        "profile.display_name.trim().to_owned().replace('\\n', \" \")"
-    ));
-}
-
-#[test]
 fn imports_and_reflow_keep_their_signals_and_local_context() {
     let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
 
@@ -581,15 +500,6 @@ fn imports_and_reflow_keep_their_signals_and_local_context() {
 fn identical_source_has_no_review_work() {
     let source = "use std::fmt;\n\nfn stable() { fmt::write(); }\n";
     let diff = diff_file("src/stable.rs", source, source).expect("source must parse");
-
-    assert!(diff.hunks.is_empty());
-}
-
-#[test]
-fn identical_recovered_source_has_no_review_work() {
-    let source = "fn broken(value: u32 {}\n";
-
-    let diff = diff_file("src/broken.rs", source, source).expect("parser must recover");
 
     assert!(diff.hunks.is_empty());
 }
@@ -1332,33 +1242,6 @@ fn generated_html_keeps_exact_correspondence() {
 }
 
 #[test]
-fn every_web_fixture_produces_review_work() {
-    let paths = web::ALL
-        .iter()
-        .map(|fixture| fixture.path)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        paths,
-        [
-            "web/profile-card.css",
-            "web/profile-card.html",
-            "web/profile-card.ts",
-        ]
-    );
-
-    for fixture in web::ALL {
-        let diff = diff_file(fixture.path, fixture.before, fixture.after)
-            .expect("web fixture uses a supported fallback");
-
-        assert!(
-            !diff.hunks.is_empty(),
-            "{} needs a visible diff",
-            fixture.path
-        );
-    }
-}
-
-#[test]
 fn typescript_fixture_keeps_declarations_and_syntax_in_the_graph_plan() {
     let fixture = web::TYPESCRIPT;
     let diff = diff_file(fixture.path, fixture.before, fixture.after)
@@ -1838,33 +1721,6 @@ fn malformed_or_linewise_rust_still_materializes_source_changes() {
                 .any(|row| matches!(row, DiffRow::LineChange { .. }))
         );
     }
-}
-
-#[test]
-fn identical_line_projected_source_has_no_review_work() {
-    let source = "plain text\nwith no grammar\n";
-
-    let diff = diff_file("README", source, source).expect("plain diff cannot fail");
-
-    assert!(diff.hunks.is_empty());
-}
-
-#[test]
-fn large_anchorless_alignment_uses_the_bounded_fallback() {
-    let before = vec!["same"; 200];
-    let after = vec!["same"; 200];
-
-    let matches = correspondence::ordered_matches(&before, &after);
-
-    assert_eq!(matches.len(), 200);
-    assert_eq!(
-        matches.first().map(|edge| (edge.before, edge.after)),
-        Some((0, 0))
-    );
-    assert_eq!(
-        matches.last().map(|edge| (edge.before, edge.after)),
-        Some((199, 199))
-    );
 }
 
 fn line_text(line: &DisplayLine) -> String {

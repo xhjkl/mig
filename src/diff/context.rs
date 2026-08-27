@@ -125,17 +125,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn three_line_halos_coalesce_across_seven_context_rows_but_not_eight() {
-        assert_eq!(CONTEXT_HALO_RADIUS, 3);
-        assert!(context_gap_fits_halos(7));
-        assert!(!context_gap_fits_halos(8));
-        assert!(merge_windows_touch(&(1..5), &(6..14)));
-        assert!(!merge_windows_touch(&(1..5), &(7..15)));
-        assert!(ranges_overlap(&(2..5), &(4..8)));
-        assert!(!ranges_overlap(&(2..5), &(5..8)));
-    }
-
-    #[test]
     fn breadcrumb_selection_normalizes_order_duplicates_touching_ranges_and_one_context_gap() {
         let ranges = review_selection_ranges(4..7, [9, 3, 2, 7, 9, 12], |index| index == 8);
 

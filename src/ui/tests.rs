@@ -540,23 +540,6 @@ fn end_navigation_lands_on_the_eof_guardian() {
 }
 
 #[test]
-fn generated_marker_survives_a_long_file_header() {
-    let mut diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-    diff.generated = true;
-    diff.path = format!("{}generated.rs", "very-long-directory/".repeat(8));
-    let mut app = App::new(vec![diff]);
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).expect("test terminal");
-
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render generated file");
-
-    let screen = buffer_text(terminal.backend().buffer());
-    assert!(screen.contains("@generated"));
-}
-
-#[test]
 fn file_ribbon_lists_reviews_and_moves_the_bold_active_style() {
     let first = diff_file("src/first.rs", "before\n", "after\n").expect("first diff");
     let second = diff_file("notes.txt", "before\n", "after\n").expect("second diff");

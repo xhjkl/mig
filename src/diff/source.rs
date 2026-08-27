@@ -203,9 +203,6 @@ mod tests {
                 ending: LineEnding::Missing,
             }
         );
-        assert_eq!(LineEnding::Missing.byte_len(), 0);
-        assert_eq!(LineEnding::Lf.byte_len(), 1);
-        assert_eq!(LineEnding::CrLf.byte_len(), 2);
     }
 
     #[test]

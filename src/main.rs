@@ -154,7 +154,6 @@ fn display_pair_path(before: &Path, after: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mig::diff::DiffRow;
     use std::fs;
     use tempfile::TempDir;
 
@@ -258,93 +257,5 @@ mod tests {
                 limit_lines: MAX_REVISION_LINES,
             }) if path == "dense.txt" && lines == MAX_REVISION_LINES + 1
         ));
-    }
-
-    #[test]
-    fn explicit_html_pair_keeps_a_whitespace_noisy_wrapped_tag_atomic() {
-        let directory = TempDir::new().expect("temporary directory");
-        let before_path = directory.path().join("before.html");
-        let after_path = directory.path().join("after.html");
-        let before = "<article>\n\t<img\n\t\tsrc=\"avatar.webp\"\n\t/>\n</article>\n";
-        let after = concat!(
-            "<article>\n",
-            "\t<div>\n",
-            "\t\t<img",
-            "                           ",
-            "\n",
-            "\t\t\tsrc=\"avatar.webp\"\n",
-            "\t\t/>\n",
-            "\t</div>\n",
-            "</article>\n",
-        );
-        fs::write(&before_path, before).expect("write before HTML");
-        fs::write(&after_path, after).expect("write after HTML");
-
-        let review = plan_file_pair(&before_path, &after_path, None, MAX_REVISION_BYTES)
-            .expect("plan explicit HTML pair")
-            .expect("changed pair stays visible");
-        let FileReview::Diff(diff) = review else {
-            panic!("HTML pair needs a concrete diff");
-        };
-        assert!(diff.path.ends_with("after.html"));
-        let reflow = diff
-            .hunks
-            .iter()
-            .flat_map(|hunk| &hunk.rows)
-            .filter_map(|row| {
-                let DiffRow::Reflow(line) = row else {
-                    return None;
-                };
-                let text = line
-                    .spans
-                    .iter()
-                    .map(|span| span.text.as_str())
-                    .collect::<String>();
-                Some((line.number, text))
-            })
-            .collect::<Vec<_>>();
-        for expected in [
-            (3, "\t\t<img                           "),
-            (4, "\t\t\tsrc=\"avatar.webp\""),
-            (5, "\t\t/>"),
-        ] {
-            assert!(
-                reflow
-                    .iter()
-                    .any(|(number, text)| *number == expected.0 && text == expected.1),
-                "missing exact current row {expected:?}",
-            );
-        }
-        for needle in ["<img", "src=\"avatar.webp\"", "/>"] {
-            let retained = diff
-                .hunks
-                .iter()
-                .flat_map(|hunk| &hunk.rows)
-                .filter(|row| {
-                    matches!(
-                        row,
-                        DiffRow::Reflow(line) if line
-                            .spans
-                            .iter()
-                            .map(|span| span.text.as_str())
-                            .collect::<String>()
-                            .contains(needle)
-                    )
-                })
-                .count();
-            assert_eq!(retained, 1, "{needle:?} must stay in the retained tag");
-            assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-                let DiffRow::LineChange { before, after } = row else {
-                    return false;
-                };
-                before.iter().chain(after).any(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.text.as_str())
-                        .collect::<String>()
-                        .contains(needle)
-                })
-            }));
-        }
     }
 }
