@@ -183,4 +183,6 @@ fn is_generated_marker_line(line: &str) -> bool {
 }
 
 #[cfg(test)]
+mod corpus_tests;
+#[cfg(test)]
 mod tests;

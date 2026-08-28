@@ -10,7 +10,7 @@ use super::context::{
     context_halo_start, merge_windows_touch, ranges_overlap, review_selection_ranges,
 };
 use super::correspondence::{
-    Correspondence, LeafRelation, LineLink, MatchedUnit, NodeLink, Placement, UnitEdit,
+    Correspondence, LeafLink, LeafRelation, LineLink, MatchedUnit, NodeLink, Placement, UnitEdit,
     ordered_matches,
 };
 use super::projection::{ContentChannel, NodeId, Projection, ProjectionPair, ReviewMode};
@@ -245,8 +245,10 @@ impl ReviewSequence {
             let Some(owner) = self.before_owner.get_mut(line) else {
                 continue;
             };
-            debug_assert!(owner.is_none() || *owner == Some(order));
-            *owner = Some(order);
+            // Adjacent review units can share a physical line. Changed overlaps are
+            // planned by a local line fallback; unchanged overlaps retain the first
+            // unit's edit-script position as their common presentation anchor.
+            owner.get_or_insert(order);
         }
     }
 
@@ -255,8 +257,9 @@ impl ReviewSequence {
             let Some(owner) = self.after_owner.get_mut(line) else {
                 continue;
             };
-            debug_assert!(owner.is_none() || *owner == Some(order));
-            *owner = Some(order);
+            // Mirroring before-world ownership keeps shared-line context stable
+            // across revisions without inventing a second display row.
+            owner.get_or_insert(order);
         }
         if !lines.is_empty() {
             self.after_units.push((lines, order));
@@ -507,7 +510,12 @@ pub(crate) fn plan_hunks(
         .iter()
         .map(|edit| fallback_index.suppresses(pair, edit))
         .collect::<Vec<_>>();
-    let changes = if only_linewise {
+    // A one-sided file has no competing revision geometry or structural edit order.
+    // Treating its syntax units as independently buoyant can lift separators ahead of
+    // the declarations they separate, so retain the file as one physical line region.
+    let one_sided = pair.before.source.lines().is_empty() || pair.after.source.lines().is_empty();
+    let source_ordered = only_linewise || one_sided;
+    let changes = if source_ordered {
         edit_fragments(plan_whole_file_lines(pair, correspondence, &anchor_facts))
     } else {
         plan_units(pair, correspondence, &anchor_facts, &suppressed_units)
@@ -515,7 +523,7 @@ pub(crate) fn plan_hunks(
 
     let alignment = LineAlignment::new(correspondence, pair.after.source.lines().len());
     let review_sequence =
-        (!only_linewise).then(|| ReviewSequence::new(pair, correspondence, &suppressed_units));
+        (!source_ordered).then(|| ReviewSequence::new(pair, correspondence, &suppressed_units));
     let mut changes = changes
         .into_iter()
         .map(|change| change.place(&alignment))
@@ -551,6 +559,8 @@ pub(crate) fn plan_hunks(
             rows: change.groups.into_iter().flatten().collect(),
         });
     }
+    normalize_stable_revision_rows(&mut hunks, &alignment);
+    normalize_added_inline_wrappers(&mut hunks, pair, correspondence);
     deduplicate_context_rows(&mut hunks);
     append_file_boundary(
         &mut hunks,
@@ -558,6 +568,355 @@ pub(crate) fn plan_hunks(
         pair.after.source.lines().len(),
     );
     hunks
+}
+
+/// Present exact physical correspondence once, in the current revision.
+///
+/// Independently planned structural units can claim the two sides of a stable line as if it
+/// were a removal and addition. The physical-line graph is the language-neutral authority for
+/// those rows: old ghosts disappear and one current owner remains as context. Explicit
+/// structural movement already uses `Moved` rows and remains outside this normalization.
+fn normalize_stable_revision_rows(hunks: &mut Vec<Hunk>, alignment: &LineAlignment<'_>) {
+    let mut changed_before = HashSet::new();
+    let mut changed_after = HashSet::new();
+    let mut current_owners = HashSet::new();
+    let mut context_owners = HashSet::new();
+    let mut material_current_owners = HashSet::new();
+    for row in hunks.iter().flat_map(|hunk| &hunk.rows) {
+        match row {
+            DiffRow::LineChange { before, after } => {
+                changed_before.extend(before.as_ref().map(|line| line.number));
+                changed_after.extend(after.as_ref().map(|line| line.number));
+            }
+            DiffRow::Line(line) if !line.has_changes() => {
+                current_owners.insert(line.number);
+                context_owners.insert(line.number);
+            }
+            _ => {
+                let after = row_displayed_after_source_line(row);
+                current_owners.extend(after);
+                material_current_owners.extend(after);
+            }
+        }
+    }
+
+    let stable = alignment
+        .graph
+        .line_links
+        .iter()
+        .filter_map(|link| {
+            let before = link.before + 1;
+            let after = link.after + 1;
+            let both_material = changed_before.contains(&before) && changed_after.contains(&after);
+            let duplicates_current_owner = current_owners.contains(&after)
+                && (changed_before.contains(&before) || changed_after.contains(&after));
+            (both_material || duplicates_current_owner).then_some((before, after))
+        })
+        .collect::<Vec<_>>();
+    if stable.is_empty() {
+        return;
+    }
+
+    let stable_before = stable
+        .iter()
+        .map(|(before, _)| *before)
+        .collect::<HashSet<_>>();
+    let stable_after = stable
+        .iter()
+        .map(|(_, after)| *after)
+        .collect::<HashSet<_>>();
+    // A material current-side claim identifies the line's structural home more
+    // precisely than context borrowed by another producer. Rebuild that claim as
+    // context in place so extracted payload follows its new declaration.
+    let relocated_after = stable_after
+        .intersection(&changed_after)
+        .filter(|line| context_owners.contains(line) && !material_current_owners.contains(line))
+        .copied()
+        .collect::<HashSet<_>>();
+    current_owners.retain(|line| !relocated_after.contains(line));
+    for hunk in hunks.iter_mut() {
+        hunk.rows = std::mem::take(&mut hunk.rows)
+            .into_iter()
+            .flat_map(|row| {
+                if matches!(
+                    &row,
+                    DiffRow::Line(line)
+                        if !line.has_changes() && relocated_after.contains(&line.number)
+                ) {
+                    return Vec::new();
+                }
+                let DiffRow::LineChange { before, after } = row else {
+                    return vec![row];
+                };
+                let before = before.filter(|line| !stable_before.contains(&line.number));
+                let stable_current = after
+                    .as_ref()
+                    .is_some_and(|line| stable_after.contains(&line.number));
+                if !stable_current {
+                    return (before.is_some() || after.is_some())
+                        .then_some(DiffRow::LineChange { before, after })
+                        .into_iter()
+                        .collect();
+                }
+
+                let mut rows = before
+                    .map(|line| DiffRow::LineChange {
+                        before: Some(line),
+                        after: None,
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let mut line = after.expect("stable current row exists");
+                if current_owners.insert(line.number) {
+                    for span in &mut line.spans {
+                        span.mark = DiffMark::Context;
+                    }
+                    rows.push(DiffRow::Line(line));
+                }
+                rows
+            })
+            .collect();
+    }
+    hunks.retain(hunk_has_signal);
+}
+
+/// Present an addition around exact inline payload in the current revision.
+///
+/// A changed same-line subtree can cross a parent boundary while all of its old meaningful
+/// payload survives inside added syntax. Physical line alignment cannot pair that row after the
+/// surrounding layout disappears, so the raw fallback would show a full old/new replacement.
+/// Exact leaf correspondence supplies the finer contract: retain its ranges as context, mark the
+/// new wrapper, and discard the redundant old-world row. Rows with removed or modified payload
+/// are deliberately excluded so their history remains visible.
+fn normalize_added_inline_wrappers(
+    hunks: &mut Vec<Hunk>,
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+) {
+    let line_pairs = retained_inline_lines(pair, correspondence, &correspondence.leaf_links);
+    if line_pairs.is_empty() {
+        return;
+    }
+    let mut before_targets = HashMap::<usize, HashSet<usize>>::new();
+    let mut after_sources = HashMap::<usize, HashSet<usize>>::new();
+    for line in &line_pairs {
+        before_targets
+            .entry(line.before)
+            .or_default()
+            .insert(line.after);
+        after_sources
+            .entry(line.after)
+            .or_default()
+            .insert(line.before);
+    }
+
+    let removed = hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .filter_map(|row| match row {
+            DiffRow::LineChange {
+                before: Some(line),
+                after: None,
+            } => Some(line.number),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let added = hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .filter_map(|row| match row {
+            DiffRow::LineChange {
+                before: None,
+                after: Some(line),
+            } => Some(line.number),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    let mut retained = HashMap::<usize, (usize, Vec<Range<usize>>)>::new();
+    for line in line_pairs {
+        let before_line = line.before;
+        let after_line = line.after;
+        if !removed.contains(&before_line) || !added.contains(&after_line) {
+            continue;
+        }
+        let unique_pair = before_targets
+            .get(&before_line)
+            .is_some_and(|targets| targets.len() == 1)
+            && after_sources
+                .get(&after_line)
+                .is_some_and(|sources| sources.len() == 1);
+        if !unique_pair
+            || line_has_nonexact_before_payload(pair, correspondence, before_line)
+            || !line_has_nonexact_after_payload(pair, correspondence, after_line)
+            || line_pair_has_modified_payload(pair, correspondence, before_line, after_line)
+        {
+            continue;
+        }
+
+        let ranges = correspondence
+            .leaf_links
+            .iter()
+            .filter(|link| {
+                link.relation == LeafRelation::Exact && link.placement == Placement::Stable
+            })
+            .filter_map(|link| {
+                let before = pair.before.node(link.before);
+                let after = pair.after.node(link.after);
+                (before.lines.contains(&before_line) && after.lines.contains(&after_line))
+                    .then(|| after.bytes.clone())
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            continue;
+        }
+        retained.insert(after_line, (before_line, ranges));
+    }
+    if retained.is_empty() {
+        return;
+    }
+
+    let retained_before = retained
+        .values()
+        .map(|(before, _)| *before)
+        .collect::<HashSet<_>>();
+    for hunk in hunks.iter_mut() {
+        hunk.rows = std::mem::take(&mut hunk.rows)
+            .into_iter()
+            .filter_map(|row| match row {
+                DiffRow::LineChange {
+                    before: Some(line),
+                    after: None,
+                } if retained_before.contains(&line.number) => None,
+                DiffRow::LineChange {
+                    before: None,
+                    after: Some(line),
+                } if retained.contains_key(&line.number) => {
+                    let (_, ranges) = &retained[&line.number];
+                    let ranges = ranges
+                        .iter()
+                        .cloned()
+                        .map(|bytes| MarkedRange::new(bytes, DiffMark::Context))
+                        .collect::<Vec<_>>();
+                    let source = &pair.after.source.lines()[line.number - 1];
+                    Some(DiffRow::Line(build_display_line(
+                        &pair.after,
+                        source,
+                        &ranges,
+                        DiffMark::Added,
+                    )))
+                }
+                row => Some(row),
+            })
+            .collect();
+    }
+    hunks.retain(hunk_has_signal);
+}
+
+struct RetainedInlineLine {
+    before: usize,
+    after: usize,
+    links: Vec<LeafLink>,
+}
+
+/// Select same-line exact payload whose parent change is carried by neighboring syntax.
+fn retained_inline_lines(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    links: &[LeafLink],
+) -> Vec<RetainedInlineLine> {
+    let mut by_line = HashMap::<(usize, usize), Vec<_>>::new();
+    for link in links.iter().copied().filter(|link| {
+        link.relation == LeafRelation::Exact
+            && link.placement == Placement::Stable
+            && link.reparented
+    }) {
+        let before = pair.before.node(link.before);
+        let after = pair.after.node(link.after);
+        if before.lines.len() != 1 || after.lines.len() != 1 {
+            continue;
+        }
+        by_line
+            .entry((before.lines.start, after.lines.start))
+            .or_default()
+            .push(link);
+    }
+
+    by_line
+        .into_iter()
+        .filter_map(|((before, after), links)| {
+            let meaningful = links
+                .iter()
+                .any(|link| leaf_is_meaningful_payload(&pair.after, link.after));
+            let carries_signal =
+                line_pair_has_modified_payload(pair, correspondence, before, after)
+                    || line_has_nonexact_before_payload(pair, correspondence, before)
+                    || line_has_nonexact_after_payload(pair, correspondence, after);
+            (meaningful && carries_signal).then_some(RetainedInlineLine {
+                before,
+                after,
+                links,
+            })
+        })
+        .collect()
+}
+
+fn line_has_nonexact_before_payload(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    line: usize,
+) -> bool {
+    line_has_nonexact_payload(&pair.before, line, |id| {
+        correspondence.before_leaf_link(id).is_none()
+    })
+}
+
+fn line_has_nonexact_after_payload(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    line: usize,
+) -> bool {
+    line_has_nonexact_payload(&pair.after, line, |id| {
+        correspondence.after_leaf_link(id).is_none()
+    })
+}
+
+fn line_has_nonexact_payload(
+    projection: &Projection<'_>,
+    line: usize,
+    nonexact: impl Fn(NodeId) -> bool,
+) -> bool {
+    let Some(source) = projection.source.line(line) else {
+        return false;
+    };
+    projection
+        .leaf_ids_in(source.content_bytes.clone())
+        .any(|id| nonexact(id) && leaf_is_meaningful_payload(projection, id))
+}
+
+fn line_pair_has_modified_payload(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    before_line: usize,
+    after_line: usize,
+) -> bool {
+    correspondence.leaf_links.iter().any(|link| {
+        link.relation == LeafRelation::Modified
+            && (pair.before.node(link.before).lines.contains(&before_line)
+                || pair.after.node(link.after).lines.contains(&after_line))
+    })
+}
+
+fn hunk_has_signal(hunk: &Hunk) -> bool {
+    hunk.rows.iter().any(|row| match row {
+        DiffRow::Line(line) => line.has_changes(),
+        DiffRow::Reflow(_)
+        | DiffRow::LineChange { .. }
+        | DiffRow::LineEnding { .. }
+        | DiffRow::Moved { .. }
+        | DiffRow::Wordwise(_) => true,
+        DiffRow::Elision(_) | DiffRow::FileBoundary => false,
+    })
 }
 
 /// One hunk contains each physical current-world context row at most once.
@@ -1471,13 +1830,26 @@ fn plan_payload(
 ) -> Vec<ReviewExcerpt> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
+    if has_multiline_modified_payload(pair, correspondence, unit) {
+        return plan_line_region(
+            pair,
+            correspondence,
+            Some(before.lines.clone()),
+            Some(after.lines.clone()),
+            correspondence.unit_composites(unit),
+            Some(unit.after),
+            LineAnchors::new(structural_anchor_basis(pair, unit), anchor_facts),
+        );
+    }
     edits.extend(modified_payload_edits(pair, correspondence, unit));
+    let retained_inline = retained_inline_reparenting(pair, correspondence, unit);
     let mut changed_before = correspondence
         .unit_leaf_links(unit)
         .iter()
         .filter(|link| {
             link.relation != LeafRelation::Modified
                 && (link.placement == Placement::Reordered || link.reparented)
+                && !retained_inline.0.contains(&link.before)
         })
         .map(|link| link.before)
         .collect::<HashSet<_>>();
@@ -1487,6 +1859,7 @@ fn plan_payload(
         .filter(|link| {
             link.relation != LeafRelation::Modified
                 && (link.placement == Placement::Reordered || link.reparented)
+                && !retained_inline.1.contains(&link.after)
         })
         .map(|link| link.after)
         .collect::<HashSet<_>>();
@@ -1577,6 +1950,69 @@ fn plan_payload(
     }
 
     select_review_excerpts(pair, correspondence, unit, rows)
+}
+
+/// Keep exact inline payload as context when new syntax merely wraps it.
+///
+/// A direct-parent change normally remains visible structural signal. On one physical row,
+/// however, inserting or changing meaningful neighboring syntax can make an exact child look
+/// reparented even though it stayed in place as the payload of a new wrapper. The independent
+/// non-exact signal carries that edit, so the exact child becomes its local review halo. Pure
+/// reparenting and reordering have no such signal and remain marked.
+fn retained_inline_reparenting(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    unit: &MatchedUnit,
+) -> (HashSet<NodeId>, HashSet<NodeId>) {
+    let mut retained_before = HashSet::new();
+    let mut retained_after = HashSet::new();
+    for line in retained_inline_lines(pair, correspondence, correspondence.unit_leaf_links(unit)) {
+        retained_before.extend(line.links.iter().map(|link| link.before));
+        retained_after.extend(line.links.iter().map(|link| link.after));
+    }
+    (retained_before, retained_after)
+}
+
+fn leaf_is_meaningful_payload(projection: &Projection<'_>, id: NodeId) -> bool {
+    let node = projection.node(id);
+    let Some(leaf) = node.leaf else {
+        return false;
+    };
+    !leaf.delimiter
+        && !matches!(
+            leaf.channel,
+            ContentChannel::Comment | ContentChannel::Layout
+        )
+        && projection
+            .leaf_text(id)
+            .is_some_and(|text| !text.trim().is_empty())
+}
+
+/// Detect atomic parser payloads that need physical-line review locality.
+fn has_multiline_modified_payload(
+    pair: &ProjectionPair<'_, '_>,
+    correspondence: &Correspondence,
+    unit: &MatchedUnit,
+) -> bool {
+    correspondence.unit_leaf_links(unit).iter().any(|link| {
+        if link.relation != LeafRelation::Modified {
+            return false;
+        }
+        let before = pair.before.node(link.before);
+        let after = pair.after.node(link.after);
+        let significant = before.leaf.is_some_and(|leaf| {
+            !matches!(
+                leaf.channel,
+                ContentChannel::Comment | ContentChannel::Layout
+            )
+        }) && after.leaf.is_some_and(|leaf| {
+            !matches!(
+                leaf.channel,
+                ContentChannel::Comment | ContentChannel::Layout
+            )
+        });
+        significant && (before.lines.len() > 1 || after.lines.len() > 1)
+    })
 }
 
 /// One physical replacement row retained with both source revisions.

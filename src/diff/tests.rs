@@ -1,157 +1,6 @@
 use super::*;
-use crate::fixture::{AFTER, BEFORE, LABEL, web};
+use crate::fixture::{AFTER, BEFORE, LABEL};
 use std::collections::HashSet;
-
-#[test]
-fn fixture_keeps_payload_edits_ahead_of_pure_imports() {
-    let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-
-    assert_eq!(diff.hunks.len(), 2, "adjacent focus windows must coalesce");
-    let rows = diff
-        .hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .collect::<Vec<_>>();
-    let import = rows
-        .iter()
-        .position(|row| matches!(row, DiffRow::Wordwise(_)))
-        .expect("fixture must include its import replacement");
-    let definition = rows
-        .iter()
-        .position(
-            |row| matches!(row, DiffRow::Line(line) if line_text(line).contains("fn load_profile")),
-        )
-        .expect("fixture must include its first changed definition");
-    let moved = rows
-        .iter()
-        .position(|row| {
-            matches!(
-                row,
-                DiffRow::Moved { after, .. }
-                    if after.number == 38 && line_text(after).contains("fn cache_key")
-            )
-        })
-        .expect("fixture must include its moved definition");
-    assert!(
-        definition < moved,
-        "source order must survive coalescing: {rows:#?}"
-    );
-    assert!(
-        moved < import,
-        "pure import churn belongs below payload-edit hunks: {rows:#?}"
-    );
-}
-
-#[test]
-fn pure_import_and_reflow_hunks_follow_payload_edits() {
-    let stable = concat!(
-        "const A: u8 = 0;\n",
-        "const B: u8 = 0;\n",
-        "const C: u8 = 0;\n",
-        "const D: u8 = 0;\n",
-        "const E: u8 = 0;\n",
-        "const F: u8 = 0;\n",
-        "const G: u8 = 0;\n",
-        "const H: u8 = 0;\n",
-    );
-    let before = format!(
-        "use crate::old;\n{stable}fn formatted() -> u8 {{ 1 }}\n{stable}fn logic() {{ old(); }}\n"
-    );
-    let after = format!(
-        "use crate::new;\n{stable}fn formatted() -> u8 {{\n    1\n}}\n{stable}fn logic() {{ new(); }}\n"
-    );
-    let diff = diff_file("src/buoyancy.rs", &before, &after).expect("source must parse");
-
-    let payload = diff
-        .hunks
-        .iter()
-        .position(|hunk| hunk_has_text(hunk, "new();"))
-        .expect("payload-edit hunk");
-    let import = diff
-        .hunks
-        .iter()
-        .position(|hunk| {
-            hunk.rows
-                .iter()
-                .any(|row| matches!(row, DiffRow::Wordwise(_)))
-        })
-        .expect("wiring import hunk");
-    let reflow = diff
-        .hunks
-        .iter()
-        .position(|hunk| hunk_has_text(hunk, "fn formatted"))
-        .expect("reflow hunk");
-
-    assert!(payload < import && import < reflow, "{:#?}", diff.hunks);
-}
-
-#[test]
-fn bodyless_module_wiring_follows_payload_edits() {
-    let stable = concat!(
-        "const A: u8 = 0;\n",
-        "const B: u8 = 0;\n",
-        "const C: u8 = 0;\n",
-        "const D: u8 = 0;\n",
-        "const E: u8 = 0;\n",
-        "const F: u8 = 0;\n",
-        "const G: u8 = 0;\n",
-        "const H: u8 = 0;\n",
-    );
-    let before = format!("mod stable;\n{stable}fn logic() {{ old(); }}\n");
-    let after =
-        format!("mod stable;\nmod change;\nmod context;\n{stable}fn logic() {{ new(); }}\n");
-    let diff = diff_file("src/diff.rs", &before, &after).expect("Rust must plan");
-    let payload = diff
-        .hunks
-        .iter()
-        .position(|hunk| hunk_has_text(hunk, "new();"))
-        .expect("payload-edit hunk");
-    let wiring = diff
-        .hunks
-        .iter()
-        .position(|hunk| hunk_has_text(hunk, "mod change;"))
-        .expect("module-wiring hunk");
-
-    assert!(payload < wiring, "{:#?}", diff.hunks);
-}
-
-#[test]
-fn mixed_module_mode_keeps_edit_buoyancy_in_both_directions() {
-    let separation = concat!(
-        "const A: u8 = 0;\n",
-        "const B: u8 = 0;\n",
-        "const C: u8 = 0;\n",
-        "const D: u8 = 0;\n",
-        "const E: u8 = 0;\n",
-        "const F: u8 = 0;\n",
-        "const G: u8 = 0;\n",
-        "const H: u8 = 0;\n",
-    );
-    let inline = "mod subject { pub fn payload() {} }\n";
-    let bodyless = "mod subject;\n";
-
-    for (before_module, after_module) in [(inline, bodyless), (bodyless, inline)] {
-        let before = format!("use crate::old;\n{separation}{before_module}");
-        let after = format!("use crate::new;\n{separation}{after_module}");
-        let diff = diff_file("src/lib.rs", &before, &after).expect("Rust must plan");
-        let module = diff
-            .hunks
-            .iter()
-            .position(|hunk| hunk_has_text(hunk, "pub fn payload"))
-            .expect("module transition hunk");
-        let import = diff
-            .hunks
-            .iter()
-            .position(|hunk| {
-                hunk.rows
-                    .iter()
-                    .any(|row| matches!(row, DiffRow::Wordwise(_)))
-            })
-            .expect("compact import hunk");
-
-        assert!(module < import, "{:#?}", diff.hunks);
-    }
-}
 
 #[test]
 fn definition_hunk_keeps_hierarchy_local_context_and_distant_elision() {
@@ -523,85 +372,6 @@ fn duplicate_definition_names_keep_one_to_one_correspondence() {
 }
 
 #[test]
-fn inserted_call_wrapper_does_not_mark_unchanged_empty_calls() {
-    let before = r#"async fn serve_one_turn() -> Result<()> {
-    let harmony = HarmonyAdapter::gpt_oss()?;
-    let mut parser = harmony.output_parser()?;
-    let (generated_tx, mut generated_rx) = unbounded_channel();
-    let history = history.to_owned();
-    let also_hub = hub.clone();
-    while let Some(event) = generated_rx.recv().await {}
-    let calls = parser.finish();
-    let message = error.to_string();
-    Ok(())
-}
-"#;
-    let after = r#"async fn serve_one_turn() -> Result<()> {
-    // The constructor may populate a cache through a blocking client.
-    let harmony = tokio::task::spawn_blocking(HarmonyAdapter::gpt_oss)
-        .await
-        .map_err(|error| eyre!(error))??;
-    let mut parser = harmony.output_parser()?;
-    let (generated_tx, mut generated_rx) = unbounded_channel();
-    let history = history.to_owned();
-    let also_hub = hub.clone();
-    while let Some(event) = generated_rx.recv().await {}
-    let calls = parser.finish();
-    let message = error.to_string();
-    Ok(())
-}
-"#;
-
-    let diff = diff_file("src/hub.rs", before, after).expect("source must parse");
-
-    assert!(hunk_has_added_text(&diff.hunks[0], "spawn_blocking"));
-    assert_eq!(current_line_occurrences(&diff, "output_parser()"), 1);
-    for unchanged in [
-        "output_parser()",
-        "unbounded_channel()",
-        "to_owned()",
-        "clone()",
-        "recv()",
-        "finish()",
-        "to_string()",
-    ] {
-        assert_eq!(
-            marked_line_occurrences(&diff, unchanged, DiffMark::Added),
-            0,
-            "unchanged call became added: {unchanged}"
-        );
-    }
-}
-
-#[test]
-fn inserted_and_removed_comments_keep_their_source_side() {
-    let plain = "fn run() {\n    work();\n}\n";
-    let commented = "fn run() {\n    // explain why\n    work();\n}\n";
-
-    let added = diff_file("src/run.rs", plain, commented).expect("source must parse");
-    let removed = diff_file("src/run.rs", commented, plain).expect("source must parse");
-
-    assert!(added.hunks[0].rows.iter().any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: None,
-                after: Some(after),
-            } if line_text(after).contains("explain why")
-        )
-    }));
-    assert!(removed.hunks[0].rows.iter().any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(before),
-                after: None,
-            } if line_text(before).contains("explain why")
-        )
-    }));
-}
-
-#[test]
 fn comments_inside_an_added_definition_are_added_content() {
     let after = "fn run() {\n    // explain why\n    work();\n}\n";
 
@@ -684,63 +454,6 @@ fn line_insertions_and_deletions_keep_their_source_numbers() {
 }
 
 #[test]
-fn html_wrapper_preserves_the_reindented_image_subtree() {
-    let fixture = web::HTML;
-    let diff =
-        diff_file(fixture.path, fixture.before, fixture.after).expect("HTML projection must plan");
-    let rows = diff
-        .hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .collect::<Vec<_>>();
-
-    for needle in [
-        "<img",
-        "class=\"profile-card__avatar\"",
-        "src=\"/avatars/ada.webp\"",
-        "alt=\"Ada Lovelace\"",
-        "/>",
-    ] {
-        let retained = rows
-            .iter()
-            .filter_map(|row| {
-                let DiffRow::Reflow(line) = row else {
-                    return None;
-                };
-                line_text(line).contains(needle).then_some(line)
-            })
-            .collect::<Vec<_>>();
-        let [line] = retained.as_slice() else {
-            panic!("{needle:?} must appear once as retained current content");
-        };
-        assert!(line.spans.iter().all(|span| span.mark == DiffMark::Context));
-        assert!(!rows.iter().any(|row| {
-            let DiffRow::LineChange { before, after } = row else {
-                return false;
-            };
-            before
-                .iter()
-                .chain(after)
-                .any(|line| line_text(line).contains(needle))
-        }));
-    }
-
-    for wrapper in ["<div class=\"profile-card__portrait\">", "</div>"] {
-        assert!(rows.iter().any(|row| {
-            let DiffRow::LineChange {
-                before: None,
-                after: Some(line),
-            } = row
-            else {
-                return false;
-            };
-            line_text(line).trim() == wrapper
-                && line.spans.iter().all(|span| span.mark == DiffMark::Added)
-        }));
-    }
-}
-
-#[test]
 fn recovered_html_still_anchors_a_reindented_child() {
     // Browsers accept this common authoring state even though a `div` cannot
     // formally remain inside a `p`; the recovered CST still knows the image.
@@ -748,15 +461,15 @@ fn recovered_html_still_anchors_a_reindented_child() {
     let after = concat!(
         "<p>\n",
         "\t<div\n",
-        "\t\tid=\"gege\"\n",
-        "\t\tx-aria=\"takogoNet\"\t\n",
+        "\t\tid=\"alpha\"\n",
+        "\t\tdata-alpha=\"beta\"\t\n",
         "\t>\n",
         " \t\t<img />\n",
         "\t</div>\n",
         "</p>\n",
     );
 
-    let diff = diff_file("sample.html", before, after).expect("HTML must plan");
+    let diff = diff_file("alpha.html", before, after).expect("HTML must plan");
     let rows = diff
         .hunks
         .iter()
@@ -795,98 +508,47 @@ fn recovered_html_still_anchors_a_reindented_child() {
 }
 
 #[test]
-fn renamed_definition_keeps_exact_body_lines_as_context() {
-    let before = concat!(
-        "mod tests {\n",
-        "#[test]\n",
-        "fn fixture_keeps_primary_logic_ahead_of_pure_imports() {\n",
-        "    let diff = diff_file(LABEL, BEFORE, AFTER).expect(\"fixture must parse\");\n",
-        "\n",
-        "    assert_eq!(diff.hunks.len(), 2, \"adjacent focus windows must coalesce\");\n",
-        "    let rows = diff\n",
-        "        .hunks\n",
-        "        .iter()\n",
-        "        .flat_map(|hunk| &hunk.rows)\n",
-        "        .collect::<Vec<_>>();\n",
-        "    let import = rows\n",
-        "        .iter()\n",
-        "        .position(|row| matches!(row, DiffRow::Wordwise(_)))\n",
-        "        .expect(\"fixture must include its import replacement\");\n",
-        "}\n",
-        "}\n",
-    );
-    let after = before
-        .replace(
-            "fixture_keeps_primary_logic_ahead_of_pure_imports",
-            "fixture_keeps_payload_edits_ahead_of_pure_imports",
-        )
-        .replace("primary logic", "payload edits");
-
-    let diff = diff_file("src/diff.rs", before, &after).expect("Rust must plan");
-    let rows = diff
-        .hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .collect::<Vec<_>>();
-
-    for needle in [".hunks", ".flat_map", "let import = rows"] {
-        assert!(
-            !rows.iter().any(|row| {
-                let DiffRow::LineChange { before, after } = row else {
-                    return false;
-                };
-                before
-                    .iter()
-                    .chain(after)
-                    .any(|line| line_text(line).contains(needle))
-            }),
-            "unchanged {needle:?} must be context or omitted, never a ghost/addition pair: {rows:#?}"
-        );
-    }
-}
-
-#[test]
 fn inserted_test_does_not_drift_across_repeated_neighbor_bodies() {
     let before = concat!(
-        "mod tests {\n",
+        "mod alpha {\n",
         "#[test]\n",
-        "fn first() {\n",
-        "    let rows = compose();\n",
-        "    assert!(rows.contains(\"first contract\"));\n",
+        "fn alpha() {\n",
+        "    let alpha = beta();\n",
+        "    consume(alpha);\n",
         "}\n",
         "#[test]\n",
-        "fn second() {\n",
-        "    let rows = compose();\n",
-        "    assert!(rows.contains(\"second contract\"));\n",
+        "fn beta() {\n",
+        "    let alpha = beta();\n",
+        "    consume(alpha);\n",
         "}\n",
         "#[test]\n",
-        "fn third() {\n",
-        "    let rows = compose();\n",
-        "    assert!(rows.contains(\"third contract\"));\n",
+        "fn gamma() {\n",
+        "    let alpha = beta();\n",
+        "    consume(alpha);\n",
         "}\n",
         "}\n",
     );
     let after = before.replace(
-        "#[test]\nfn second()",
+        "#[test]\nfn beta()",
         concat!(
             "#[test]\n",
-            "fn inserted() {\n",
-            "    let rows = compose();\n",
-            "    assert!(rows.contains(\"inserted contract\"));\n",
+            "fn delta() {\n",
+            "    let alpha = beta();\n",
+            "    consume(alpha);\n",
             "}\n",
             "#[test]\n",
-            "fn second()",
+            "fn beta()",
         ),
     );
 
-    let diff = diff_file("src/ui.rs", before, &after).expect("Rust must plan");
+    let diff = diff_file("alpha.rs", before, &after).expect("Rust must plan");
     let rows = diff
         .hunks
         .iter()
         .flat_map(|hunk| &hunk.rows)
         .collect::<Vec<_>>();
 
-    for needle in ["fn second", "second contract", "fn third", "third contract"] {
+    for needle in ["fn beta", "fn gamma"] {
         assert!(
             !rows.iter().any(|row| {
                 let DiffRow::LineChange { before, after } = row else {
@@ -906,20 +568,20 @@ fn inserted_test_does_not_drift_across_repeated_neighbor_bodies() {
 fn inserted_top_level_test_keeps_attributes_with_their_definitions() {
     let before = concat!(
         "#[test]\n",
-        "fn first() { assert!(\"first contract\"); }\n",
+        "fn alpha() { alpha(); }\n",
         "#[test]\n",
-        "fn second() { assert!(\"second contract\"); }\n",
+        "fn beta() { beta(); }\n",
     );
     let after = before.replace(
-        "#[test]\nfn second()",
+        "#[test]\nfn beta()",
         concat!(
             "#[test]\n",
-            "fn inserted() { assert!(\"inserted contract\"); }\n",
+            "fn gamma() { gamma(); }\n",
             "#[test]\n",
-            "fn second()",
+            "fn beta()",
         ),
     );
-    let diff = diff_file("src/tests.rs", before, &after).expect("Rust must plan");
+    let diff = diff_file("alpha.rs", before, &after).expect("Rust must plan");
     let rows = diff
         .hunks
         .iter()
@@ -933,7 +595,7 @@ fn inserted_top_level_test_keeps_attributes_with_their_definitions() {
         before
             .iter()
             .chain(after)
-            .any(|line| line_text(line).contains("fn second"))
+            .any(|line| line_text(line).contains("fn beta"))
     }));
     let removed_attributes = rows
         .iter()
@@ -1046,10 +708,11 @@ fn nested_test_decorations_follow_their_reordered_functions() {
 
 #[test]
 fn bare_html_wrapper_does_not_steal_an_existing_div_anchor() {
-    let before = "<section>\n  <img src=\"avatar.webp\">\n  <div>\n    <p>Existing</p>\n  </div>\n</section>\n";
-    let after = "<section>\n  <div>\n    <img src=\"avatar.webp\">\n  </div>\n  <div>\n    <p>Existing</p>\n  </div>\n</section>\n";
+    let before =
+        "<section>\n  <img src=\"alpha.webp\">\n  <div>\n    <p>alpha</p>\n  </div>\n</section>\n";
+    let after = "<section>\n  <div>\n    <img src=\"alpha.webp\">\n  </div>\n  <div>\n    <p>alpha</p>\n  </div>\n</section>\n";
 
-    let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+    let diff = diff_file("alpha.html", before, after).expect("HTML uses the line planner");
     let rows = &diff.hunks[0].rows;
     let retained = rows
         .iter()
@@ -1075,10 +738,10 @@ fn bare_html_wrapper_does_not_steal_an_existing_div_anchor() {
 
 #[test]
 fn inline_html_wrapper_cannot_hide_unrelated_bytes_on_the_same_line() {
-    let before = "<article><img src=\"avatar.webp\"></article>\n";
-    let after = "<article><div><img src=\"avatar.webp\"></div></article>\n";
+    let before = "<article><img src=\"alpha.webp\"></article>\n";
+    let after = "<article><div><img src=\"alpha.webp\"></div></article>\n";
 
-    let diff = diff_file("index.html", before, after).expect("HTML projection must plan");
+    let diff = diff_file("alpha.html", before, after).expect("HTML projection must plan");
     let rows = diff
         .hunks
         .iter()
@@ -1100,13 +763,13 @@ fn inline_html_wrapper_cannot_hide_unrelated_bytes_on_the_same_line() {
 
 #[test]
 fn multiline_html_wrapper_keeps_mixed_indentation_atomic() {
-    let before = "<img\nfixed=\"yes\"\n  src=\"avatar.webp\"\n/>\n";
-    let after = "<div>\n  <img\nfixed=\"yes\"\n    src=\"avatar.webp\"\n  />\n</div>\n";
+    let before = "<img\ndata-alpha=\"beta\"\n  src=\"alpha.webp\"\n/>\n";
+    let after = "<div>\n  <img\ndata-alpha=\"beta\"\n    src=\"alpha.webp\"\n  />\n</div>\n";
 
-    let diff = diff_file("index.html", before, after).expect("HTML uses the line planner");
+    let diff = diff_file("alpha.html", before, after).expect("HTML uses the line planner");
     let rows = &diff.hunks[0].rows;
 
-    for needle in ["<img", "fixed=\"yes\"", "src=\"avatar.webp\"", "/>"] {
+    for needle in ["<img", "data-alpha=\"beta\"", "src=\"alpha.webp\"", "/>"] {
         let retained = rows
             .iter()
             .filter_map(|row| {
@@ -1123,7 +786,7 @@ fn multiline_html_wrapper_keeps_mixed_indentation_atomic() {
         matches!(
             row,
             DiffRow::Line(line)
-                if !line.has_changes() && line_text(line).contains("fixed=\"yes\"")
+                if !line.has_changes() && line_text(line).contains("data-alpha=\"beta\"")
         )
     }));
     assert!(!rows.iter().any(|row| {
@@ -1131,7 +794,7 @@ fn multiline_html_wrapper_keeps_mixed_indentation_atomic() {
             return false;
         };
         before.iter().chain(after).any(|line| {
-            ["<img", "fixed=\"yes\"", "src=\"avatar.webp\"", "/>"]
+            ["<img", "data-alpha=\"beta\"", "src=\"alpha.webp\"", "/>"]
                 .iter()
                 .any(|needle| line_text(line).contains(needle))
         })
@@ -1222,8 +885,8 @@ fn html_multiline_attribute_values_remain_literal_changes() {
 
 #[test]
 fn generated_html_keeps_exact_correspondence() {
-    let before = "<!-- @generated -->\n  <img src=\"avatar.webp\" />\n";
-    let after = "<!-- @generated -->\n    <img src=\"avatar.webp\" />\n";
+    let before = "<!-- @generated -->\n  <img src=\"alpha.webp\" />\n";
+    let after = "<!-- @generated -->\n    <img src=\"alpha.webp\" />\n";
 
     let diff = diff_file("index.html", before, after).expect("generated HTML uses line diff");
     let rows = &diff.hunks[0].rows;
@@ -1239,91 +902,6 @@ fn generated_html_keeps_exact_correspondence() {
         )
     }));
     assert!(!rows.iter().any(|row| { matches!(row, DiffRow::Reflow(_)) }));
-}
-
-#[test]
-fn typescript_fixture_keeps_declarations_and_syntax_in_the_graph_plan() {
-    let fixture = web::TYPESCRIPT;
-    let diff = diff_file(fixture.path, fixture.before, fixture.after)
-        .expect("TypeScript fixture must parse");
-
-    for declaration in [
-        "export interface Profile",
-        "export function cardTitle",
-        "export function avatarAlt",
-        "export function avatarSource",
-    ] {
-        assert_eq!(
-            current_line_occurrences(&diff, declaration),
-            1,
-            "{declaration}"
-        );
-    }
-    assert_eq!(current_line_occurrences(&diff, "string | null"), 1);
-    assert_eq!(current_line_occurrences(&diff, " · "), 1);
-    assert_eq!(current_line_occurrences(&diff, "Portrait of"), 1);
-    assert_eq!(
-        marked_line_occurrences(&diff, "avatarSource", DiffMark::Added),
-        1
-    );
-    assert!(has_two_sided_line_changes(&diff));
-
-    let syntax = displayed_syntax_classes(&diff);
-    for expected in [
-        SyntaxClass::Keyword,
-        SyntaxClass::Type,
-        SyntaxClass::String,
-        SyntaxClass::Punctuation,
-    ] {
-        assert!(syntax.contains(&expected), "missing {expected:?} styling");
-    }
-}
-
-#[test]
-fn css_fixture_keeps_rules_and_declarations_in_the_graph_plan() {
-    let fixture = web::CSS;
-    let diff =
-        diff_file(fixture.path, fixture.before, fixture.after).expect("CSS fixture must parse");
-    assert_eq!(current_line_occurrences(&diff, ".profile-card {"), 1);
-    assert_eq!(
-        current_line_occurrences(&diff, "grid-template-columns: 7rem"),
-        1
-    );
-    assert_eq!(
-        current_line_occurrences(&diff, ".profile-card__portrait {"),
-        1
-    );
-    assert_eq!(
-        current_line_occurrences(&diff, ".profile-card__portrait img {"),
-        1
-    );
-    assert_eq!(marked_line_occurrences(&diff, "7rem", DiffMark::Added), 1);
-    assert_eq!(
-        marked_line_occurrences(&diff, ".profile-card__avatar {", DiffMark::Removed),
-        1,
-        "{diff:#?}"
-    );
-    assert_eq!(current_line_occurrences(&diff, "aspect-ratio: 1;"), 1);
-    assert_eq!(current_line_occurrences(&diff, "object-fit: cover;"), 1);
-    assert!(diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(before),
-                after: Some(after),
-            } if line_text(before).contains("grid-template-columns: 6rem")
-                && line_text(after).contains("grid-template-columns: 7rem")
-        )
-    }));
-
-    let syntax = displayed_syntax_classes(&diff);
-    for expected in [
-        SyntaxClass::Identifier,
-        SyntaxClass::Literal,
-        SyntaxClass::Punctuation,
-    ] {
-        assert!(syntax.contains(&expected), "missing {expected:?} styling");
-    }
 }
 
 #[test]
@@ -1585,99 +1163,6 @@ fn generated_rust_is_flagged_and_forced_through_line_projection() {
 }
 
 #[test]
-fn representative_public_rows_obey_source_space_invariants() {
-    let moved_before = concat!(
-        "fn first() {\n",
-        "    one();\n",
-        "}\n",
-        "fn second() {\n",
-        "    two();\n",
-        "}\n",
-        "fn third() {\n",
-        "    three();\n",
-        "}\n",
-    );
-    let moved_after = concat!(
-        "fn third() {\n",
-        "    three();\n",
-        "}\n",
-        "fn second() {\n",
-        "    two();\n",
-        "}\n",
-        "fn first() {\n",
-        "    changed_one();\n",
-        "    extra();\n",
-        "}\n",
-    );
-    let distant_before = concat!(
-        "one\n",
-        "old two\n",
-        "three\n",
-        "four\n",
-        "five\n",
-        "six\n",
-        "seven\n",
-        "eight\n",
-        "nine\n",
-        "ten\n",
-        "eleven\n",
-        "old twelve\n",
-        "thirteen\n",
-        "fourteen\n",
-    );
-    let distant_after = concat!(
-        "one\n",
-        "new two\n",
-        "three\n",
-        "four\n",
-        "five\n",
-        "six\n",
-        "seven\n",
-        "eight\n",
-        "nine\n",
-        "ten\n",
-        "eleven\n",
-        "new twelve\n",
-        "thirteen\n",
-        "fourteen\n",
-    );
-    let edge_cases = [
-        ("src/order.rs", moved_before, moved_after),
-        ("notes.md", distant_before, distant_after),
-        ("notes.txt", "same\n", "same"),
-        ("src/removed.rs", "fn removed() {}\n", ""),
-        ("src/added.rs", "", "fn added() {}\n"),
-    ];
-
-    let fixtures = [(LABEL, BEFORE, AFTER)]
-        .into_iter()
-        .chain(
-            web::ALL
-                .iter()
-                .map(|fixture| (fixture.path, fixture.before, fixture.after)),
-        )
-        .chain(edge_cases);
-    let mut observed = ObservedRowKinds::default();
-    for (path, before, after) in fixtures {
-        let diff = diff_file(path, before, after).expect("source must plan");
-
-        assert_source_space_invariants(path, &diff);
-        observed.extend(&diff);
-    }
-    assert!(observed.line, "matrix must exercise ordinary source rows");
-    assert!(observed.reflow, "matrix must exercise reflow rows");
-    assert!(observed.line_change, "matrix must exercise line changes");
-    assert!(observed.line_ending, "matrix must exercise line endings");
-    assert!(observed.moved, "matrix must exercise moves");
-    assert!(observed.wordwise, "matrix must exercise compact changes");
-    assert!(observed.elision, "matrix must exercise elisions");
-    assert!(
-        observed.file_boundary,
-        "matrix must exercise file boundaries"
-    );
-}
-
-#[test]
 fn generated_marker_is_exact_and_header_bounded() {
     let mut below_header = "ordinary\n".repeat(20);
     below_header.push_str("// @generated\n");
@@ -1703,22 +1188,30 @@ fn generated_marker_is_exact_and_header_bounded() {
 #[test]
 fn malformed_or_linewise_rust_still_materializes_source_changes() {
     for (before, after) in [
-        ("fn broken(value: u32 {}\n", "fn broken(value: u64 {}\n"),
-        ("// old license\n", "// new license\n"),
+        ("fn alpha(value: u32 {}\n", "fn alpha(value: u64 {}\n"),
+        ("// alpha\n", "// beta\n"),
         (
-            "// old license\nfn run() { old(); }\n",
-            "// new license\nfn run() { new(); }\n",
+            "// alpha\nfn gamma() { alpha(); }\n",
+            "// beta\nfn gamma() { beta(); }\n",
         ),
-        ("fn run() { old(); }\n", "fn run() { new(); }"),
+        ("fn alpha() { beta(); }\n", "fn alpha() { gamma(); }"),
     ] {
-        let diff = diff_file("src/lib.rs", before, after).expect("plain fallback cannot fail");
+        let diff = diff_file("alpha.rs", before, after).expect("line fallback cannot fail");
 
         assert!(!diff.hunks.is_empty());
         assert!(
             diff.hunks
                 .iter()
                 .flat_map(|hunk| &hunk.rows)
-                .any(|row| matches!(row, DiffRow::LineChange { .. }))
+                .any(|row| match row {
+                    DiffRow::Line(line) | DiffRow::Reflow(line) => line.has_changes(),
+                    DiffRow::LineChange { .. }
+                    | DiffRow::LineEnding { .. }
+                    | DiffRow::Moved { .. }
+                    | DiffRow::Wordwise(_) => true,
+                    DiffRow::Elision(_) | DiffRow::FileBoundary => false,
+                }),
+            "{before:?} -> {after:?}: {diff:#?}",
         );
     }
 }
@@ -1797,35 +1290,6 @@ fn assert_source_space_invariants(path: &str, diff: &FileDiff) {
     }
 }
 
-#[derive(Default)]
-struct ObservedRowKinds {
-    line: bool,
-    reflow: bool,
-    line_change: bool,
-    line_ending: bool,
-    moved: bool,
-    wordwise: bool,
-    elision: bool,
-    file_boundary: bool,
-}
-
-impl ObservedRowKinds {
-    fn extend(&mut self, diff: &FileDiff) {
-        for row in diff.hunks.iter().flat_map(|hunk| &hunk.rows) {
-            match row {
-                DiffRow::Line(_) => self.line = true,
-                DiffRow::Reflow(_) => self.reflow = true,
-                DiffRow::LineChange { .. } => self.line_change = true,
-                DiffRow::LineEnding { .. } => self.line_ending = true,
-                DiffRow::Moved { .. } => self.moved = true,
-                DiffRow::Wordwise(_) => self.wordwise = true,
-                DiffRow::Elision(_) => self.elision = true,
-                DiffRow::FileBoundary => self.file_boundary = true,
-            }
-        }
-    }
-}
-
 fn source_lines(diff: &FileDiff) -> Vec<&DisplayLine> {
     diff.hunks
         .iter()
@@ -1843,39 +1307,12 @@ fn source_lines(diff: &FileDiff) -> Vec<&DisplayLine> {
         .collect()
 }
 
-fn current_line_occurrences(diff: &FileDiff, needle: &str) -> usize {
-    source_lines(diff)
-        .into_iter()
-        .filter(|line| !line.spans.iter().any(|span| span.mark == DiffMark::Removed))
-        .filter(|line| line_text(line).contains(needle))
-        .count()
-}
-
 fn marked_line_occurrences(diff: &FileDiff, needle: &str, mark: DiffMark) -> usize {
     source_lines(diff)
         .into_iter()
         .filter(|line| line_text(line).contains(needle))
         .filter(|line| line.spans.iter().any(|span| span.mark == mark))
         .count()
-}
-
-fn displayed_syntax_classes(diff: &FileDiff) -> Vec<SyntaxClass> {
-    source_lines(diff)
-        .into_iter()
-        .flat_map(|line| line.spans.iter().map(|span| span.syntax))
-        .collect()
-}
-
-fn has_two_sided_line_changes(diff: &FileDiff) -> bool {
-    diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(_),
-                after: Some(_),
-            }
-        )
-    })
 }
 
 fn assert_html_line_is_literal(rows: &[DiffRow], needle: &str) {

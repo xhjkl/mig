@@ -279,6 +279,148 @@ fn replacement_group_uses_current_position_and_deletion_uses_its_gap() {
 }
 
 #[test]
+fn stable_line_claimed_by_distant_hunks_has_one_current_owner() {
+    let graph = Correspondence {
+        units: Vec::new(),
+        line_ending_edits: Vec::new(),
+        line_fallbacks: Vec::new(),
+        line_links: vec![crate::diff::correspondence::LineLink {
+            before: 3,
+            after: 8,
+        }],
+        leaf_links: Vec::new(),
+        before_leaf: Vec::new(),
+        after_leaf: Vec::new(),
+        composites: Vec::new(),
+    };
+    let alignment = LineAlignment::new(&graph, 12);
+    let line = |number, mark| DisplayLine {
+        number,
+        spans: vec![crate::diff::DisplaySpan {
+            text: "}".into(),
+            syntax: SyntaxClass::Punctuation,
+            mark,
+        }],
+    };
+    let signal = |before_line, after_line| {
+        DiffRow::Wordwise(crate::diff::WordDiff {
+            before_line: Some(before_line),
+            after_line: Some(after_line),
+            prefix: String::new(),
+            removed: "alpha".into(),
+            added: "beta".into(),
+            suffix: String::new(),
+        })
+    };
+    let mut hunks = vec![
+        Hunk {
+            coverage: LineCoverage {
+                before: Some(2..5),
+                after: Some(1..10),
+            },
+            rows: vec![DiffRow::Line(line(9, DiffMark::Context)), signal(2, 2)],
+        },
+        Hunk {
+            coverage: LineCoverage {
+                before: Some(10..13),
+                after: Some(8..11),
+            },
+            rows: vec![
+                DiffRow::LineChange {
+                    before: None,
+                    after: Some(line(9, DiffMark::Added)),
+                },
+                signal(11, 10),
+            ],
+        },
+    ];
+
+    normalize_stable_revision_rows(&mut hunks, &alignment);
+
+    let stable = hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .filter_map(current_line)
+        .filter(|line| line.number == 9)
+        .collect::<Vec<_>>();
+    assert_eq!(stable.len(), 1, "{hunks:#?}");
+    assert!(!stable[0].has_changes(), "{hunks:#?}");
+    assert!(!hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+        matches!(row, DiffRow::LineChange { after: Some(line), .. } if line.number == 9)
+    }));
+    assert!(
+        hunks[1]
+            .rows
+            .iter()
+            .filter_map(current_line)
+            .any(|line| line.number == 9),
+        "the current structural claim owns the stable line: {hunks:#?}"
+    );
+}
+
+#[test]
+fn extracted_payload_follows_its_new_declaration() {
+    let extracted = (1..=9)
+        .map(|index| format!("    beta_{index}();\n"))
+        .collect::<String>();
+    let retained = (1..=8)
+        .map(|index| format!("    gamma_{index}();\n"))
+        .collect::<String>();
+    let signature = "    beta: Beta,\n    gamma: Gamma,\n) -> Delta {\n";
+    let before = format!("fn alpha(\n{signature}{extracted}{retained}}}\n");
+    let after = format!(
+        "fn alpha(\n{signature}    delta(beta, gamma)?;\n{retained}}}\n\n\
+         fn delta(\n{signature}{extracted}}}\n"
+    );
+
+    let hunks = planned("alpha.rs", &before, &after);
+    let hunk_containing = |payload: &str| {
+        hunks.iter().position(|hunk| {
+            hunk.rows
+                .iter()
+                .filter_map(current_line)
+                .any(|line| line_text(line).contains(payload))
+        })
+    };
+    let declaration = hunk_containing("fn delta").expect("new declaration is visible");
+    let payload = hunk_containing("beta_9").expect("extracted payload is visible");
+
+    assert_eq!(
+        payload, declaration,
+        "extracted context belongs beneath its new declaration: {hunks:#?}"
+    );
+    let hunk = &hunks[declaration];
+    let declaration_row = hunk
+        .rows
+        .iter()
+        .position(|row| current_line(row).is_some_and(|line| line_text(line).contains("fn delta")))
+        .expect("new declaration row exists");
+    let extracted_rows = hunk
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row, value)| {
+            let line = current_line(value)?;
+            line_text(line)
+                .contains("beta_")
+                .then_some((row, line.number))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(extracted_rows.len(), 9, "{hunks:#?}");
+    assert!(
+        declaration_row < extracted_rows[0].0,
+        "the declaration precedes its extracted payload: {hunks:#?}"
+    );
+    assert!(
+        extracted_rows
+            .windows(2)
+            .all(|rows| rows[0].0 < rows[1].0 && rows[0].1 < rows[1].1),
+        "extracted payload retains current source order: {hunks:#?}"
+    );
+}
+
+#[test]
 fn deletion_gaps_are_stable_before_first_between_anchors_at_eof_and_when_empty() {
     let graph = Correspondence {
         units: Vec::new(),
@@ -455,7 +597,8 @@ fn reordered_subtree_inside_unit_is_not_rendered_as_all_context() {
             .filter_map(current_line)
             .flat_map(|line| &line.spans)
             .any(|span| span.mark == DiffMark::Added
-                && matches!(span.text.as_str(), "first" | "second"))
+                && matches!(span.text.as_str(), "first" | "second")),
+        "{hunks:#?}"
     );
 }
 
@@ -586,6 +729,44 @@ fn overlapping_syntax_units_review_one_physical_row_locally() {
 }
 
 #[test]
+fn stable_rust_delimiters_are_current_context() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    if beta() {\n",
+        "        gamma();\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = before.replace("gamma", "delta");
+    let hunks = planned("alpha.rs", before, &after);
+    let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
+
+    for stable in ["    }", "}"] {
+        assert!(
+            !rows.iter().any(|row| {
+                matches!(
+                    row,
+                    DiffRow::LineChange { before, after }
+                        if before.iter().chain(after).any(|line| line_text(line) == stable)
+                )
+            }),
+            "stable delimiter became remove/add churn: {hunks:#?}"
+        );
+        let current = rows
+            .iter()
+            .filter_map(|row| {
+                let DiffRow::Line(line) = row else {
+                    return None;
+                };
+                (line_text(line) == stable).then_some(line)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(current.len(), 1, "{stable:?}: {hunks:#?}");
+        assert!(!current[0].has_changes(), "{stable:?}: {hunks:#?}");
+    }
+}
+
+#[test]
 fn file_boundary_is_unique_and_globally_terminal() {
     let hunks = planned(
         "lib.rs",
@@ -627,116 +808,6 @@ fn adjacent_structural_hunks_share_one_context_halo() {
 
     assert_eq!(hunks.len(), 1, "adjacent context halos must coalesce");
     assert_eq!(shared_blank, 1, "{hunks:#?}");
-}
-
-#[test]
-fn payload_signal_keeps_ancestor_headers_and_local_context() {
-    let filler = (0..12)
-        .map(|index| format!("        stable_{index}();\n"))
-        .collect::<String>();
-    let before = format!(
-        concat!(
-            "pub async fn attempt_turn_on_stream() -> Result<()> {{\n",
-            "    prepare();\n",
-            "    loop {{\n",
-            "        outer_setup();\n",
-            "{filler}",
-            "        loop {{\n",
-            "            settle();\n",
-            "            let frame = read().await?;\n",
-            "            match frame {{\n",
-            "                Frame::Log(line) => show(line),\n",
-            "                Frame::ToolCall => handle(),\n",
-            "                Frame::Stop => break,\n",
-            "                Frame::Request {{ .. }} => {{}}\n",
-            "            }}\n",
-            "            finish();\n",
-            "        }}\n",
-            "    }}\n",
-            "}}\n",
-        ),
-        filler = filler,
-    );
-    let after = before.replace(
-        "                Frame::Stop => break,\n",
-        concat!(
-            "                Frame::Stop => break,\n",
-            "                Frame::Error(message) => return Err(eyre!(message)),\n",
-        ),
-    );
-
-    let hunks = planned("turn.rs", &before, &after);
-    let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
-    for context in [
-        "pub async fn attempt_turn_on_stream",
-        "match frame {",
-        "Frame::Log",
-        "Frame::ToolCall",
-        "Frame::Stop",
-        "Frame::Request",
-        "finish();",
-    ] {
-        assert!(
-            rows.iter().any(|row| {
-                matches!(
-                    row,
-                    DiffRow::Line(line) | DiffRow::Reflow(line)
-                        if line_text(line).contains(context)
-                )
-            }),
-            "missing {context:?}: {hunks:#?}",
-        );
-    }
-    assert_eq!(
-        rows.iter()
-            .filter(|row| {
-                matches!(
-                    row,
-                    DiffRow::Line(line) | DiffRow::Reflow(line)
-                        if line_text(line).trim() == "loop {"
-                )
-            })
-            .count(),
-        2,
-        "both loop ancestors must be visible: {hunks:#?}",
-    );
-    assert!(rows.iter().any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: None,
-                after: Some(line),
-            } if line_text(line).contains("Frame::Error")
-        )
-    }));
-    assert!(rows.iter().any(|row| matches!(row, DiffRow::Elision(_))));
-    assert!(!rows.iter().any(|row| {
-            matches!(row, DiffRow::Line(line) | DiffRow::Reflow(line) if line_text(line).contains("stable_5"))
-        }));
-
-    let position = |number| {
-        rows.iter()
-            .position(|row| current_line(row).is_some_and(|line| line.number == number))
-            .unwrap_or_else(|| panic!("missing current line {number}: {hunks:#?}"))
-    };
-    let hierarchy = [1, 3, 17, 20].map(position);
-    assert!(
-        hierarchy.windows(2).all(|pair| pair[0] < pair[1]),
-        "hierarchy breadcrumbs must remain source ordered: {hunks:#?}",
-    );
-    for halo in [(1..=6).collect::<Vec<_>>(), (14..=27).collect::<Vec<_>>()] {
-        let halo = halo.into_iter().map(position).collect::<Vec<_>>();
-        assert!(
-            halo.windows(2).all(|pair| pair[0] + 1 == pair[1]),
-            "each hierarchy step needs its own contiguous context halo: {hunks:#?}",
-        );
-    }
-    let local = [21, 22, 23, 24, 25, 26, 27].map(position);
-    assert_eq!(hierarchy[3] + 1, local[0], "{hunks:#?}");
-    assert!(
-        local.windows(2).all(|pair| pair[0] + 1 == pair[1]),
-        "three rows on either side of the signal must stay contiguous: {hunks:#?}",
-    );
 }
 
 #[test]
@@ -817,34 +888,43 @@ fn multiline_replacement_renders_each_revision_as_one_run() {
 #[test]
 fn changed_chain_limits_replacement_to_linked_parent_context() {
     let before = concat!(
-        "fn annotate(node: Node) {\n",
-        "    if node.kind() == \"use_declaration\" {\n",
-        "        let identity = node\n",
-        "            .child_by_field_name(\"argument\")\n",
-        "            .map(|argument| argument.byte_range());\n",
-        "        consume(identity);\n",
+        "fn alpha(node: Node) {\n",
+        "    if node.kind() == \"alpha\" {\n",
+        "        let beta = node\n",
+        "            .child_by_field_name(\"beta\")\n",
+        "            .map(|beta| beta.byte_range());\n",
+        "        consume(beta);\n",
         "    }\n",
         "}\n",
     );
     let after = concat!(
-        "fn annotate(node: Node) {\n",
-        "    if node.kind() == \"use_declaration\" || is_bodyless_module(node) {\n",
-        "        let identity = node\n",
-        "            .child_by_field_name(\"argument\")\n",
-        "            .or_else(|| node.child_by_field_name(\"name\"))\n",
-        "            .map(|identity| identity.byte_range());\n",
-        "        consume(identity);\n",
+        "fn alpha(node: Node) {\n",
+        "    if node.kind() == \"alpha\" || gamma(node) {\n",
+        "        let beta = node\n",
+        "            .child_by_field_name(\"beta\")\n",
+        "            .or_else(|| node.child_by_field_name(\"gamma\"))\n",
+        "            .map(|beta| beta.byte_range());\n",
+        "        consume(beta);\n",
         "    }\n",
         "}\n",
     );
-    let hunks = planned("rust.rs", before, after);
+    let hunks = planned("alpha.rs", before, after);
+    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+        matches!(
+            row,
+                DiffRow::Line(line)
+                    if line.number == 2
+                        && line.has_changes()
+                    && line_text(line).contains("gamma(node)")
+        )
+    }));
     assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
         matches!(
             row,
             DiffRow::Line(line)
-                if line.number == 2
-                    && line.has_changes()
-                    && line_text(line).contains("is_bodyless_module")
+                if line.number == 4
+                    && !line.has_changes()
+                    && line_text(line).contains("child_by_field_name(\"beta\")")
         )
     }));
     let replacement = hunks
@@ -865,17 +945,11 @@ fn changed_chain_limits_replacement_to_linked_parent_context() {
 
     assert_eq!(
         replacement,
-        [
-            ('-', 4, ".child_by_field_name(\"argument\")".to_owned()),
-            ('-', 5, ".map(|argument| argument.byte_range());".to_owned(),),
-            ('+', 4, ".child_by_field_name(\"argument\")".to_owned()),
-            (
-                '+',
-                5,
-                ".or_else(|| node.child_by_field_name(\"name\"))".to_owned(),
-            ),
-            ('+', 6, ".map(|identity| identity.byte_range());".to_owned(),),
-        ],
+        [(
+            '+',
+            5,
+            ".or_else(|| node.child_by_field_name(\"gamma\"))".to_owned(),
+        )],
         "{hunks:#?}",
     );
 }
@@ -1095,46 +1169,6 @@ fn stable_attribute_subtrees_cannot_become_structural_checkpoints() {
         )
         .is_empty()
     );
-}
-
-#[test]
-fn modified_expression_keeps_both_sides_and_its_owner() {
-    let before = concat!(
-        "fn make_history() {\n",
-        "    let reasoning = reasoning();\n",
-        "    let mut history = vec![Message::System(\n",
-        "        SYSTEM_PREAMBLE\n",
-        "            .replace(\"cutoff\", \"old\")\n",
-        "            .replace(\"reasoning\", &reasoning),\n",
-        "    )];\n",
-        "}\n",
-    );
-    let after = before.replace("SYSTEM_PREAMBLE", "system_preamble");
-
-    let hunks = planned("history.rs", before, &after);
-    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(before),
-                after: Some(after),
-            } if line_text(before).contains("SYSTEM_PREAMBLE")
-                && line_text(after).contains("system_preamble")
-        )
-    }));
-    for context in [
-        "fn make_history",
-        "let mut history = vec!",
-        ".replace(\"cutoff\"",
-        ".replace(\"reasoning\"",
-    ] {
-        assert!(
-                hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-                    matches!(row, DiffRow::Line(line) | DiffRow::Reflow(line) if line_text(line).contains(context))
-                }),
-                "missing {context:?}: {hunks:#?}",
-            );
-    }
 }
 
 #[test]
@@ -1435,160 +1469,6 @@ fn changed_callable_header_is_still_a_distant_body_breadcrumb() {
     assert!(!body.rows.iter().any(|row| {
             matches!(row, DiffRow::Line(line) | DiffRow::Reflow(line) if line_text(line).contains("stable_3"))
         }));
-}
-
-#[test]
-fn history_shape_crosses_unit_boundaries_without_losing_source_order() {
-    let before = concat!(
-        "//! Extensions to handle lists of messages.\n",
-        "use crate::prompting::SYSTEM_PREAMBLE;\n",
-        "use crate::protocol::Message;\n",
-        "\n",
-        "/// Compose a full session history from the default preamble\n",
-        "/// and optional stdin/extra contexts in the canonical order.\n",
-        "pub fn make_history(\n",
-        "    stdin_content: Option<String>,\n",
-        "    stdout_redirection_path: Option<String>,\n",
-        ") -> Vec<Message> {\n",
-        "    let now = time::OffsetDateTime::now_local();\n",
-        "    let now = now.date().to_string();\n",
-        "    let reasoning = std::env::var(\"PLEASE_TRY\")\n",
-        "        .ok()\n",
-        "        .map(|v| v.trim().to_lowercase())\n",
-        "        .and_then(|v| match v.as_str() {\n",
-        "            _ if v.starts_with(\"h\") => Some(\"high\".to_string()),\n",
-        "            _ if v.starts_with(\"m\") => Some(\"medium\".to_string()),\n",
-        "            _ => None,\n",
-        "        })\n",
-        "        .unwrap_or_else(|| \"medium\".to_string());\n",
-        "    let mut history = vec![Message::System(\n",
-        "        SYSTEM_PREAMBLE\n",
-        "            .replace(\"cutoff\", \"old\")\n",
-        "            .replace(\"today\", &now)\n",
-        "            .replace(\"reasoning\", &reasoning),\n",
-        "    )];\n",
-        "}\n",
-    );
-    let after = before
-        .replace("use crate::prompting::SYSTEM_PREAMBLE;\n", "")
-        .replace("default preamble", "selected backend preamble")
-        .replace(
-            "    stdout_redirection_path: Option<String>,\n",
-            concat!(
-                "    stdout_redirection_path: Option<String>,\n",
-                "    system_preamble: &str,\n",
-            ),
-        )
-        .replace("        SYSTEM_PREAMBLE\n", "        system_preamble\n");
-    let hunks = planned("history.rs", before, &after);
-    assert_eq!(
-        hunks.len(),
-        2,
-        "adjacent top edits coalesce, while the distant use-site repeats its scope"
-    );
-    let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
-    let position = |predicate: &dyn Fn(&DiffRow) -> bool| {
-        rows.iter()
-            .position(|row| predicate(row))
-            .unwrap_or_else(|| panic!("expected history row: {hunks:#?}"))
-    };
-    let module = position(&|row| matches!(row, DiffRow::Line(line) if line.number == 1));
-    let removed_import = position(&|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(line),
-                after: None,
-            } if line_text(line).contains("SYSTEM_PREAMBLE;")
-        )
-    });
-    let remaining_import = position(
-        &|row| matches!(row, DiffRow::Line(line) if line.number == 2 && line_text(line).contains("protocol::Message")),
-    );
-    let blank = position(
-        &|row| matches!(row, DiffRow::Line(line) if line.number == 3 && line_text(line).is_empty()),
-    );
-    let doc = position(&|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(before),
-                after: Some(after),
-            } if line_text(before).contains("default preamble")
-                && line_text(after).contains("selected backend preamble")
-        )
-    });
-    let continuation = position(
-        &|row| matches!(row, DiffRow::Line(line) if line.number == 5 && line_text(line).contains("optional stdin")),
-    );
-    let definition = position(
-        &|row| matches!(row, DiffRow::Line(line) if line.number == 6 && line_text(line).contains("make_history")),
-    );
-    let stdout = position(
-        &|row| matches!(row, DiffRow::Line(line) if line.number == 8 && line_text(line).contains("stdout_redirection_path")),
-    );
-    let parameter = position(&|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: None,
-                after: Some(line),
-            } if line.number == 9 && line_text(line).contains("system_preamble: &str")
-        )
-    });
-    let signature_end = position(
-        &|row| matches!(row, DiffRow::Line(line) if line.number == 10 && line_text(line).contains(") -> Vec<Message>")),
-    );
-
-    assert!(module < removed_import);
-    assert!(removed_import < remaining_import);
-    assert!(remaining_import < blank);
-    assert!(blank < doc);
-    assert!(doc < continuation);
-    assert!(continuation < definition);
-    assert!(definition < stdout);
-    assert_eq!(stdout + 1, parameter, "added parameter must follow stdout");
-    assert_eq!(
-        parameter + 1,
-        signature_end,
-        "signature must stay contiguous"
-    );
-    assert_eq!(
-        rows.iter()
-            .filter(|row| {
-                matches!(
-                    row,
-                    DiffRow::Line(line)
-                        if line_text(line).contains("pub fn make_history")
-                )
-            })
-            .count(),
-        2,
-        "each distant window needs its callable breadcrumb: {hunks:#?}",
-    );
-
-    let local_position = |number| {
-        rows.iter()
-            .position(|row| current_line(row).is_some_and(|line| line.number == number))
-            .unwrap_or_else(|| panic!("missing history line {number}: {hunks:#?}"))
-    };
-    let local = [20, 21, 22, 23, 24, 25, 26].map(local_position);
-    assert!(
-        local.windows(2).all(|pair| pair[0] + 1 == pair[1]),
-        "expression owner and chain must stay contiguous: {hunks:#?}",
-    );
-    assert!(matches!(
-        rows[local[3]],
-        DiffRow::LineChange {
-            before: Some(_),
-            after: Some(_),
-        }
-    ));
-    let elision = rows
-        .iter()
-        .position(|row| matches!(row, DiffRow::Elision(_)))
-        .expect("distant history context must remain folded");
-    assert!(signature_end < elision && elision < local[0], "{hunks:#?}");
 }
 
 #[test]

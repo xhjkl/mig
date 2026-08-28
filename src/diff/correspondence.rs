@@ -1,5 +1,6 @@
 //! Language-agnostic commonality over neutral before/after projections.
 
+use super::SyntaxClass;
 use super::projection::{
     ContentChannel, Language, LayoutOwnership, NodeId, Projection, ProjectionPair, ReviewMode,
 };
@@ -1564,6 +1565,21 @@ fn reciprocal_confident_matches(
     after_len: usize,
     similarity: impl Fn(usize, usize) -> u64,
 ) -> Vec<OrderedMatch> {
+    reciprocal_unique_matches(
+        before_len,
+        after_len,
+        MIN_CONFIDENT_UNIT_SIMILARITY,
+        similarity,
+    )
+}
+
+/// Retain reciprocal unique-best edges whose evidence clears one strict threshold.
+fn reciprocal_unique_matches(
+    before_len: usize,
+    after_len: usize,
+    minimum_similarity: u64,
+    similarity: impl Fn(usize, usize) -> u64,
+) -> Vec<OrderedMatch> {
     if before_len == 0 || after_len == 0 {
         return Vec::new();
     }
@@ -1594,7 +1610,7 @@ fn reciprocal_confident_matches(
         .enumerate()
         .filter_map(|(before, best)| {
             let (after, similarity) = best?;
-            (similarity > MIN_CONFIDENT_UNIT_SIMILARITY
+            (similarity > minimum_similarity
                 && after_best[after].map(|(candidate, _)| candidate) == Some(before))
             .then(|| OrderedMatch::new(before, after))
         })
@@ -2099,7 +2115,10 @@ struct LeafShape {
 /// Actual same-context composite pairing used to judge parent changes.
 struct ContextLinks {
     before: HashMap<NodeId, NodeId>,
+    after: HashMap<NodeId, NodeId>,
     placement: HashMap<NodeId, Placement>,
+    /// Before-side contexts retained beneath a different matched parent.
+    reparented: HashSet<NodeId>,
 }
 
 /// Parent correspondence inside one matched review unit.
@@ -2126,6 +2145,7 @@ impl UnitContext<'_, '_, '_> {
             return before_node.parent.is_none() && after_node.parent.is_none();
         };
         self.parents.before.get(&before_parent).copied() == Some(after_parent)
+            && !self.parents.reparented.contains(&before_parent)
     }
 
     fn desired_after_parent(&self, before: NodeId) -> Option<ParentSlot> {
@@ -2684,30 +2704,186 @@ fn contextual_links(
 ) -> ContextLinks {
     let mut links = ContextLinks {
         before: HashMap::new(),
+        after: HashMap::new(),
         placement: HashMap::new(),
+        reparented: HashSet::new(),
     };
-    link_context(before_unit, after_unit, unit_placement, &mut links);
+    link_context(before_unit, after_unit, unit_placement, false, &mut links);
     let mut pending = VecDeque::from([(before_unit, after_unit)]);
-    while let Some((before_parent, after_parent)) = pending.pop_front() {
-        let before_children = direct_composites(&pair.before, before_parent);
-        let after_children = direct_composites(&pair.after, after_parent);
-        let pairs = contextual_child_matches(
+    loop {
+        while let Some((before_parent, after_parent)) = pending.pop_front() {
+            let before_children = direct_composites(&pair.before, before_parent);
+            let after_children = direct_composites(&pair.after, after_parent);
+            let pairs = contextual_child_matches(
+                pair,
+                &links,
+                &before_children,
+                &after_children,
+                before_fingerprints,
+                after_fingerprints,
+            );
+            let placements = contextual_match_placements(pair, &before_children, &pairs, &links);
+            let inherited_reparenting = links.reparented.contains(&before_parent);
+            for (edge, placement) in pairs.into_iter().zip(placements) {
+                let before = before_children[edge.before];
+                let after = after_children[edge.after];
+                link_context(before, after, placement, inherited_reparenting, &mut links);
+                pending.push_back((before, after));
+            }
+        }
+
+        let reparented = confident_reparented_context_matches(
             pair,
+            before_unit,
+            after_unit,
             &links,
-            &before_children,
-            &after_children,
             before_fingerprints,
             after_fingerprints,
         );
-        let placements = contextual_match_placements(pair, &before_children, &pairs, &links);
-        for (edge, placement) in pairs.into_iter().zip(placements) {
-            let before = before_children[edge.before];
-            let after = after_children[edge.after];
-            link_context(before, after, placement, &mut links);
+        if reparented.is_empty() {
+            break;
+        }
+        for (before, after, placement) in reparented {
+            link_context(before, after, placement, true, &mut links);
             pending.push_back((before, after));
         }
     }
     links
+}
+
+/// Recover a changed semantic subtree after it moves between otherwise-linked parents.
+///
+/// Same identity and reciprocal exact descendant evidence are both required. The outermost
+/// confident roots win so their children can be aligned inside the recovered context.
+fn confident_reparented_context_matches(
+    pair: &ProjectionPair<'_, '_>,
+    before_unit: NodeId,
+    after_unit: NodeId,
+    links: &ContextLinks,
+    before_fingerprints: &[NodeFingerprints],
+    after_fingerprints: &[NodeFingerprints],
+) -> Vec<(NodeId, NodeId, Placement)> {
+    let before = descendant_composites(&pair.before, before_unit)
+        .into_iter()
+        .filter(|id| {
+            !links.before.contains_key(id)
+                && pair.before.identity_text(*id).is_some()
+                && pair.before.node(*id).decoration_owner.is_none()
+        })
+        .collect::<Vec<_>>();
+    let after = descendant_composites(&pair.after, after_unit)
+        .into_iter()
+        .filter(|id| {
+            !links.after.contains_key(id)
+                && pair.after.identity_text(*id).is_some()
+                && pair.after.node(*id).decoration_owner.is_none()
+        })
+        .collect::<Vec<_>>();
+    let cells = before.len().saturating_mul(after.len());
+    if cells == 0 || cells > MAX_LOCAL_ALIGNMENT_CELLS {
+        return Vec::new();
+    }
+
+    let before_payload = before
+        .iter()
+        .map(|id| meaningful_payload_fingerprints(&pair.before, before_fingerprints, *id))
+        .collect::<Vec<_>>();
+    let after_payload = after
+        .iter()
+        .map(|id| meaningful_payload_fingerprints(&pair.after, after_fingerprints, *id))
+        .collect::<Vec<_>>();
+    let candidates = reciprocal_unique_matches(before.len(), after.len(), 0, |left, right| {
+        let left_node = pair.before.node(before[left]);
+        let right_node = pair.after.node(after[right]);
+        let parents_already_linked = left_node
+            .parent
+            .zip(right_node.parent)
+            .is_some_and(|(left, right)| links.before.get(&left).copied() == Some(right));
+        if left_node.kind != right_node.kind
+            || left_node.field != right_node.field
+            || parents_already_linked
+            || pair.before.identity_text(before[left]) != pair.after.identity_text(after[right])
+        {
+            return 0;
+        }
+        shared_fingerprint_count(&before_payload[left], &after_payload[right])
+    });
+
+    let mut roots: Vec<OrderedMatch> = Vec::new();
+    for candidate in candidates {
+        let nested = roots.iter().any(|root| {
+            node_contains(&pair.before, before[root.before], before[candidate.before])
+                || node_contains(&pair.after, after[root.after], after[candidate.after])
+        });
+        if !nested {
+            roots.push(candidate);
+        }
+    }
+    let placements = match_placements(&roots);
+    roots
+        .into_iter()
+        .zip(placements)
+        .map(|(edge, placement)| (before[edge.before], after[edge.after], placement))
+        .collect()
+}
+
+/// Collect exact non-delimiter payload below an identity-bearing context.
+fn meaningful_payload_fingerprints(
+    projection: &Projection<'_>,
+    fingerprints: &[NodeFingerprints],
+    root: NodeId,
+) -> Vec<FingerprintId> {
+    let identity = projection.identity_text(root);
+    let mut payload = descendant_leaves(projection, root)
+        .into_iter()
+        .filter(|id| {
+            let node = projection.node(*id);
+            let Some(leaf) = node.leaf else {
+                return false;
+            };
+            if leaf.delimiter
+                || matches!(
+                    leaf.channel,
+                    ContentChannel::Comment | ContentChannel::Layout
+                )
+                || !matches!(
+                    leaf.syntax,
+                    SyntaxClass::Plain | SyntaxClass::Literal | SyntaxClass::String
+                )
+            {
+                return false;
+            }
+            let text = projection.leaf_text(*id);
+            text.is_some_and(|text| !text.trim().is_empty() && Some(text) != identity)
+        })
+        .map(|id| fingerprints[id.index()].full)
+        .collect::<Vec<_>>();
+    payload.sort_unstable();
+    payload
+}
+
+fn shared_fingerprint_count(before: &[FingerprintId], after: &[FingerprintId]) -> u64 {
+    let mut before_index = 0;
+    let mut after_index = 0;
+    let mut shared = 0;
+    while before_index < before.len() && after_index < after.len() {
+        match before[before_index].cmp(&after[after_index]) {
+            std::cmp::Ordering::Less => before_index += 1,
+            std::cmp::Ordering::Greater => after_index += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                before_index += 1;
+                after_index += 1;
+            }
+        }
+    }
+    shared
+}
+
+fn node_contains(projection: &Projection<'_>, outer: NodeId, inner: NodeId) -> bool {
+    let outer = &projection.node(outer).bytes;
+    let inner = &projection.node(inner).bytes;
+    outer.start <= inner.start && inner.end <= outer.end
 }
 
 fn contextual_child_matches(
@@ -2720,6 +2896,14 @@ fn contextual_child_matches(
 ) -> Vec<OrderedMatch> {
     let mut before_match = vec![None; before.len()];
     let mut after_match = vec![None; after.len()];
+    let before_reserved = before
+        .iter()
+        .map(|id| context.before.contains_key(id))
+        .collect::<Vec<_>>();
+    let after_reserved = after
+        .iter()
+        .map(|id| context.after.contains_key(id))
+        .collect::<Vec<_>>();
 
     let mut exact_after = HashMap::<ExactContextIdentity<'_>, VecDeque<usize>>::new();
     let mut identity_after = HashMap::<ContextIdentity<'_>, VecDeque<usize>>::new();
@@ -2747,6 +2931,9 @@ fn contextual_child_matches(
     }
 
     for (before_index, before_id) in before.iter().copied().enumerate() {
+        if before_reserved[before_index] || before_match[before_index].is_some() {
+            continue;
+        }
         let Some(identity) = pair.before.identity_text(before_id) else {
             continue;
         };
@@ -2760,10 +2947,11 @@ fn contextual_child_matches(
             context,
             fingerprint: before_fingerprints[before_id.index()].full,
         });
-        let exact = exact.and_then(|positions| pop_unmatched(positions, &after_match));
+        let exact =
+            exact.and_then(|positions| pop_unmatched(positions, &after_match, &after_reserved));
         let after_index = exact.or_else(|| {
             let positions = identity_after.get_mut(&context)?;
-            pop_unmatched(positions, &after_match)
+            pop_unmatched(positions, &after_match, &after_reserved)
         });
         let Some(after_index) = after_index else {
             continue;
@@ -2776,8 +2964,14 @@ fn contextual_child_matches(
         pair,
         before,
         after,
-        &before_match,
-        &after_match,
+        ContextClaims {
+            matched: &before_match,
+            reserved: &before_reserved,
+        },
+        ContextClaims {
+            matched: &after_match,
+            reserved: &after_reserved,
+        },
         before_fingerprints,
         after_fingerprints,
     ) {
@@ -2791,11 +2985,13 @@ fn contextual_child_matches(
         ContextCandidates {
             nodes: before,
             matched: &before_match,
+            reserved: &before_reserved,
             fingerprints: before_fingerprints,
         },
         ContextCandidates {
             nodes: after,
             matched: &after_match,
+            reserved: &after_reserved,
             fingerprints: after_fingerprints,
         },
     ) {
@@ -2806,6 +3002,7 @@ fn contextual_child_matches(
     let remaining_before = (0..before.len())
         .filter(|index| {
             before_match[*index].is_none()
+                && !before_reserved[*index]
                 && pair.before.identity_text(before[*index]).is_none()
                 && pair.before.node(before[*index]).decoration_owner.is_none()
         })
@@ -2813,6 +3010,7 @@ fn contextual_child_matches(
     let remaining_after = (0..after.len())
         .filter(|index| {
             after_match[*index].is_none()
+                && !after_reserved[*index]
                 && pair.after.identity_text(after[*index]).is_none()
                 && pair.after.node(after[*index]).decoration_owner.is_none()
         })
@@ -2842,7 +3040,14 @@ fn contextual_child_matches(
 struct ContextCandidates<'input> {
     nodes: &'input [NodeId],
     matched: &'input [Option<usize>],
+    reserved: &'input [bool],
     fingerprints: &'input [NodeFingerprints],
+}
+
+#[derive(Clone, Copy)]
+struct ContextClaims<'input> {
+    matched: &'input [Option<usize>],
+    reserved: &'input [bool],
 }
 
 /// Decorations are aligned only inside one already-linked semantic owner pair.
@@ -2860,7 +3065,8 @@ fn decoration_matches(
         .chain(before.matched.iter().copied().enumerate().filter_map(
             |(before_index, after_index)| {
                 let after_index = after_index?;
-                Some((before.nodes[before_index], after.nodes[after_index]))
+                let after = after.nodes.get(after_index)?;
+                Some((before.nodes[before_index], *after))
             },
         ))
         .collect::<Vec<_>>();
@@ -2874,6 +3080,7 @@ fn decoration_matches(
             .enumerate()
             .filter(|(index, id)| {
                 before.matched[*index].is_none()
+                    && !before.reserved[*index]
                     && pair.before.node(*id).decoration_owner == Some(before_owner)
             })
             .map(|(index, _)| index)
@@ -2885,6 +3092,7 @@ fn decoration_matches(
             .enumerate()
             .filter(|(index, id)| {
                 after.matched[*index].is_none()
+                    && !after.reserved[*index]
                     && pair.after.node(*id).decoration_owner == Some(after_owner)
             })
             .map(|(index, _)| index)
@@ -2976,21 +3184,23 @@ fn confident_renamed_context_matches(
     pair: &ProjectionPair<'_, '_>,
     before: &[NodeId],
     after: &[NodeId],
-    before_match: &[Option<usize>],
-    after_match: &[Option<usize>],
+    before_claims: ContextClaims<'_>,
+    after_claims: ContextClaims<'_>,
     before_fingerprints: &[NodeFingerprints],
     after_fingerprints: &[NodeFingerprints],
 ) -> Vec<OrderedMatch> {
     let before_candidates = (0..before.len())
         .filter(|index| {
-            before_match[*index].is_none()
+            before_claims.matched[*index].is_none()
+                && !before_claims.reserved[*index]
                 && pair.before.identity_text(before[*index]).is_some()
                 && pair.before.node(before[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let after_candidates = (0..after.len())
         .filter(|index| {
-            after_match[*index].is_none()
+            after_claims.matched[*index].is_none()
+                && !after_claims.reserved[*index]
                 && pair.after.identity_text(after[*index]).is_some()
                 && pair.after.node(after[*index]).decoration_owner.is_none()
         })
@@ -3020,14 +3230,50 @@ fn confident_renamed_context_matches(
     ) {
         return Vec::new();
     }
+    let preferred_descendants = before_candidates
+        .iter()
+        .map(|index| {
+            pair.before
+                .descendants(before[*index])
+                .filter(|candidate| {
+                    let node = pair.before.node(*candidate);
+                    node.leaf.is_none() && pair.before.identity_text(*candidate).is_some()
+                })
+                .filter_map(|candidate| {
+                    let payload = meaningful_payload_fingerprints(
+                        &pair.before,
+                        before_fingerprints,
+                        candidate,
+                    );
+                    (!payload.is_empty()).then_some((candidate, payload))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let after_payload = after_candidates
+        .iter()
+        .map(|index| {
+            meaningful_payload_fingerprints(&pair.after, after_fingerprints, after[*index])
+        })
+        .collect::<Vec<_>>();
 
     reciprocal_confident_matches(
         before_candidates.len(),
         after_candidates.len(),
         |before_index, after_index| {
-            let before_node = pair.before.node(before[before_candidates[before_index]]);
-            let after_node = pair.after.node(after[after_candidates[after_index]]);
+            let before_id = before[before_candidates[before_index]];
+            let after_id = after[after_candidates[after_index]];
+            let before_node = pair.before.node(before_id);
+            let after_node = pair.after.node(after_id);
             if before_node.field != after_node.field {
+                return 0;
+            }
+            if preferred_identity_descendant(
+                pair,
+                &preferred_descendants[before_index],
+                after_id,
+                &after_payload[after_index],
+            ) {
                 return 0;
             }
             unit_similarity(&before_records[before_index], &after_records[after_index])
@@ -3036,6 +3282,33 @@ fn confident_renamed_context_matches(
     .into_iter()
     .map(|edge| OrderedMatch::new(before_candidates[edge.before], after_candidates[edge.after]))
     .collect()
+}
+
+/// Prefer a nested same-identity context over renaming its enclosing wrapper.
+fn preferred_identity_descendant(
+    pair: &ProjectionPair<'_, '_>,
+    before: &[(NodeId, Vec<FingerprintId>)],
+    after: NodeId,
+    after_payload: &[FingerprintId],
+) -> bool {
+    let after_node = pair.after.node(after);
+    let Some(after_identity) = pair.after.identity_text(after) else {
+        return false;
+    };
+    if after_payload.is_empty() {
+        return false;
+    }
+    before.iter().any(|(candidate, before_payload)| {
+        let candidate_node = pair.before.node(*candidate);
+        if candidate_node.leaf.is_some()
+            || candidate_node.kind != after_node.kind
+            || candidate_node.field != after_node.field
+            || pair.before.identity_text(*candidate) != Some(after_identity)
+        {
+            return false;
+        }
+        shared_fingerprint_count(before_payload, after_payload) > 0
+    })
 }
 
 fn context_record<'source>(
@@ -3057,9 +3330,13 @@ fn context_record<'source>(
     }
 }
 
-fn pop_unmatched(positions: &mut VecDeque<usize>, matches: &[Option<usize>]) -> Option<usize> {
+fn pop_unmatched(
+    positions: &mut VecDeque<usize>,
+    matches: &[Option<usize>],
+    reserved: &[bool],
+) -> Option<usize> {
     while let Some(index) = positions.pop_front() {
-        if matches[index].is_none() {
+        if matches[index].is_none() && !reserved[index] {
             return Some(index);
         }
     }
@@ -3131,11 +3408,22 @@ fn contextual_match_placements(
         .collect()
 }
 
-fn link_context(before: NodeId, after: NodeId, placement: Placement, links: &mut ContextLinks) {
+fn link_context(
+    before: NodeId,
+    after: NodeId,
+    placement: Placement,
+    reparented: bool,
+    links: &mut ContextLinks,
+) {
     let previous_after = links.before.insert(before, after);
     debug_assert!(previous_after.is_none());
+    let previous_before = links.after.insert(after, before);
+    debug_assert!(previous_before.is_none());
     let previous_placement = links.placement.insert(before, placement);
     debug_assert!(previous_placement.is_none());
+    if reparented {
+        links.reparented.insert(before);
+    }
 }
 
 fn mark_subtree(projection: &Projection<'_>, root: NodeId, marked: &mut HashSet<NodeId>) {
