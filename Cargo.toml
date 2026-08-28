@@ -28,7 +28,7 @@ required-features = ["fixture-bins"]
 anyhow = "1.0.104"
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
-gix = { version = "0.86.0", default-features = false, features = ["max-performance-safe", "revparse-regex", "sha1", "sha256", "status"] }
+gix = { version = "0.87.1", default-features = false, features = ["max-performance", "revparse-regex", "sha1", "sha256", "status"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 tree-sitter = "0.26.11"
 tree-sitter-css = "0.25.0"
