@@ -17,7 +17,7 @@ worktree, commit, or explicit file pair
        lower to internal neutral syntax trees
                     │
                     ▼
-       correspond trees → form raw hunks
+    correspond trees → form atomic raw hunks
                     │
                     ▼
        refine priority, order, and context
@@ -44,11 +44,14 @@ payloads may cross transparent wrappers at any depth, sealed owners prevent
 tunneling, and owner-local anchors partition line fallback before changes snap
 to source-complete syntax owners.
 
-`tree_diff::RawHunks` carries owned coordinates and atomic before/after
-replacements, including source-located line endings. `refine::RefinedHunks`
-assigns priority and order, then adds breadcrumbs, halos, and elisions; opaque
-phase types prevent premature presentation.
+`tree_diff::RawSourceDiff` couples atomic `SourceHunk`s with the source layout
+needed to place them. Refinement ranks and coalesces those hunks, adds
+breadcrumbs, halos, and elisions, then emits `RefinedHunk`s containing only
+final coverage and semantic changes.
 
 `presentation` alone slices source text into styled, typed rows. The terminal UI
 only lays out, clips, styles, and navigates those rows; tests stop at presentation
 facts and terminal rendering is checked visually.
+
+The executable enters through `run`; acquisition, differencing, presentation,
+and rendering remain private implementation modules.
