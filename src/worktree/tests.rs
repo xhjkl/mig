@@ -110,7 +110,7 @@ fn real_git_scan_covers_the_net_recursive_worktree() {
     }
 
     let diffs = diff_directory(repository.path()).expect("changed scan");
-    let paths = diffs.iter().map(FileReview::path).collect::<Vec<_>>();
+    let paths = diffs.iter().map(ReviewItem::path).collect::<Vec<_>>();
     assert_eq!(
         paths,
         vec![
@@ -126,15 +126,15 @@ fn real_git_scan_covers_the_net_recursive_worktree() {
         ]
     );
     assert!(
-        diffs
-            .iter()
-            .all(|review| { matches!(review, FileReview::Diff(diff) if !diff.hunks.is_empty()) })
+        diffs.iter().all(|review| {
+            matches!(review, ReviewItem::Presented(diff) if !diff.hunks.is_empty())
+        })
     );
     assert!(diffs[..7].iter().all(|review| !review.is_generated()));
-    assert!(diffs[7..].iter().all(FileReview::is_generated));
+    assert!(diffs[7..].iter().all(ReviewItem::is_generated));
 
     let nested = diff_directory(&repository.path().join("nested")).expect("nested scan");
-    let nested_paths = nested.iter().map(FileReview::path).collect::<Vec<_>>();
+    let nested_paths = nested.iter().map(ReviewItem::path).collect::<Vec<_>>();
     assert_eq!(
         nested_paths,
         vec!["nested/staged.rs", "nested/untracked.rs"]
@@ -176,7 +176,7 @@ fn review_compares_pinned_head_directly_to_the_worktree() {
 
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].path(), "current.txt");
-    let FileReview::Diff(diff) = &reviews[0] else {
+    let ReviewItem::Presented(diff) = &reviews[0] else {
         panic!("small text change must remain a diff");
     };
     let rendered = diff
@@ -229,7 +229,7 @@ fn unborn_and_nested_scans_use_standard_git_excludes() {
     write(repository.path(), "root-ignored/child.txt", "ignored\n");
 
     let nested = diff_directory(&repository.path().join("nested")).expect("nested scan");
-    let paths = nested.iter().map(FileReview::path).collect::<Vec<_>>();
+    let paths = nested.iter().map(ReviewItem::path).collect::<Vec<_>>();
     assert_eq!(
         paths,
         vec![
@@ -247,7 +247,7 @@ fn unborn_and_nested_scans_use_standard_git_excludes() {
     write(unborn.path(), "ignored.txt", "ignored\n");
 
     let reviews = diff_directory(unborn.path()).expect("unborn scan");
-    let paths = reviews.iter().map(FileReview::path).collect::<Vec<_>>();
+    let paths = reviews.iter().map(ReviewItem::path).collect::<Vec<_>>();
     assert_eq!(paths, vec![".gitignore", "staged.txt", "untracked.txt"]);
 }
 
@@ -264,7 +264,7 @@ fn oversized_worktree_revision_stays_in_the_review_without_decoding_head() {
     assert_eq!(reviews.len(), 1);
     assert!(matches!(
         &reviews[0],
-        FileReview::Notice(FileNotice::TooLarge {
+        ReviewItem::Notice(FileNotice::TooLarge {
             path,
             before_bytes: Some(1),
             after_bytes: Some(5),
@@ -285,7 +285,7 @@ fn oversized_head_revision_stays_in_the_review_without_reading_either_body() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [FileReview::Notice(FileNotice::TooLarge {
+        [ReviewItem::Notice(FileNotice::TooLarge {
             before_bytes: Some(5),
             after_bytes: Some(1),
             limit_bytes: 4,
@@ -306,7 +306,7 @@ fn deleted_oversized_head_revision_retains_an_absent_current_side() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [FileReview::Notice(FileNotice::TooLarge {
+        [ReviewItem::Notice(FileNotice::TooLarge {
             before_bytes: Some(5),
             after_bytes: None,
             limit_bytes: 4,
@@ -324,7 +324,7 @@ fn added_oversized_revision_retains_an_absent_head_side() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [FileReview::Notice(FileNotice::TooLarge {
+        [ReviewItem::Notice(FileNotice::TooLarge {
             before_bytes: None,
             after_bytes: Some(5),
             limit_bytes: 4,
@@ -345,7 +345,7 @@ fn exact_limit_is_still_diffed() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [FileReview::Diff(diff)] if diff.path == "exact.txt" && !diff.hunks.is_empty()
+        [ReviewItem::Presented(diff)] if diff.path == "exact.txt" && !diff.hunks.is_empty()
     ));
 }
 
@@ -358,7 +358,7 @@ fn rename_is_reviewed_as_one_addition_and_one_deletion() {
     git(repository.path(), &["mv", "old.rs", "new.rs"]);
 
     let reviews = diff_directory(repository.path()).expect("renamed scan");
-    let paths = reviews.iter().map(FileReview::path).collect::<Vec<_>>();
+    let paths = reviews.iter().map(ReviewItem::path).collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["new.rs", "old.rs"]);
 }
@@ -373,7 +373,7 @@ fn sha256_repository_uses_the_same_status_and_object_path() {
     write(repository.path(), "untracked.txt", "new\n");
 
     let reviews = diff_directory(repository.path()).expect("SHA-256 scan");
-    let paths = reviews.iter().map(FileReview::path).collect::<Vec<_>>();
+    let paths = reviews.iter().map(ReviewItem::path).collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["tracked.txt", "untracked.txt"]);
 }

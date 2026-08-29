@@ -1,17 +1,17 @@
-use crate::input::GitBlob;
+use crate::{
+    input::{GitBlob, decode_text},
+    review_source_pair,
+};
 use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use gix::bstr::{BStr, ByteSlice};
 use gix::object::tree::diff::ChangeDetached;
-use mig::diff::diff_file;
-use mig::review::{
-    FileNotice, FileReview, MAX_REVISION_BYTES, MAX_REVISION_LINES, revision_line_count,
-};
+use mig::review::{FileNotice, MAX_REVISION_BYTES, ReviewItem};
 use std::cmp::Ordering;
 use std::path::Path;
 
 /// Reviews introduced by one commit, using its first parent as the baseline.
-pub(crate) fn diff_commit(directory: &Path, commitish: &Path) -> Result<Vec<FileReview>> {
+pub(crate) fn diff_commit(directory: &Path, commitish: &Path) -> Result<Vec<ReviewItem>> {
     diff_commit_with_limit(directory, commitish, MAX_REVISION_BYTES)
 }
 
@@ -19,7 +19,7 @@ fn diff_commit_with_limit(
     directory: &Path,
     commitish: &Path,
     limit: u64,
-) -> Result<Vec<FileReview>> {
+) -> Result<Vec<ReviewItem>> {
     let repo = gix::discover(directory);
     let repo = repo.with_context(|| {
         format!(
@@ -85,7 +85,7 @@ fn diff_commit_with_limit(
         let Some(change) = change else {
             continue;
         };
-        let review = plan_change(&repo, change, limit)?;
+        let review = review_change(&repo, change, limit)?;
         let Some(review) = review else {
             continue;
         };
@@ -190,35 +190,29 @@ fn inspect_blob(
     })
 }
 
-/// Bounded committed pair projected into the same review boundary as worktree input.
-fn plan_change(
+/// Route a bounded committed pair through the same review boundary as worktree input.
+fn review_change(
     repo: &gix::Repository,
     change: ChangedBlobs,
     limit: u64,
-) -> Result<Option<FileReview>> {
+) -> Result<Option<ReviewItem>> {
     let before_bytes = change.before.as_ref().map(|blob| blob.bytes);
     let after_bytes = change.after.as_ref().map(|blob| blob.bytes);
     if before_bytes.is_some_and(|bytes| bytes > limit)
         || after_bytes.is_some_and(|bytes| bytes > limit)
     {
         let notice = FileNotice::too_large(change.path, before_bytes, after_bytes, limit);
-        return Ok(Some(FileReview::Notice(notice)));
+        return Ok(Some(ReviewItem::Notice(notice)));
     }
 
-    let before = match change.before {
-        None => Vec::new(),
-        Some(before) => {
-            let before = read_blob(repo, before, &change.path, "previous");
-            before?
-        }
-    };
-    let after = match change.after {
-        None => Vec::new(),
-        Some(after) => {
-            let after = read_blob(repo, after, &change.path, "current");
-            after?
-        }
-    };
+    let mut before = Vec::new();
+    if let Some(blob) = change.before {
+        before = read_blob(repo, blob, &change.path, "previous")?;
+    }
+    let mut after = Vec::new();
+    if let Some(blob) = change.after {
+        after = read_blob(repo, blob, &change.path, "current")?;
+    }
     let Some(before) = decode_text(before) else {
         return Ok(None);
     };
@@ -229,22 +223,9 @@ fn plan_change(
         return Ok(None);
     }
 
-    let before_lines = before_bytes.map(|_| revision_line_count(&before));
-    let after_lines = after_bytes.map(|_| revision_line_count(&after));
-    if before_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
-        || after_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
-    {
-        let notice =
-            FileNotice::too_many_lines(change.path, before_lines, after_lines, MAX_REVISION_LINES);
-        return Ok(Some(FileReview::Notice(notice)));
-    }
-
-    let diff = diff_file(&change.path, &before, &after)?;
-    if diff.hunks.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(FileReview::from(diff)))
+    let before = before_bytes.map(|_| before.as_str());
+    let after = after_bytes.map(|_| after.as_str());
+    review_source_pair(&change.path, before, after)
 }
 
 /// Blob body whose length must still agree with its previously inspected header.
@@ -262,22 +243,13 @@ fn read_blob(repo: &gix::Repository, revision: GitBlob, path: &str, side: &str) 
     Ok(std::mem::take(&mut blob.data))
 }
 
-/// UTF-8 source without NUL bytes; other blobs are terminal-review binary input.
-fn decode_text(source: Vec<u8>) -> Option<String> {
-    if source.contains(&0) {
-        return None;
-    }
-
-    String::from_utf8(source).ok()
-}
-
 /// UI labels are UTF-8, so an undecodable Git path is outside this review.
 fn decode_git_path(path: &BStr) -> Option<String> {
     path.to_str().ok().map(ToOwned::to_owned)
 }
 
 /// Source paths first, inspected generated files last.
-fn review_order(left: &FileReview, right: &FileReview) -> Ordering {
+fn review_order(left: &ReviewItem, right: &ReviewItem) -> Ordering {
     left.is_generated()
         .cmp(&right.is_generated())
         .then_with(|| left.path().cmp(right.path()))

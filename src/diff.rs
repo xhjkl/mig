@@ -1,15 +1,18 @@
-mod change;
 mod context;
 mod correspondence;
-mod plan;
-mod projection;
-mod render;
+mod presentation;
+mod refine;
 mod source;
+mod syntax;
+mod tree_diff;
 
 use anyhow::{Result, bail};
 use std::ops::Range;
 use std::path::Path;
 
+pub use presentation::{
+    DiffMark, PresentedFile, ReviewHunk, ReviewRow, SourceRow, SourceSpan, WordDiff,
+};
 pub use source::LineEnding;
 
 /// Largest physical-line arena expanded for one revision.
@@ -33,47 +36,6 @@ pub enum SyntaxClass {
     Punctuation,
 }
 
-/// Diff role layered over syntax styling.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiffMark {
-    Context,
-    Removed,
-    Added,
-}
-
-/// Smallest independently styled slice of one displayed source line.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisplaySpan {
-    pub text: String,
-    pub syntax: SyntaxClass,
-    pub mark: DiffMark,
-}
-
-/// Original source line retained inside a bounded diff hunk.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisplayLine {
-    pub number: usize,
-    pub spans: Vec<DisplaySpan>,
-}
-
-impl DisplayLine {
-    /// Whether this line carries an added or removed source span.
-    pub fn has_changes(&self) -> bool {
-        self.spans.iter().any(|span| span.mark != DiffMark::Context)
-    }
-}
-
-/// One low-signal replacement compacted to its shared affixes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WordDiff {
-    pub before_line: Option<usize>,
-    pub after_line: Option<usize>,
-    pub prefix: String,
-    pub removed: String,
-    pub added: String,
-    pub suffix: String,
-}
-
 /// One-based, half-open before/after bounds covered by a review row or hunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineCoverage {
@@ -81,53 +43,11 @@ pub struct LineCoverage {
     pub after: Option<Range<usize>>,
 }
 
-/// Presentation-ready row chosen while planning a bounded diff hunk.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DiffRow {
-    /// Current-world source; span marks distinguish changed payload from context.
-    Line(DisplayLine),
-    /// Current-world source whose payload survived a physical-layout change.
-    Reflow(DisplayLine),
-    /// Paired or one-sided physical-line change.
-    LineChange {
-        before: Option<DisplayLine>,
-        after: Option<DisplayLine>,
-    },
-    LineEnding {
-        before: Option<LineEnding>,
-        after: Option<LineEnding>,
-    },
-    Moved {
-        before: Option<usize>,
-        after: DisplayLine,
-    },
-    Wordwise(WordDiff),
-    Elision(LineCoverage),
-    /// Ordered sentinel that makes the displayed file boundary part of the row stream.
-    FileBoundary,
-}
-
-/// Bounded view into a file containing related, presentation-ready rows.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Hunk {
-    pub coverage: LineCoverage,
-    pub rows: Vec<DiffRow>,
-}
-
-/// Render-ready stream of bounded hunks for one source file.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileDiff {
-    pub path: String,
-    /// Whether either source revision declares itself generated near its header.
-    pub generated: bool,
-    pub hunks: Vec<Hunk>,
-}
-
-/// Project, find language-neutral correspondence, then plan render-ready rows.
-pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
+/// Parse, lower, reconcile, refine, and present one pair of source revisions.
+pub fn diff_file(path: &str, before: &str, after: &str) -> Result<PresentedFile> {
     let generated = has_generated_marker(before) || has_generated_marker(after);
     if before == after {
-        return Ok(FileDiff {
+        return Ok(PresentedFile {
             path: path.to_owned(),
             generated,
             hunks: Vec::new(),
@@ -136,13 +56,15 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<FileDiff> {
     let before_lines = revision_line_count(before);
     let after_lines = revision_line_count(after);
     if before_lines > MAX_REVISION_LINES || after_lines > MAX_REVISION_LINES {
-        bail!("source exceeds the {MAX_REVISION_LINES}-line per-revision projection limit");
+        bail!("source exceeds the {MAX_REVISION_LINES}-line per-revision syntax limit");
     }
 
-    let pair = projection::project_pair(Path::new(path), before, after, generated)?;
-    let correspondence = correspondence::correspond(&pair);
-    let hunks = plan::plan_hunks(&pair, &correspondence);
-    Ok(FileDiff {
+    let syntax = syntax::syntax_pair(Path::new(path), before, after, generated)?;
+    let correspondence = correspondence::correspond(&syntax);
+    let raw_hunks = tree_diff::raw_hunks(&syntax, &correspondence);
+    let refined_hunks = refine::refine_hunks(&syntax, raw_hunks);
+    let hunks = presentation::present_hunks(&syntax.before, &syntax.after, refined_hunks);
+    Ok(PresentedFile {
         path: path.to_owned(),
         generated,
         hunks,

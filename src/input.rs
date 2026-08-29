@@ -75,6 +75,15 @@ pub(crate) enum BoundedBytes {
     TooLarge(u64),
 }
 
+/// Decode terminal-review text while leaving binary content outside the review.
+pub(crate) fn decode_text(source: Vec<u8>) -> Option<String> {
+    if source.contains(&0) {
+        return None;
+    }
+
+    String::from_utf8(source).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

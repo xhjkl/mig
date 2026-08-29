@@ -1,4 +1,4 @@
-use crate::diff::FileDiff;
+use crate::diff::PresentedFile;
 pub use crate::diff::{MAX_REVISION_LINES, revision_line_count};
 
 /// Largest source revision Mig will load and expand into review rows.
@@ -6,15 +6,15 @@ pub const MAX_REVISION_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One path in the review ribbon, whether diffable or deliberately deferred.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FileReview {
-    Diff(FileDiff),
+pub enum ReviewItem {
+    Presented(PresentedFile),
     Notice(FileNotice),
 }
 
-impl FileReview {
+impl ReviewItem {
     pub fn path(&self) -> &str {
         match self {
-            Self::Diff(diff) => &diff.path,
+            Self::Presented(diff) => &diff.path,
             Self::Notice(notice) => notice.path(),
         }
     }
@@ -22,15 +22,15 @@ impl FileReview {
     /// Generated ordering applies only after source was safe to inspect.
     pub fn is_generated(&self) -> bool {
         match self {
-            Self::Diff(diff) => diff.generated,
+            Self::Presented(diff) => diff.generated,
             Self::Notice(_) => false,
         }
     }
 }
 
-impl From<FileDiff> for FileReview {
-    fn from(diff: FileDiff) -> Self {
-        Self::Diff(diff)
+impl From<PresentedFile> for ReviewItem {
+    fn from(diff: PresentedFile) -> Self {
+        Self::Presented(diff)
     }
 }
 

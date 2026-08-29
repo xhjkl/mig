@@ -1,11 +1,11 @@
-use crate::input::{BoundedBytes, GitBlob, OpenFile};
+use crate::{
+    input::{BoundedBytes, GitBlob, OpenFile, decode_text},
+    review_source_pair,
+};
 use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use gix::bstr::{BStr, BString, ByteSlice};
-use mig::diff::diff_file;
-use mig::review::{
-    FileNotice, FileReview, MAX_REVISION_BYTES, MAX_REVISION_LINES, revision_line_count,
-};
+use mig::review::{FileNotice, MAX_REVISION_BYTES, ReviewItem};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,12 +30,12 @@ enum GitChange {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct RibbonBuoyancy(u8);
 
-/// Planned text reviews with dirty files most buoyant and generated files least.
-pub fn diff_directory(directory: &Path) -> Result<Vec<FileReview>> {
+/// Presented text reviews with dirty files most buoyant and generated files least.
+pub fn diff_directory(directory: &Path) -> Result<Vec<ReviewItem>> {
     diff_directory_with_limit(directory, MAX_REVISION_BYTES)
 }
 
-fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileReview>> {
+fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<ReviewItem>> {
     let repo = gix::discover(directory).with_context(|| {
         format!(
             "failed to discover a Git repository from {}",
@@ -85,21 +85,25 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
         // Read the mutable side first so post-stat growth cannot force a HEAD allocation.
         let after = match after {
             None => Vec::new(),
-            Some(after) => match after.read(limit)? {
-                BoundedBytes::Contents(after) => after,
-                BoundedBytes::TooLarge(bytes) => {
-                    reviews.push((
-                        change,
-                        oversized_review(&path, before_bytes, Some(bytes), limit),
-                    ));
-                    continue;
+            Some(after) => {
+                let after = after.read(limit)?;
+                match after {
+                    BoundedBytes::TooLarge(bytes) => {
+                        reviews.push((
+                            change,
+                            oversized_review(&path, before_bytes, Some(bytes), limit),
+                        ));
+                        continue;
+                    }
+                    BoundedBytes::Contents(after) => after,
                 }
-            },
+            }
         };
-        let before = match before {
-            None => Vec::new(),
-            Some(before) => read_head_blob(&repo, before)?,
-        };
+        let mut before_source = Vec::new();
+        if let Some(before) = before {
+            before_source = read_head_blob(&repo, before)?;
+        }
+        let before = before_source;
         let Some(before) = decode_text(before) else {
             continue;
         };
@@ -109,18 +113,14 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
         if before == after {
             continue;
         }
-        let before_lines = before_bytes.map(|_| revision_line_count(&before));
-        let after_lines = after_bytes.map(|_| revision_line_count(&after));
-        if before_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
-            || after_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
-        {
-            reviews.push((change, complexity_review(&path, before_lines, after_lines)));
-            continue;
-        }
-
         let label = path.to_string_lossy();
-        let diff = diff_file(&label, &before, &after)?;
-        reviews.push((change, FileReview::from(diff)));
+        let before = before_bytes.map(|_| before.as_str());
+        let after = after_bytes.map(|_| after.as_str());
+        let review = review_source_pair(&label, before, after)?;
+        let Some(review) = review else {
+            continue;
+        };
+        reviews.push((change, review));
     }
 
     reviews.sort_by(|(left_change, left), (right_change, right)| {
@@ -131,7 +131,7 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<FileRev
     Ok(reviews.into_iter().map(|(_, review)| review).collect())
 }
 
-fn ribbon_buoyancy(change: GitChange, review: &FileReview) -> RibbonBuoyancy {
+fn ribbon_buoyancy(change: GitChange, review: &ReviewItem) -> RibbonBuoyancy {
     if review.is_generated() {
         return RibbonBuoyancy(0);
     }
@@ -149,20 +149,10 @@ fn oversized_review(
     before_bytes: Option<u64>,
     after_bytes: Option<u64>,
     limit: u64,
-) -> FileReview {
+) -> ReviewItem {
     let path = path.to_string_lossy().into_owned();
     let notice = FileNotice::too_large(path, before_bytes, after_bytes, limit);
-    FileReview::Notice(notice)
-}
-
-fn complexity_review(
-    path: &Path,
-    before_lines: Option<usize>,
-    after_lines: Option<usize>,
-) -> FileReview {
-    let path = path.to_string_lossy().into_owned();
-    let notice = FileNotice::too_many_lines(path, before_lines, after_lines, MAX_REVISION_LINES);
-    FileReview::Notice(notice)
+    ReviewItem::Notice(notice)
 }
 
 /// Status candidates from the pinned tree, index, and regular worktree scope.
@@ -313,15 +303,6 @@ fn worktree_revision(root: &Path, path: &Path) -> Result<Revision<OpenFile>> {
 
     let source = OpenFile::open(&full_path)?;
     Ok(Revision::Present(source))
-}
-
-/// UTF-8 source without NUL bytes; other content is outside the terminal text review.
-fn decode_text(source: Vec<u8>) -> Option<String> {
-    if source.contains(&0) {
-        return None;
-    }
-
-    String::from_utf8(source).ok()
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use crate::input::{BoundedBytes, OpenFile};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use mig::review::{
-    FileNotice, FileReview, MAX_REVISION_BYTES, MAX_REVISION_LINES, revision_line_count,
+    FileNotice, MAX_REVISION_BYTES, MAX_REVISION_LINES, ReviewItem, revision_line_count,
 };
 use mig::{diff::diff_file, ui};
 use std::env;
@@ -69,7 +69,7 @@ fn review_commit(commitish: &Path) -> Result<()> {
 
 /// One explicit pair, independent of any surrounding Git worktree.
 fn review_file_pair(before: PathBuf, after: PathBuf, path: Option<PathBuf>) -> Result<()> {
-    let review = plan_file_pair(&before, &after, path.as_deref(), MAX_REVISION_BYTES)?;
+    let review = load_file_pair(&before, &after, path.as_deref(), MAX_REVISION_BYTES)?;
     let Some(review) = review else {
         return Ok(());
     };
@@ -77,12 +77,12 @@ fn review_file_pair(before: PathBuf, after: PathBuf, path: Option<PathBuf>) -> R
     ui::run(vec![review])
 }
 
-fn plan_file_pair(
+fn load_file_pair(
     before: &Path,
     after: &Path,
     path: Option<&Path>,
     limit: u64,
-) -> Result<Option<FileReview>> {
+) -> Result<Option<ReviewItem>> {
     let before_file = OpenFile::open(before)?;
     let after_file = OpenFile::open(after)?;
     let before_bytes = before_file.bytes();
@@ -114,28 +114,39 @@ fn plan_file_pair(
         .with_context(|| format!("file is not UTF-8: {}", before.display()))?;
     let after_source = String::from_utf8(after_source)
         .with_context(|| format!("file is not UTF-8: {}", after.display()))?;
-    let before_lines = revision_line_count(&before_source);
-    let after_lines = revision_line_count(&after_source);
-    if before_lines > MAX_REVISION_LINES || after_lines > MAX_REVISION_LINES {
-        let notice = FileNotice::too_many_lines(
-            path,
-            Some(before_lines),
-            Some(after_lines),
-            MAX_REVISION_LINES,
-        );
-        return Ok(Some(FileReview::Notice(notice)));
+
+    review_source_pair(&path, Some(&before_source), Some(&after_source))
+}
+
+/// Turn acquired UTF-8 revisions into one bounded review item.
+fn review_source_pair(
+    path: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<Option<ReviewItem>> {
+    let before_lines = before.map(revision_line_count);
+    let after_lines = after.map(revision_line_count);
+    if before_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
+        || after_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
+    {
+        let notice =
+            FileNotice::too_many_lines(path, before_lines, after_lines, MAX_REVISION_LINES);
+        return Ok(Some(ReviewItem::Notice(notice)));
     }
-    let diff = diff_file(&path, &before_source, &after_source)?;
+
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    let diff = diff_file(path, before, after)?;
     if diff.hunks.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(FileReview::from(diff)))
+    Ok(Some(ReviewItem::from(diff)))
 }
 
-fn oversized_pair(path: String, before_bytes: u64, after_bytes: u64, limit: u64) -> FileReview {
+fn oversized_pair(path: String, before_bytes: u64, after_bytes: u64, limit: u64) -> ReviewItem {
     let notice = FileNotice::too_large(path, Some(before_bytes), Some(after_bytes), limit);
-    FileReview::Notice(notice)
+    ReviewItem::Notice(notice)
 }
 
 /// Stable UI label for Git difftool pairs whose directories are temporary.
@@ -174,12 +185,9 @@ mod tests {
 
     #[test]
     fn shared_file_names_hide_temporary_directories() {
-        let path = display_pair_path(
-            Path::new("/tmp/mig-before/src/lib.rs"),
-            Path::new("/work/project/src/lib.rs"),
-        );
+        let path = display_pair_path(Path::new("/alpha/beta.rs"), Path::new("/gamma/beta.rs"));
 
-        assert_eq!(path, Path::new("lib.rs"));
+        assert_eq!(path, Path::new("beta.rs"));
     }
 
     #[test]
@@ -197,18 +205,18 @@ mod tests {
         fs::write(&before, [0xff]).expect("write invalid UTF-8 before input");
         fs::write(&after, b"12345").expect("write oversized after input");
 
-        let review = plan_file_pair(&before, &after, Some(Path::new("input.txt")), 4)
-            .expect("plan oversized pair")
+        let review = load_file_pair(&before, &after, Some(Path::new("alpha.txt")), 4)
+            .expect("inspect oversized pair")
             .expect("oversized pair stays visible");
 
         assert!(matches!(
             review,
-            FileReview::Notice(FileNotice::TooLarge {
+            ReviewItem::Notice(FileNotice::TooLarge {
                 path,
                 before_bytes: Some(1),
                 after_bytes: Some(5),
                 limit_bytes: 4,
-            }) if path == "input.txt"
+            }) if path == "alpha.txt"
         ));
     }
 
@@ -220,13 +228,13 @@ mod tests {
         fs::write(&before, b"1234").expect("write before input");
         fs::write(&after, b"5678").expect("write after input");
 
-        let review = plan_file_pair(&before, &after, Some(Path::new("input.txt")), 4)
-            .expect("plan exact-limit pair")
+        let review = load_file_pair(&before, &after, Some(Path::new("alpha.txt")), 4)
+            .expect("diff exact-limit pair")
             .expect("changed pair stays visible");
 
         assert!(matches!(
             review,
-            FileReview::Diff(diff) if diff.path == "input.txt" && !diff.hunks.is_empty()
+            ReviewItem::Presented(diff) if diff.path == "alpha.txt" && !diff.hunks.is_empty()
         ));
     }
 
@@ -239,23 +247,41 @@ mod tests {
         fs::write(&after, "\n".repeat(MAX_REVISION_LINES + 1))
             .expect("write line-dense after input");
 
-        let review = plan_file_pair(
+        let review = load_file_pair(
             &before,
             &after,
-            Some(Path::new("dense.txt")),
+            Some(Path::new("alpha.txt")),
             MAX_REVISION_BYTES,
         )
-        .expect("plan line-dense pair")
+        .expect("inspect line-dense pair")
         .expect("line-dense pair stays visible");
 
         assert!(matches!(
             review,
-            FileReview::Notice(FileNotice::TooManyLines {
+            ReviewItem::Notice(FileNotice::TooManyLines {
                 path,
                 before_lines: Some(1),
                 after_lines: Some(lines),
                 limit_lines: MAX_REVISION_LINES,
-            }) if path == "dense.txt" && lines == MAX_REVISION_LINES + 1
+            }) if path == "alpha.txt" && lines == MAX_REVISION_LINES + 1
+        ));
+    }
+
+    #[test]
+    fn source_pair_notice_preserves_an_absent_revision() {
+        let after = "\n".repeat(MAX_REVISION_LINES + 1);
+
+        let review = review_source_pair("alpha.txt", None, Some(&after))
+            .expect("inspect added source")
+            .expect("line-dense source stays visible");
+
+        assert!(matches!(
+            review,
+            ReviewItem::Notice(FileNotice::TooManyLines {
+                before_lines: None,
+                after_lines: Some(lines),
+                ..
+            }) if lines == MAX_REVISION_LINES + 1
         ));
     }
 }

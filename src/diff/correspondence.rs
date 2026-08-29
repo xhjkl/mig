@@ -1,23 +1,22 @@
-//! Language-agnostic commonality over neutral before/after projections.
+//! Language-agnostic commonality over neutral before/after trees.
 
-use super::SyntaxClass;
-use super::projection::{
-    ContentChannel, CorrespondenceRole, Language, LayoutOwnership, NodeId, Projection,
-    ProjectionPair, ReviewMode, horizontal_layout, node_is_line_isolated,
-};
 use super::source::LineEnding;
+use super::syntax::{
+    ChildSlot, ComparisonStrategy, ContentChannel, Language, LayoutOwnership, LeafRole, NodeId,
+    SiblingMatching, SourceRole, SyntaxKind, SyntaxPair, SyntaxTree, node_owns_complete_lines,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::ops::Range;
 
 const MAX_LOCAL_ALIGNMENT_CELLS: usize = 16_384;
 
-/// Projection-only edit graph; planning consumes it without structural or unit rematching.
+/// SyntaxTree-only edit graph consumed without structural or unit rematching.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Correspondence {
     /// Semantic review units not superseded by an exact local line fallback.
     pub(crate) units: Vec<UnitEdit>,
-    /// Exact physical-line alignment certified inside one matched semantic scope.
+    /// Global non-crossing physical-line alignment certified by semantic-scope gaps.
     pub(crate) line_links: Vec<LineLink>,
     /// Content-paired physical rows whose concrete terminators differ.
     pub(crate) line_ending_edits: Vec<LineLink>,
@@ -128,8 +127,10 @@ pub(crate) enum UnitEdit {
 pub(crate) struct MatchedUnit {
     pub(crate) before: NodeId,
     pub(crate) after: NodeId,
-    /// Symmetric review behavior chosen from both frontend classifications.
-    pub(crate) mode: ReviewMode,
+    /// Symmetric comparison behavior chosen from both frontend classifications.
+    pub(crate) comparison: ComparisonStrategy,
+    /// Symmetric source role chosen from both frontend classifications.
+    pub(crate) role: SourceRole,
     pub(crate) relation: ContentRelation,
     pub(crate) placement: Placement,
     line_links: Range<usize>,
@@ -226,7 +227,7 @@ struct FingerprintId(usize);
 /// Intrinsic node facts; incoming field names live on parent-to-child edges.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct NodeAtom {
-    kind: &'static str,
+    kind: SyntaxKind,
     channel: Option<ContentChannel>,
     named: bool,
     extra: bool,
@@ -236,7 +237,7 @@ struct NodeAtom {
 /// Recursive edge retained inside a collision-free structural fingerprint.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FingerprintChild {
-    field: Option<&'static str>,
+    slot: ChildSlot,
     fingerprint: FingerprintId,
 }
 
@@ -275,14 +276,14 @@ struct NodeFingerprints {
 
 /// Recursive full/payload fingerprints for every arena node.
 fn fingerprints<'source>(
-    projection: &'source Projection<'_>,
+    tree: &'source SyntaxTree<'_>,
     interner: &mut FingerprintInterner<'source>,
 ) -> Vec<NodeFingerprints> {
-    let mut fingerprints = vec![None::<NodeFingerprints>; projection.nodes.len()];
-    for index in (0..projection.nodes.len()).rev() {
+    let mut fingerprints = vec![None::<NodeFingerprints>; tree.nodes.len()];
+    for index in (0..tree.nodes.len()).rev() {
         let id = NodeId::new(index);
-        let node = projection.node(id);
-        let payload = projection.leaf_text(id);
+        let node = tree.node(id);
+        let payload = tree.leaf_text(id);
         let atom = NodeAtom {
             kind: node.kind,
             channel: node.leaf.map(|leaf| leaf.channel),
@@ -293,11 +294,11 @@ fn fingerprints<'source>(
         let full_children = node
             .children
             .iter()
-            .filter(|child| !is_layout_leaf(projection, **child))
+            .filter(|child| !is_layout_leaf(tree, **child))
             .map(|child| FingerprintChild {
-                field: projection.node(*child).field,
+                slot: tree.node(*child).slot,
                 fingerprint: fingerprints[child.index()]
-                    .expect("children follow parents in projection preorder")
+                    .expect("children follow parents in tree preorder")
                     .full,
             })
             .collect();
@@ -309,11 +310,11 @@ fn fingerprints<'source>(
         let shape_children = node
             .children
             .iter()
-            .filter(|child| !is_layout_leaf(projection, **child))
+            .filter(|child| !is_layout_leaf(tree, **child))
             .map(|child| FingerprintChild {
-                field: projection.node(*child).field,
+                slot: tree.node(*child).slot,
                 fingerprint: fingerprints[child.index()]
-                    .expect("children follow parents in projection preorder")
+                    .expect("children follow parents in tree preorder")
                     .shape,
             })
             .collect();
@@ -337,9 +338,9 @@ fn fingerprints<'source>(
                 .iter()
                 .filter_map(|child| {
                     let child_fingerprint: NodeFingerprints = fingerprints[child.index()]
-                        .expect("children follow parents in projection preorder");
+                        .expect("children follow parents in tree preorder");
                     Some(FingerprintChild {
-                        field: projection.node(*child).field,
+                        slot: tree.node(*child).slot,
                         fingerprint: child_fingerprint.payload?,
                     })
                 })
@@ -359,13 +360,12 @@ fn fingerprints<'source>(
 
     fingerprints
         .into_iter()
-        .map(|fingerprint| fingerprint.expect("every projection node was fingerprinted"))
+        .map(|fingerprint| fingerprint.expect("every tree node was fingerprinted"))
         .collect()
 }
 
-fn is_layout_leaf(projection: &Projection<'_>, id: NodeId) -> bool {
-    projection
-        .node(id)
+fn is_layout_leaf(tree: &SyntaxTree<'_>, id: NodeId) -> bool {
+    tree.node(id)
         .leaf
         .is_some_and(|leaf| leaf.channel == ContentChannel::Layout)
 }
@@ -373,23 +373,24 @@ fn is_layout_leaf(projection: &Projection<'_>, id: NodeId) -> bool {
 #[derive(Clone)]
 struct UnitRecord<'source> {
     id: NodeId,
-    kind: &'static str,
+    kind: SyntaxKind,
     identity: Option<&'source str>,
     atomic: bool,
     decoration_owner: Option<NodeId>,
     fingerprint: NodeFingerprints,
     shape: FingerprintId,
-    mode: ReviewMode,
+    comparison: ComparisonStrategy,
+    role: SourceRole,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct UnitKey<'source> {
-    kind: &'static str,
+    kind: SyntaxKind,
     identity: &'source str,
 }
 
-/// Build the complete neutral correspondence graph for one symmetric projection pair.
-pub(crate) fn correspond(pair: &ProjectionPair<'_, '_>) -> Correspondence {
+/// Build the complete neutral correspondence graph for one symmetric tree pair.
+pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
     let mut interner = FingerprintInterner::default();
     let before_fingerprints = fingerprints(&pair.before, &mut interner);
     let after_fingerprints = fingerprints(&pair.after, &mut interner);
@@ -492,7 +493,7 @@ pub(crate) fn correspond(pair: &ProjectionPair<'_, '_>) -> Correspondence {
 }
 
 fn scope_correspondence_is_valid(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     scopes: &[ScopeLink],
     scope_proof: &ScopeProof,
@@ -544,7 +545,7 @@ fn scope_correspondence_is_valid(
 }
 
 fn parent_correspondence_is_valid(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     scope_proof: &ScopeProof,
     before: NodeId,
     after: NodeId,
@@ -559,7 +560,7 @@ fn parent_correspondence_is_valid(
 }
 
 fn scope_edge_is_valid(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     scope_proof: &ScopeProof,
     before: NodeId,
     after: NodeId,
@@ -576,13 +577,13 @@ fn scope_edge_is_valid(
     }
 }
 
-fn enclosing_semantic_scope(projection: &Projection<'_>, node: NodeId) -> Option<NodeId> {
-    nearest_scope_owner(projection, projection.node(node).parent?)
+fn enclosing_semantic_scope(tree: &SyntaxTree<'_>, node: NodeId) -> Option<NodeId> {
+    nearest_scope_owner(tree, tree.node(node).parent?)
 }
 
-/// Exact line-leaf unit edges are the canonical physical-line graph for line projections.
+/// Exact line-leaf unit edges are the canonical physical-line graph for line trees.
 fn line_links_from_unit_matches(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
     before_match: &[Option<usize>],
@@ -618,6 +619,15 @@ struct ScopedLineValue<'source> {
     scopes: Vec<NodeId>,
 }
 
+/// Whether one physical row carries enough payload to anchor without a local syntax owner.
+fn line_can_anchor_without_owner(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && !text
+            .chars()
+            .all(|character| character.is_ascii_punctuation())
+}
+
 /// Canonical semantic-scope witnesses used by every physical-line anchor.
 struct ScopeProof {
     before_lines: Vec<Vec<NodeId>>,
@@ -628,7 +638,7 @@ struct ScopeProof {
 }
 
 impl ScopeProof {
-    fn new(pair: &ProjectionPair<'_, '_>, scopes: &[ScopeLink]) -> Self {
+    fn new(pair: &SyntaxPair<'_, '_>, scopes: &[ScopeLink]) -> Self {
         let mut links = vec![None; pair.before.nodes.len()];
         let mut reverse_links = vec![None; pair.after.nodes.len()];
         let mut before_claimed = vec![false; pair.before.nodes.len()];
@@ -671,7 +681,7 @@ impl ScopeProof {
 
     fn containment_reparenting(
         &self,
-        pair: &ProjectionPair<'_, '_>,
+        pair: &SyntaxPair<'_, '_>,
         before: NodeId,
         after: NodeId,
     ) -> Option<Reparenting> {
@@ -754,17 +764,17 @@ impl ScopeProof {
 }
 
 /// Map every physical row to its nearest semantic owners, including layout-only rows.
-fn scope_lines(projection: &Projection<'_>) -> Vec<Vec<NodeId>> {
-    let mut lines = vec![Vec::new(); projection.source.lines().len()];
-    for (index, node) in projection.nodes.iter().enumerate() {
+fn scope_lines(tree: &SyntaxTree<'_>) -> Vec<Vec<NodeId>> {
+    let mut lines = vec![Vec::new(); tree.source.lines().len()];
+    for (index, node) in tree.nodes.iter().enumerate() {
         if node.leaf.is_none() {
             continue;
         }
         let id = NodeId::new(index);
-        let Some(owner) = nearest_scope_owner(projection, id) else {
+        let Some(owner) = nearest_scope_owner(tree, id) else {
             continue;
         };
-        for line in zero_based_lines(projection, id) {
+        for line in zero_based_lines(tree, id) {
             lines[line].push(owner);
         }
     }
@@ -775,9 +785,9 @@ fn scope_lines(projection: &Projection<'_>) -> Vec<Vec<NodeId>> {
     lines
 }
 
-fn nearest_scope_owner(projection: &Projection<'_>, mut candidate: NodeId) -> Option<NodeId> {
+fn nearest_scope_owner(tree: &SyntaxTree<'_>, mut candidate: NodeId) -> Option<NodeId> {
     loop {
-        let node = projection.node(candidate);
+        let node = tree.node(candidate);
         if node.is_scope_boundary() {
             return Some(candidate);
         }
@@ -786,7 +796,7 @@ fn nearest_scope_owner(projection: &Projection<'_>, mut candidate: NodeId) -> Op
 }
 
 /// Align physical content once while retaining concrete terminator differences as source facts.
-fn physical_line_correspondence(pair: &ProjectionPair<'_, '_>) -> PhysicalLineFacts {
+fn physical_line_correspondence(pair: &SyntaxPair<'_, '_>) -> PhysicalLineFacts {
     physical_line_correspondence_in(
         pair,
         0..pair.before.source.lines().len(),
@@ -796,7 +806,7 @@ fn physical_line_correspondence(pair: &ProjectionPair<'_, '_>) -> PhysicalLineFa
 
 /// Align physical content inside one already-corresponding semantic scope.
 fn physical_line_correspondence_in(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before_bounds: Range<usize>,
     after_bounds: Range<usize>,
 ) -> PhysicalLineFacts {
@@ -890,7 +900,7 @@ fn physical_line_correspondence_in(
 
 /// Separate scoped physical anchors from exact payload recurring in another semantic owner.
 fn scoped_physical_line_correspondence(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     scope_proof: &ScopeProof,
     global: &PhysicalLineFacts,
@@ -907,13 +917,13 @@ fn scoped_physical_line_correspondence(
         .iter()
         .enumerate()
         .filter_map(|(line, source)| {
-            Some((
-                line,
-                ScopedLineValue {
-                    text: pair.before.source.text(source),
-                    scopes: scope_proof.stable_before_line_scopes(line)?,
-                },
-            ))
+            let text = pair.before.source.text(source);
+            let scopes = scope_proof.stable_before_line_scopes(line)?;
+            let has_local_owner = scopes.iter().any(|scope| *scope != pair.after.root);
+            if !has_local_owner && !line_can_anchor_without_owner(text) {
+                return None;
+            }
+            Some((line, ScopedLineValue { text, scopes }))
         })
         .collect::<Vec<_>>();
     let after_candidates = pair
@@ -923,13 +933,13 @@ fn scoped_physical_line_correspondence(
         .iter()
         .enumerate()
         .filter_map(|(line, source)| {
-            Some((
-                line,
-                ScopedLineValue {
-                    text: pair.after.source.text(source),
-                    scopes: scope_proof.stable_after_line_scopes(line)?,
-                },
-            ))
+            let text = pair.after.source.text(source);
+            let scopes = scope_proof.stable_after_line_scopes(line)?;
+            let has_local_owner = scopes.iter().any(|scope| *scope != pair.after.root);
+            if !has_local_owner && !line_can_anchor_without_owner(text) {
+                return None;
+            }
+            Some((line, ScopedLineValue { text, scopes }))
         })
         .collect::<Vec<_>>();
     let before_values = before_candidates
@@ -985,37 +995,71 @@ fn scoped_physical_line_correspondence(
         .enumerate()
         .filter(|(line, _)| !claimed_after.contains(line))
         .collect::<Vec<_>>();
-    let before_text = remaining_before
+
+    // Semantic anchors partition the weaker text-only fallback. Matching each gap
+    // independently prevents a repeated line in one owner from crossing a stronger
+    // owner-local correspondence and rewinding the eventual source edit script.
+    let mut semantic_anchors = scoped
+        .exact
         .iter()
-        .map(|(_, line)| pair.before.source.text(line))
+        .chain(&scoped.ending_edits)
+        .copied()
         .collect::<Vec<_>>();
-    let after_text = remaining_after
+    semantic_anchors.sort_unstable_by_key(|link| (link.before, link.after));
+    let mut before_start = 0;
+    let mut after_start = 0;
+    for anchor in semantic_anchors
         .iter()
-        .map(|(_, line)| pair.after.source.text(line))
-        .collect::<Vec<_>>();
-    for edge in ordered_matches(&before_text, &after_text) {
-        let link = LineLink {
-            before: remaining_before[edge.before].0,
-            after: remaining_after[edge.after].0,
-        };
-        if pair.before.source.lines()[link.before].ending
-            != pair.after.source.lines()[link.after].ending
-        {
-            continue;
-        }
-        if claimed_before.contains(&link.before) || claimed_after.contains(&link.after) {
-            continue;
-        }
-        if semantically_reordered_lines.contains(&link) {
-            continue;
-        }
-        let stable_scope = scope_proof.line_has_scoped_cover(link, true);
-        if stable_scope {
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
+        let before_end = anchor.map_or(pair.before.source.lines().len(), |link| link.before);
+        let after_end = anchor.map_or(pair.after.source.lines().len(), |link| link.after);
+        let before_gap = remaining_before
+            .iter()
+            .filter(|(line, _)| (before_start..before_end).contains(line))
+            .collect::<Vec<_>>();
+        let after_gap = remaining_after
+            .iter()
+            .filter(|(line, _)| (after_start..after_end).contains(line))
+            .collect::<Vec<_>>();
+        let before_text = before_gap
+            .iter()
+            .map(|(_, line)| pair.before.source.text(line))
+            .collect::<Vec<_>>();
+        let after_text = after_gap
+            .iter()
+            .map(|(_, line)| pair.after.source.text(line))
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_text, &after_text) {
+            let link = LineLink {
+                before: before_gap[edge.before].0,
+                after: after_gap[edge.after].0,
+            };
+            if pair.before.source.lines()[link.before].ending
+                != pair.after.source.lines()[link.after].ending
+                || semantically_reordered_lines.contains(&link)
+                || !scope_proof.line_has_scoped_cover(link, true)
+            {
+                continue;
+            }
             claimed_before.insert(link.before);
             claimed_after.insert(link.after);
             scoped.exact.push(link);
         }
+        if let Some(anchor) = anchor {
+            before_start = anchor.before + 1;
+            after_start = anchor.after + 1;
+        }
     }
+
+    let mut accepted = scoped
+        .exact
+        .iter()
+        .chain(&scoped.ending_edits)
+        .copied()
+        .collect::<Vec<_>>();
     for link in &global.ending_edits {
         if claimed_before.contains(&link.before) || claimed_after.contains(&link.after) {
             continue;
@@ -1023,12 +1067,19 @@ fn scoped_physical_line_correspondence(
         if semantically_reordered_lines.contains(link) {
             continue;
         }
-        if scope_proof.line_has_scoped_cover(*link, true) {
-            scoped.ending_edits.push(*link);
+        if !scope_proof.line_has_scoped_cover(*link, true)
+            || !line_link_preserves_order(*link, &accepted)
+        {
+            continue;
         }
+        claimed_before.insert(link.before);
+        claimed_after.insert(link.after);
+        scoped.ending_edits.push(*link);
+        accepted.push(*link);
     }
     sort_and_deduplicate_line_links(&mut scoped.exact);
     sort_and_deduplicate_line_links(&mut scoped.ending_edits);
+    debug_assert!(line_links_are_monotone(&scoped.exact, &scoped.ending_edits));
     scoped.missing_terminators.sort_by_key(|fallback| {
         (
             fallback.before.start,
@@ -1041,9 +1092,24 @@ fn scoped_physical_line_correspondence(
     scoped
 }
 
+fn line_link_preserves_order(candidate: LineLink, accepted: &[LineLink]) -> bool {
+    accepted.iter().all(|anchor| {
+        (anchor.before < candidate.before && anchor.after < candidate.after)
+            || (anchor.before > candidate.before && anchor.after > candidate.after)
+    })
+}
+
+fn line_links_are_monotone(exact: &[LineLink], endings: &[LineLink]) -> bool {
+    let mut links = exact.iter().chain(endings).copied().collect::<Vec<_>>();
+    links.sort_unstable_by_key(|link| (link.before, link.after));
+    links
+        .windows(2)
+        .all(|links| links[0].before < links[1].before && links[0].after < links[1].after)
+}
+
 /// Collect reordered leaf rows whose physical equality cannot erase semantic movement.
 fn semantically_reordered_line_links(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
 ) -> HashSet<LineLink> {
     let mut lines = HashSet::new();
@@ -1066,74 +1132,6 @@ fn semantically_reordered_line_links(
     lines
 }
 
-/// Whether one subtree owns every non-layout token on its first and last rows.
-///
-/// Grammar delimiters such as a trailing comma or semicolon follow the preceding semantic
-/// subtree, so they may extend its physical provenance without becoming correspondence.
-fn node_owns_complete_lines(projection: &Projection<'_>, node: NodeId) -> bool {
-    if node_is_line_isolated(projection, node) {
-        return true;
-    }
-    let node_ref = projection.node(node);
-    let Some(first) = projection.source.line(node_ref.lines.start) else {
-        return false;
-    };
-    let Some(last_number) = node_ref.lines.end.checked_sub(1) else {
-        return false;
-    };
-    let Some(last) = projection.source.line(last_number) else {
-        return false;
-    };
-    if node_ref.bytes.start < first.content_bytes.start
-        || node_ref.bytes.end > last.content_bytes.end
-    {
-        return false;
-    }
-    boundary_is_owned(
-        projection,
-        node,
-        first.content_bytes.start..node_ref.bytes.start,
-    ) && boundary_is_owned(projection, node, node_ref.bytes.end..last.content_bytes.end)
-}
-
-fn boundary_is_owned(projection: &Projection<'_>, owner: NodeId, bytes: Range<usize>) -> bool {
-    let mut cursor = bytes.start;
-    for leaf in projection.leaf_ids_in(bytes.clone()) {
-        let node = projection.node(leaf);
-        let start = node.bytes.start.max(bytes.start);
-        let end = node.bytes.end.min(bytes.end);
-        let Some(gap) = projection.source.slice(cursor..start) else {
-            return false;
-        };
-        if !horizontal_layout(gap) {
-            return false;
-        }
-        if is_layout_leaf(projection, leaf) {
-            let Some(layout) = projection.source.slice(start..end) else {
-                return false;
-            };
-            if !horizontal_layout(layout) {
-                return false;
-            }
-            cursor = end;
-            continue;
-        }
-        if node.bytes.start < bytes.start || node.bytes.end > bytes.end {
-            return false;
-        }
-        let owned_delimiter = node.leaf.is_some_and(|leaf| leaf.delimiter)
-            && trailing_delimiter_owner(projection, leaf) == Some(owner);
-        if !owned_delimiter {
-            return false;
-        }
-        cursor = end;
-    }
-    projection
-        .source
-        .slice(cursor..bytes.end)
-        .is_some_and(horizontal_layout)
-}
-
 fn sort_and_deduplicate_line_links(links: &mut Vec<LineLink>) {
     links.sort_unstable_by_key(|link| (link.before, link.after));
     links.dedup();
@@ -1149,7 +1147,7 @@ struct UnitLineGeometry {
 
 /// Retain syntax everywhere except concrete physical regions it cannot own exactly.
 fn local_line_fallbacks(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     mut fallbacks: Vec<LineFallback>,
 ) -> Vec<LineFallback> {
@@ -1204,7 +1202,7 @@ fn local_line_fallbacks(
 }
 
 fn move_owns_missing_terminator(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     fallback: &LineFallback,
 ) -> bool {
@@ -1234,7 +1232,7 @@ fn range_contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
 
 /// Exact reordered units render their own concrete terminator facts beside the move.
 fn move_owns_line_ending(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     link: LineLink,
 ) -> bool {
@@ -1250,7 +1248,7 @@ fn move_owns_line_ending(
 }
 
 fn unit_line_geometry(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     edit: &UnitEdit,
 ) -> UnitLineGeometry {
@@ -1295,7 +1293,7 @@ fn unit_lines_are_physically_paired(graph: &Correspondence, unit: &UnitLineGeome
 }
 
 /// Stable semantic rows may bypass global monotone alignment only when their full source agrees.
-fn unit_lines_are_source_equal(pair: &ProjectionPair<'_, '_>, unit: &UnitLineGeometry) -> bool {
+fn unit_lines_are_source_equal(pair: &SyntaxPair<'_, '_>, unit: &UnitLineGeometry) -> bool {
     unit.before.len() == unit.after.len()
         && unit
             .before
@@ -1308,16 +1306,10 @@ fn unit_lines_are_source_equal(pair: &ProjectionPair<'_, '_>, unit: &UnitLineGeo
             })
 }
 
-fn zero_based_lines(projection: &Projection<'_>, node: NodeId) -> Range<usize> {
-    let lines = projection.node(node).lines.clone();
-    let start = lines
-        .start
-        .saturating_sub(1)
-        .min(projection.source.lines().len());
-    let end = lines
-        .end
-        .saturating_sub(1)
-        .min(projection.source.lines().len());
+fn zero_based_lines(tree: &SyntaxTree<'_>, node: NodeId) -> Range<usize> {
+    let lines = tree.node(node).lines.clone();
+    let start = lines.start.saturating_sub(1).min(tree.source.lines().len());
+    let end = lines.end.saturating_sub(1).min(tree.source.lines().len());
     start.min(end)..end
 }
 
@@ -1329,7 +1321,7 @@ fn increment_claims(claims: &mut [u16], lines: Range<usize>) {
 
 /// Equal blank separators may travel with their matched owner without becoming edit signal.
 fn claim_paired_adjacent_layout(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     graph: &Correspondence,
     before_claims: &mut [u16],
     after_claims: &mut [u16],
@@ -1398,12 +1390,12 @@ fn claim_paired_adjacent_layout(
     }
 }
 
-fn adjacent_blank_lines(projection: &Projection<'_>, boundary: usize, before: bool) -> Vec<usize> {
+fn adjacent_blank_lines(tree: &SyntaxTree<'_>, boundary: usize, before: bool) -> Vec<usize> {
     let mut lines = Vec::new();
     if before {
         let mut index = boundary;
         while let Some(previous) = index.checked_sub(1) {
-            if !source_line_is_blank(projection, previous) {
+            if !source_line_is_blank(tree, previous) {
                 break;
             }
             lines.push(previous);
@@ -1414,24 +1406,23 @@ fn adjacent_blank_lines(projection: &Projection<'_>, boundary: usize, before: bo
     }
 
     let mut index = boundary;
-    while source_line_is_blank(projection, index) {
+    while source_line_is_blank(tree, index) {
         lines.push(index);
         index += 1;
     }
     lines
 }
 
-fn source_line_is_blank(projection: &Projection<'_>, index: usize) -> bool {
-    projection
-        .source
+fn source_line_is_blank(tree: &SyntaxTree<'_>, index: usize) -> bool {
+    tree.source
         .lines()
         .get(index)
-        .is_some_and(|line| projection.source.text(line).trim().is_empty())
+        .is_some_and(|line| tree.source.text(line).trim().is_empty())
 }
 
 fn claim_equal_layout_run(
-    before: &Projection<'_>,
-    after: &Projection<'_>,
+    before: &SyntaxTree<'_>,
+    after: &SyntaxTree<'_>,
     before_lines: &[usize],
     after_lines: &[usize],
     before_claims: &mut [u16],
@@ -1549,7 +1540,7 @@ fn empty_counterpart(
 }
 
 fn conflicting_unit_fallbacks(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     units: &[UnitLineGeometry],
 ) -> Vec<LineFallback> {
     let mut before_owner = vec![None; pair.before.source.lines().len()];
@@ -1744,11 +1735,10 @@ fn range_union(left: &Range<usize>, right: &Range<usize>) -> Range<usize> {
 }
 
 fn unit_records<'source>(
-    projection: &Projection<'source>,
+    tree: &SyntaxTree<'source>,
     fingerprints: &[NodeFingerprints],
 ) -> Vec<UnitRecord<'source>> {
-    projection
-        .review_units()
+    tree.review_units()
         .map(|(id, node)| {
             let fingerprint = fingerprints[id.index()];
             UnitRecord {
@@ -1759,17 +1749,22 @@ fn unit_records<'source>(
                 identity: node
                     .leaf
                     .is_none()
-                    .then(|| projection.identity_text(id))
+                    .then(|| tree.identity_text(id))
                     .flatten(),
                 atomic: node.leaf.is_some(),
                 decoration_owner: node.decoration_owner,
                 fingerprint,
                 shape: fingerprint.shape,
-                mode: node
+                comparison: node
                     .review
                     .as_ref()
                     .expect("review node owns review metadata")
-                    .mode,
+                    .comparison,
+                role: node
+                    .review
+                    .as_ref()
+                    .expect("review node owns review metadata")
+                    .role,
             }
         })
         .collect()
@@ -2027,7 +2022,7 @@ fn pair_atomic_units(
     }
 }
 
-/// Align unclaimed review units by local kind and mode inside established anchor gaps.
+/// Align unclaimed review units by local kind and comparison inside established anchor gaps.
 fn pair_compatible_units(
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
@@ -2079,11 +2074,11 @@ fn compatible_unit_matches(
 ) -> Vec<OrderedMatch> {
     let before_values = before_indices
         .iter()
-        .map(|index| (before[*index].kind, before[*index].mode))
+        .map(|index| (before[*index].kind, before[*index].comparison))
         .collect::<Vec<_>>();
     let after_values = after_indices
         .iter()
-        .map(|index| (after[*index].kind, after[*index].mode))
+        .map(|index| (after[*index].kind, after[*index].comparison))
         .collect::<Vec<_>>();
     ordered_matches(&before_values, &after_values)
 }
@@ -2176,8 +2171,12 @@ fn stable_unit_matches(
             if before[before_index].decoration_owner.is_some() {
                 return None;
             }
-            let mode = ReviewMode::reconcile(before[before_index].mode, after[after_index].mode);
-            mode.tracks_movement()
+            let comparison = ComparisonStrategy::reconcile(
+                before[before_index].comparison,
+                after[after_index].comparison,
+            );
+            comparison
+                .tracks_movement()
                 .then_some((before_index, after_index))
         })
         .collect::<Vec<_>>();
@@ -2196,8 +2195,11 @@ fn stable_unit_matches(
         let Some(after_index) = *after_index else {
             continue;
         };
-        let mode = ReviewMode::reconcile(before[before_index].mode, after[after_index].mode);
-        if !mode.tracks_movement() {
+        let comparison = ComparisonStrategy::reconcile(
+            before[before_index].comparison,
+            after[after_index].comparison,
+        );
+        if !comparison.tracks_movement() {
             stable[before_index] = true;
         }
     }
@@ -2293,9 +2295,9 @@ fn ordered_script_anchors(
     anchors
 }
 
-/// Stateful graph assembly keeps mutation local while projection facts stay immutable.
+/// Stateful graph assembly keeps mutation local while tree facts stay immutable.
 struct CorrespondenceBuilder<'input, 'before, 'after> {
-    pair: &'input ProjectionPair<'before, 'after>,
+    pair: &'input SyntaxPair<'before, 'after>,
     before_units: &'input [UnitRecord<'before>],
     after_units: &'input [UnitRecord<'after>],
     before_match: &'input [Option<usize>],
@@ -2382,13 +2384,13 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             .before
             .source
             .slice(before_node.bytes.clone())
-            .expect("projection node source geometry remains valid");
+            .expect("tree node source geometry remains valid");
         let after_source = self
             .pair
             .after
             .source
             .slice(after_node.bytes.clone())
-            .expect("projection node source geometry remains valid");
+            .expect("tree node source geometry remains valid");
         let relation = if before_source == after_source {
             ContentRelation::SourceEqual
         } else if before_fingerprint.full == after_fingerprint.full {
@@ -2406,9 +2408,13 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         let leaf_start = self.graph.leaf_links.len();
         let composite_start = self.graph.composites.len();
         self.link_unit_contents(before, after, placement);
-        let mode = ReviewMode::reconcile(
-            self.before_units[before_index].mode,
-            self.after_units[after_index].mode,
+        let comparison = ComparisonStrategy::reconcile(
+            self.before_units[before_index].comparison,
+            self.after_units[after_index].comparison,
+        );
+        let role = SourceRole::reconcile(
+            self.before_units[before_index].role,
+            self.after_units[after_index].role,
         );
         let line_start = self.graph.unit_line_links.len();
         if placement == Placement::Reordered && relation.full_equal() {
@@ -2426,7 +2432,8 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         edits.push(UnitEdit::Matched(MatchedUnit {
             before,
             after,
-            mode,
+            comparison,
+            role,
             relation,
             placement,
             line_links: line_start..self.graph.unit_line_links.len(),
@@ -2438,7 +2445,7 @@ impl CorrespondenceBuilder<'_, '_, '_> {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct ExactLeafKey {
-    field: Option<&'static str>,
+    slot: ChildSlot,
     fingerprint: FingerprintId,
 }
 
@@ -2480,8 +2487,8 @@ struct ContextualLeafKey {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct LeafShape {
-    kind: &'static str,
-    field: Option<&'static str>,
+    kind: SyntaxKind,
+    slot: ChildSlot,
     channel: ContentChannel,
     named: bool,
     extra: bool,
@@ -2499,7 +2506,7 @@ struct ContextLinks {
 
 /// Parent correspondence inside one matched review unit.
 struct UnitContext<'input, 'before, 'after> {
-    pair: &'input ProjectionPair<'before, 'after>,
+    pair: &'input SyntaxPair<'before, 'after>,
     parents: &'input ContextLinks,
     before_unit: NodeId,
     after_unit: NodeId,
@@ -2509,7 +2516,7 @@ impl UnitContext<'_, '_, '_> {
     fn parents_are_linked(&self, before: NodeId, after: NodeId) -> bool {
         let before_node = self.pair.before.node(before);
         let after_node = self.pair.after.node(after);
-        if before_node.field != after_node.field {
+        if before_node.slot != after_node.slot {
             return false;
         }
         if before == self.before_unit && after == self.after_unit {
@@ -2547,7 +2554,7 @@ impl UnitContext<'_, '_, '_> {
         before: NodeId,
         leaf_keys: &HashMap<NodeId, ExactLeafKey>,
     ) -> DelimiterOwnerKey {
-        let Some(owner) = trailing_delimiter_owner(&self.pair.before, before) else {
+        let Some(owner) = self.pair.before.delimiter_owner(before) else {
             return DelimiterOwnerKey::Absent;
         };
         if self.pair.before.node(owner).leaf.is_some() {
@@ -2570,7 +2577,7 @@ impl UnitContext<'_, '_, '_> {
         after: NodeId,
         leaf_keys: &HashMap<NodeId, ExactLeafKey>,
     ) -> DelimiterOwnerKey {
-        let Some(owner) = trailing_delimiter_owner(&self.pair.after, after) else {
+        let Some(owner) = self.pair.after.delimiter_owner(after) else {
             return DelimiterOwnerKey::Absent;
         };
         if self.pair.after.node(owner).leaf.is_some() {
@@ -2631,14 +2638,14 @@ impl UnitContext<'_, '_, '_> {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct ContextShape {
-    kind: &'static str,
-    field: Option<&'static str>,
+    kind: SyntaxKind,
+    slot: ChildSlot,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct ContextIdentity<'source> {
-    kind: &'static str,
-    field: Option<&'static str>,
+    kind: SyntaxKind,
+    slot: ChildSlot,
     identity: &'source str,
 }
 
@@ -2838,14 +2845,14 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         let before_exact = before_leaves
             .iter()
             .map(|id| ExactLeafKey {
-                field: pair.before.node(*id).field,
+                slot: pair.before.node(*id).slot,
                 fingerprint: self.before_fingerprints[id.index()].full,
             })
             .collect::<Vec<_>>();
         let after_exact = after_leaves
             .iter()
             .map(|id| ExactLeafKey {
-                field: pair.after.node(*id).field,
+                slot: pair.after.node(*id).slot,
                 fingerprint: self.after_fingerprints[id.index()].full,
             })
             .collect::<Vec<_>>();
@@ -3018,52 +3025,6 @@ fn exact_composite_matches(
         after_match[after_index] = Some(before_index);
     }
 
-    let wrapped_before = (0..before.len())
-        .filter(|index| {
-            before_match[*index].is_none()
-                && context
-                    .pair
-                    .before
-                    .node(before[*index])
-                    .decoration_owner
-                    .is_none()
-        })
-        .collect::<Vec<_>>();
-    let wrapped_after = (0..after.len())
-        .filter(|index| {
-            after_match[*index].is_none()
-                && context
-                    .pair
-                    .after
-                    .node(after[*index])
-                    .decoration_owner
-                    .is_none()
-        })
-        .collect::<Vec<_>>();
-    for edge in reciprocal_unique_matches(
-        wrapped_before.len(),
-        wrapped_after.len(),
-        0,
-        |left, right| {
-            let before = before[wrapped_before[left]];
-            let after = after[wrapped_after[right]];
-            let before_node = context.pair.before.node(before);
-            let after_node = context.pair.after.node(after);
-            u64::from(
-                before_node.kind == after_node.kind
-                    && before_fingerprints[before.index()].full
-                        == after_fingerprints[after.index()].full
-                    && unique_containment_reparenting(context.pair, context.parents, before, after)
-                        .is_some(),
-            )
-        },
-    ) {
-        let before_index = wrapped_before[edge.before];
-        let after_index = wrapped_after[edge.after];
-        before_match[before_index] = Some(after_index);
-        after_match[after_index] = Some(before_index);
-    }
-
     before_match
         .into_iter()
         .enumerate()
@@ -3163,28 +3124,40 @@ fn exact_leaf_matches(
                     .is_none()
         })
         .collect::<Vec<_>>();
-    for edge in reciprocal_unique_matches(
-        wrapped_before.len(),
-        wrapped_after.len(),
-        0,
-        |left, right| {
-            let before_index = wrapped_before[left];
-            let after_index = wrapped_after[right];
-            let exact =
-                before.keys[before_index].fingerprint == after.keys[after_index].fingerprint;
-            let reparenting = unique_containment_reparenting(
-                context.pair,
-                context.parents,
-                before.nodes[before_index],
-                after.nodes[after_index],
-            );
-            u64::from(exact && reparenting.is_some())
-        },
-    ) {
-        let before_index = wrapped_before[edge.before];
-        let after_index = wrapped_after[edge.after];
-        before_match[before_index] = Some(after_index);
-        after_match[after_index] = Some(before_index);
+    let mut wrapped_before_groups = HashMap::<FingerprintId, Vec<usize>>::new();
+    for before_index in wrapped_before {
+        wrapped_before_groups
+            .entry(before.keys[before_index].fingerprint)
+            .or_default()
+            .push(before_index);
+    }
+    let mut wrapped_after_groups = HashMap::<FingerprintId, Vec<usize>>::new();
+    for after_index in wrapped_after {
+        wrapped_after_groups
+            .entry(after.keys[after_index].fingerprint)
+            .or_default()
+            .push(after_index);
+    }
+    for (fingerprint, before_group) in wrapped_before_groups {
+        let Some(after_group) = wrapped_after_groups.get(&fingerprint) else {
+            continue;
+        };
+        for edge in
+            reciprocal_unique_matches(before_group.len(), after_group.len(), 0, |left, right| {
+                let reparenting = unique_containment_reparenting(
+                    context.pair,
+                    context.parents,
+                    before.nodes[before_group[left]],
+                    after.nodes[after_group[right]],
+                );
+                u64::from(reparenting.is_some())
+            })
+        {
+            let before_index = before_group[edge.before];
+            let after_index = after_group[edge.after];
+            before_match[before_index] = Some(after_index);
+            after_match[after_index] = Some(before_index);
+        }
     }
 
     let remaining_before = (0..before.nodes.len())
@@ -3284,29 +3257,27 @@ fn decorated_leaf_matches(
         .collect()
 }
 
-fn descendant_composites(projection: &Projection<'_>, root: NodeId) -> Vec<NodeId> {
-    projection
-        .descendants(root)
+fn descendant_composites(tree: &SyntaxTree<'_>, root: NodeId) -> Vec<NodeId> {
+    tree.descendants(root)
         .filter(|id| {
-            let node = projection.node(*id);
+            let node = tree.node(*id);
             node.named && node.leaf.is_none()
         })
         .collect()
 }
 
-fn descendant_leaves(projection: &Projection<'_>, root: NodeId) -> Vec<NodeId> {
-    let root_node = projection.node(root);
-    if root_node.leaf.is_some() && !is_layout_leaf(projection, root) {
+fn descendant_leaves(tree: &SyntaxTree<'_>, root: NodeId) -> Vec<NodeId> {
+    let root_node = tree.node(root);
+    if root_node.leaf.is_some() && !is_layout_leaf(tree, root) {
         return vec![root];
     }
-    projection
-        .descendants(root)
-        .filter(|id| projection.node(*id).leaf.is_some() && !is_layout_leaf(projection, *id))
+    tree.descendants(root)
+        .filter(|id| tree.node(*id).leaf.is_some() && !is_layout_leaf(tree, *id))
         .collect()
 }
 
 fn contextual_links(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before_unit: NodeId,
     after_unit: NodeId,
     unit_placement: Placement,
@@ -3386,15 +3357,85 @@ fn contextual_links(
             break;
         }
     }
+    retain_valid_context_links(pair, before_unit, after_unit, &mut links);
     links
 }
 
-/// Recover a changed semantic subtree along a uniquely certified containment spine.
+/// Retain only context claims certified by the final owner graph and rebuild their provenance.
+fn retain_valid_context_links(
+    pair: &SyntaxPair<'_, '_>,
+    before_unit: NodeId,
+    after_unit: NodeId,
+    links: &mut ContextLinks,
+) {
+    loop {
+        let context = UnitContext {
+            pair,
+            parents: links,
+            before_unit,
+            after_unit,
+        };
+        let invalid = links
+            .before
+            .iter()
+            .filter_map(|(before, after)| {
+                (!context.parents_are_linked(*before, *after)
+                    && unique_containment_reparenting(pair, links, *before, *after).is_none())
+                .then_some((*before, *after))
+            })
+            .collect::<Vec<_>>();
+        if invalid.is_empty() {
+            break;
+        }
+        for (before, after) in invalid {
+            links.before.remove(&before);
+            links.after.remove(&after);
+            links.placement.remove(&before);
+            links.reparenting.remove(&before);
+        }
+    }
+
+    let mut retained = links
+        .before
+        .iter()
+        .map(|(before, after)| (*before, *after))
+        .collect::<Vec<_>>();
+    retained.sort_unstable_by_key(|(before, _)| *before);
+    links.reparenting.clear();
+    // Rebuilding in preorder; descendants inherit only a surviving parent's fresh proof.
+    for (before, after) in retained {
+        let context = UnitContext {
+            pair,
+            parents: links,
+            before_unit,
+            after_unit,
+        };
+        let reparenting = if context.parents_are_linked(before, after) {
+            pair.before
+                .node(before)
+                .parent
+                .and_then(|parent| links.reparenting.get(&parent).copied())
+        } else {
+            unique_containment_reparenting(pair, links, before, after)
+        };
+        if let Some(reparenting) = reparenting {
+            links.reparenting.insert(before, reparenting);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum ReparentedContextKey<'source> {
+    Identified(SyntaxKind, &'source str),
+    Exact(SyntaxKind, FingerprintId),
+}
+
+/// Recover a changed or exact anonymous subtree along a uniquely certified containment spine.
 ///
-/// Same identity and reciprocal exact descendant evidence are both required. The outermost
-/// confident roots win so their children can be aligned inside the recovered context.
+/// The outermost confident roots win so their children can be aligned inside the recovered
+/// context.
 fn confident_reparented_context_matches(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before_unit: NodeId,
     after_unit: NodeId,
     links: &ContextLinks,
@@ -3404,17 +3445,13 @@ fn confident_reparented_context_matches(
     let before = descendant_composites(&pair.before, before_unit)
         .into_iter()
         .filter(|id| {
-            !links.before.contains_key(id)
-                && pair.before.identity_text(*id).is_some()
-                && pair.before.node(*id).decoration_owner.is_none()
+            !links.before.contains_key(id) && pair.before.node(*id).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let after = descendant_composites(&pair.after, after_unit)
         .into_iter()
         .filter(|id| {
-            !links.after.contains_key(id)
-                && pair.after.identity_text(*id).is_some()
-                && pair.after.node(*id).decoration_owner.is_none()
+            !links.after.contains_key(id) && pair.after.node(*id).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     if before.is_empty() || after.is_empty() {
@@ -3423,35 +3460,37 @@ fn confident_reparented_context_matches(
 
     let before_payload = before
         .iter()
-        .map(|id| meaningful_payload_fingerprints(&pair.before, before_fingerprints, *id))
+        .map(|id| {
+            pair.before.identity_text(*id).map_or_else(Vec::new, |_| {
+                meaningful_payload_fingerprints(&pair.before, before_fingerprints, *id)
+            })
+        })
         .collect::<Vec<_>>();
     let after_payload = after
         .iter()
-        .map(|id| meaningful_payload_fingerprints(&pair.after, after_fingerprints, *id))
+        .map(|id| {
+            pair.after.identity_text(*id).map_or_else(Vec::new, |_| {
+                meaningful_payload_fingerprints(&pair.after, after_fingerprints, *id)
+            })
+        })
         .collect::<Vec<_>>();
-    let mut before_groups = HashMap::<(&str, &str), Vec<usize>>::new();
+    let mut before_groups = HashMap::<ReparentedContextKey<'_>, Vec<usize>>::new();
     for (index, id) in before.iter().copied().enumerate() {
-        before_groups
-            .entry((
-                pair.before.node(id).kind,
-                pair.before
-                    .identity_text(id)
-                    .expect("reparenting candidates carry an identity"),
-            ))
-            .or_default()
-            .push(index);
+        let node = pair.before.node(id);
+        let key = pair.before.identity_text(id).map_or_else(
+            || ReparentedContextKey::Exact(node.kind, before_fingerprints[id.index()].full),
+            |identity| ReparentedContextKey::Identified(node.kind, identity),
+        );
+        before_groups.entry(key).or_default().push(index);
     }
-    let mut after_groups = HashMap::<(&str, &str), Vec<usize>>::new();
+    let mut after_groups = HashMap::<ReparentedContextKey<'_>, Vec<usize>>::new();
     for (index, id) in after.iter().copied().enumerate() {
-        after_groups
-            .entry((
-                pair.after.node(id).kind,
-                pair.after
-                    .identity_text(id)
-                    .expect("reparenting candidates carry an identity"),
-            ))
-            .or_default()
-            .push(index);
+        let node = pair.after.node(id);
+        let key = pair.after.identity_text(id).map_or_else(
+            || ReparentedContextKey::Exact(node.kind, after_fingerprints[id.index()].full),
+            |identity| ReparentedContextKey::Identified(node.kind, identity),
+        );
+        after_groups.entry(key).or_default().push(index);
     }
     let mut candidates = Vec::new();
     for (key, before_group) in before_groups {
@@ -3515,7 +3554,7 @@ fn confident_reparented_context_matches(
 }
 
 fn unique_containment_reparenting(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     links: &ContextLinks,
     before: NodeId,
     after: NodeId,
@@ -3536,7 +3575,7 @@ fn unique_containment_reparenting(
 /// Exactly one revision must contribute the unmatched spine: replacing one wrapper hierarchy
 /// with another remains an ordinary structural edit rather than a one-sided wrap or unwrap.
 fn unique_containment_reparenting_with(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before: NodeId,
     after: NodeId,
     before_link: impl Fn(NodeId) -> Option<NodeId>,
@@ -3562,13 +3601,13 @@ fn unique_containment_reparenting_with(
 
 /// Climb to one designated owner through a single correspondence-bearing child branch.
 fn unique_containment_path(
-    projection: &Projection<'_>,
+    tree: &SyntaxTree<'_>,
     candidate: NodeId,
     is_anchor: &impl Fn(NodeId) -> bool,
     is_fence: &impl Fn(NodeId) -> bool,
 ) -> Option<(NodeId, bool)> {
     let mut branch = candidate;
-    let mut candidate = projection.node(candidate).parent?;
+    let mut candidate = tree.node(candidate).parent?;
     let mut crossed_unmatched_parent = false;
     loop {
         // A paired owner is the breadth fence itself; its other children are outside this proof.
@@ -3576,13 +3615,13 @@ fn unique_containment_path(
             return Some((candidate, crossed_unmatched_parent));
         }
 
-        let node = projection.node(candidate);
-        if node.is_hard_owner()
+        let node = tree.node(candidate);
+        if node.seals_wrappers()
             || node
                 .children
                 .iter()
                 .copied()
-                .any(|child| child != branch && subtree_contains_fence(projection, child, is_fence))
+                .any(|child| child != branch && subtree_contains_fence(tree, child, is_fence))
         {
             return None;
         }
@@ -3596,16 +3635,16 @@ fn unique_containment_path(
 }
 
 fn subtree_contains_fence(
-    projection: &Projection<'_>,
+    tree: &SyntaxTree<'_>,
     root: NodeId,
     is_fence: &impl Fn(NodeId) -> bool,
 ) -> bool {
     std::iter::once(root)
-        .chain(projection.descendants(root))
+        .chain(tree.descendants(root))
         .any(|candidate| {
-            let node = projection.node(candidate);
+            let node = tree.node(candidate);
             is_fence(candidate)
-                || node.is_hard_owner()
+                || node.seals_wrappers()
                 || node.review.is_some()
                 || node.decoration_owner.is_some()
         })
@@ -3613,19 +3652,19 @@ fn subtree_contains_fence(
 
 /// Find exactly one matching descendant reachable along an unpaired containment spine.
 fn unique_contained_descendant_matches(
-    projection: &Projection<'_>,
+    tree: &SyntaxTree<'_>,
     outer: NodeId,
     is_fence: &impl Fn(NodeId) -> bool,
     mut matches: impl FnMut(NodeId) -> bool,
 ) -> bool {
     let is_outer = |candidate| candidate == outer;
     let mut retained = None;
-    for candidate in projection.descendants(outer) {
-        let node = projection.node(candidate);
+    for candidate in tree.descendants(outer) {
+        let node = tree.node(candidate);
         if !node.named || node.leaf.is_some() || !matches(candidate) {
             continue;
         }
-        if unique_containment_path(projection, candidate, &is_outer, is_fence).is_none() {
+        if unique_containment_path(tree, candidate, &is_outer, is_fence).is_none() {
             continue;
         }
         if retained.replace(candidate).is_some() {
@@ -3637,31 +3676,28 @@ fn unique_contained_descendant_matches(
 
 /// Collect exact non-delimiter payload below an identity-bearing context.
 fn meaningful_payload_fingerprints(
-    projection: &Projection<'_>,
+    tree: &SyntaxTree<'_>,
     fingerprints: &[NodeFingerprints],
     root: NodeId,
 ) -> Vec<FingerprintId> {
-    let identity = projection.identity_text(root);
-    let mut payload = descendant_leaves(projection, root)
+    let identity = tree.identity_text(root);
+    let mut payload = descendant_leaves(tree, root)
         .into_iter()
         .filter(|id| {
-            let node = projection.node(*id);
+            let node = tree.node(*id);
             let Some(leaf) = node.leaf else {
                 return false;
             };
-            if leaf.delimiter
+            if leaf.delimiter.is_some()
                 || matches!(
                     leaf.channel,
                     ContentChannel::Comment | ContentChannel::Layout
                 )
-                || !matches!(
-                    leaf.syntax,
-                    SyntaxClass::Plain | SyntaxClass::Literal | SyntaxClass::String
-                )
+                || leaf.role != LeafRole::Payload
             {
                 return false;
             }
-            let text = projection.leaf_text(*id);
+            let text = tree.leaf_text(*id);
             text.is_some_and(|text| !text.trim().is_empty() && Some(text) != identity)
         })
         .map(|id| fingerprints[id.index()].full)
@@ -3689,7 +3725,7 @@ fn shared_fingerprint_count(before: &[FingerprintId], after: &[FingerprintId]) -
 }
 
 fn contextual_child_matches(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     context: &ContextLinks,
     before: &[NodeId],
     after: &[NodeId],
@@ -3831,16 +3867,16 @@ fn contextual_child_matches(
         .filter(|index| {
             pair.before
                 .node(before[identified_before[*index]])
-                .correspondence
-                != CorrespondenceRole::Transparent
+                .sibling_matching
+                != SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let local_after = (0..identified_after.len())
         .filter(|index| {
             pair.after
                 .node(after[identified_after[*index]])
-                .correspondence
-                != CorrespondenceRole::Transparent
+                .sibling_matching
+                != SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let before_local_values = local_before
@@ -3848,7 +3884,7 @@ fn contextual_child_matches(
         .map(|index| {
             let id = before[identified_before[*index]];
             (
-                pair.before.node(id).correspondence,
+                pair.before.node(id).sibling_matching,
                 context_identity(&pair.before, id),
             )
         })
@@ -3858,7 +3894,7 @@ fn contextual_child_matches(
         .map(|index| {
             let id = after[identified_after[*index]];
             (
-                pair.after.node(id).correspondence,
+                pair.after.node(id).sibling_matching,
                 context_identity(&pair.after, id),
             )
         })
@@ -3870,46 +3906,34 @@ fn contextual_child_matches(
         after_match[after_index] = Some(before_index);
     }
 
-    let transparent_before = (0..identified_before.len())
+    let ordered_before = (0..identified_before.len())
         .filter(|index| {
             let candidate = identified_before[*index];
             before_match[candidate].is_none()
-                && pair.before.node(before[candidate]).correspondence
-                    == CorrespondenceRole::Transparent
+                && pair.before.node(before[candidate]).sibling_matching
+                    == SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
-    let transparent_after = (0..identified_after.len())
+    let ordered_after = (0..identified_after.len())
         .filter(|index| {
             let candidate = identified_after[*index];
             after_match[candidate].is_none()
-                && pair.after.node(after[candidate]).correspondence
-                    == CorrespondenceRole::Transparent
+                && pair.after.node(after[candidate]).sibling_matching
+                    == SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
-    let before_identities = transparent_before
+    let before_identities = ordered_before
         .iter()
         .map(|index| context_identity(&pair.before, before[identified_before[*index]]))
         .collect::<Vec<_>>();
-    let after_identities = transparent_after
+    let after_identities = ordered_after
         .iter()
         .map(|index| context_identity(&pair.after, after[identified_after[*index]]))
         .collect::<Vec<_>>();
-    let before_exact = transparent_before
-        .iter()
-        .map(|index| before_fingerprints[before[identified_before[*index]].index()].full)
-        .collect::<Vec<_>>();
-    let after_exact = transparent_after
-        .iter()
-        .map(|index| after_fingerprints[after[identified_after[*index]].index()].full)
-        .collect::<Vec<_>>();
-    for edge in locality_preserving_sibling_matches(
-        &before_identities,
-        &after_identities,
-        &before_exact,
-        &after_exact,
-    ) {
-        let before_index = identified_before[transparent_before[edge.before]];
-        let after_index = identified_after[transparent_after[edge.after]];
+    // Pairing exposed shell identities first; descendants get their own queued breadth layer.
+    for edge in unordered_matches(&before_identities, &after_identities) {
+        let before_index = identified_before[ordered_before[edge.before]];
+        let after_index = identified_after[ordered_after[edge.after]];
         before_match[before_index] = Some(after_index);
         after_match[after_index] = Some(before_index);
     }
@@ -3927,7 +3951,19 @@ fn contextual_child_matches(
                 matched: &after_match,
                 reserved: &after_direct_reserved,
             },
-        ) {
+        )
+        .into_iter()
+        .filter(|edge| {
+            // Preserving a certified inner owner; a later rename cannot consume its wrapper.
+            !pair
+                .before
+                .descendants(before[edge.before])
+                .any(|id| context.before.contains_key(&id))
+                && !pair
+                    .after
+                    .descendants(after[edge.after])
+                    .any(|id| context.after.contains_key(&id))
+        }) {
             before_match[edge.before] = Some(edge.after);
             after_match[edge.after] = Some(edge.before);
         }
@@ -3963,16 +3999,16 @@ fn contextual_child_matches(
         .filter(|index| {
             pair.before
                 .node(before[anonymous_before[*index]])
-                .correspondence
-                != CorrespondenceRole::Transparent
+                .sibling_matching
+                != SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let local_after = (0..anonymous_after.len())
         .filter(|index| {
             pair.after
                 .node(after[anonymous_after[*index]])
-                .correspondence
-                != CorrespondenceRole::Transparent
+                .sibling_matching
+                != SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let before_local_values = local_before
@@ -3980,7 +4016,7 @@ fn contextual_child_matches(
         .map(|index| {
             let id = before[anonymous_before[*index]];
             (
-                pair.before.node(id).correspondence,
+                pair.before.node(id).sibling_matching,
                 context_shape(&pair.before, id),
             )
         })
@@ -3990,7 +4026,7 @@ fn contextual_child_matches(
         .map(|index| {
             let id = after[anonymous_after[*index]];
             (
-                pair.after.node(id).correspondence,
+                pair.after.node(id).sibling_matching,
                 context_shape(&pair.after, id),
             )
         })
@@ -4009,8 +4045,8 @@ fn contextual_child_matches(
                 && pair
                     .before
                     .node(before[anonymous_before[*index]])
-                    .correspondence
-                    == CorrespondenceRole::Transparent
+                    .sibling_matching
+                    == SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let keyed_after = (0..anonymous_after.len())
@@ -4020,8 +4056,8 @@ fn contextual_child_matches(
                 && pair
                     .after
                     .node(after[anonymous_after[*index]])
-                    .correspondence
-                    == CorrespondenceRole::Transparent
+                    .sibling_matching
+                    == SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let before_keyed_values = keyed_before
@@ -4032,20 +4068,7 @@ fn contextual_child_matches(
         .iter()
         .map(|index| after_keys[*index].clone())
         .collect::<Vec<_>>();
-    let before_exact = keyed_before
-        .iter()
-        .map(|index| before_fingerprints[before[anonymous_before[*index]].index()].full)
-        .collect::<Vec<_>>();
-    let after_exact = keyed_after
-        .iter()
-        .map(|index| after_fingerprints[after[anonymous_after[*index]].index()].full)
-        .collect::<Vec<_>>();
-    for edge in locality_preserving_sibling_matches(
-        &before_keyed_values,
-        &after_keyed_values,
-        &before_exact,
-        &after_exact,
-    ) {
+    for edge in unordered_matches(&before_keyed_values, &after_keyed_values) {
         let before_index = anonymous_before[keyed_before[edge.before]];
         let after_index = anonymous_after[keyed_after[edge.after]];
         before_match[before_index] = Some(after_index);
@@ -4057,8 +4080,8 @@ fn contextual_child_matches(
         .copied()
         .filter(|index| {
             before_match[*index].is_none()
-                && pair.before.node(before[*index]).correspondence
-                    == CorrespondenceRole::Transparent
+                && pair.before.node(before[*index]).sibling_matching
+                    == SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let remaining_after = anonymous_after
@@ -4066,7 +4089,7 @@ fn contextual_child_matches(
         .copied()
         .filter(|index| {
             after_match[*index].is_none()
-                && pair.after.node(after[*index]).correspondence == CorrespondenceRole::Transparent
+                && pair.after.node(after[*index]).sibling_matching == SiblingMatching::OrderedSyntax
         })
         .collect::<Vec<_>>();
     let before_shapes = remaining_before
@@ -4111,143 +4134,6 @@ fn contextual_child_matches(
         .collect()
 }
 
-/// Match one sibling layer without letting a copied payload displace its local occurrence.
-///
-/// Exact payload decides identity only when two provisional edges cross, which is concrete
-/// sibling-reordering evidence. Otherwise equal local keys retain FIFO source identity.
-fn locality_preserving_sibling_matches<K: Clone + Eq + Hash>(
-    before_keys: &[K],
-    after_keys: &[K],
-    before_exact: &[FingerprintId],
-    after_exact: &[FingerprintId],
-) -> Vec<OrderedMatch> {
-    debug_assert_eq!(before_keys.len(), before_exact.len());
-    debug_assert_eq!(after_keys.len(), after_exact.len());
-
-    let mut before_groups = HashMap::<K, Vec<usize>>::new();
-    for (index, key) in before_keys.iter().cloned().enumerate() {
-        before_groups.entry(key).or_default().push(index);
-    }
-    let mut after_groups = HashMap::<K, Vec<usize>>::new();
-    for (index, key) in after_keys.iter().cloned().enumerate() {
-        after_groups.entry(key).or_default().push(index);
-    }
-
-    let mut matches = Vec::new();
-    for (key, before_group) in before_groups {
-        let Some(after_group) = after_groups.get(&key) else {
-            continue;
-        };
-        let before_values = before_group
-            .iter()
-            .map(|index| before_exact[*index])
-            .collect::<Vec<_>>();
-        let after_values = after_group
-            .iter()
-            .map(|index| after_exact[*index])
-            .collect::<Vec<_>>();
-        let mut before_counts = HashMap::new();
-        for value in &before_values {
-            *before_counts.entry(*value).or_insert(0_usize) += 1;
-        }
-        let mut after_counts = HashMap::new();
-        for value in &after_values {
-            *after_counts.entry(*value).or_insert(0_usize) += 1;
-        }
-        let exact = unordered_matches(&before_values, &after_values)
-            .into_iter()
-            .filter(|edge| {
-                before_counts[&before_values[edge.before]] == 1
-                    && after_counts[&after_values[edge.after]] == 1
-            })
-            .collect::<Vec<_>>();
-        let mut provisional = exact
-            .iter()
-            .copied()
-            .map(|edge| (edge, true))
-            .collect::<Vec<_>>();
-        let mut before_claimed = vec![false; before_group.len()];
-        let mut after_claimed = vec![false; after_group.len()];
-        for edge in &exact {
-            before_claimed[edge.before] = true;
-            after_claimed[edge.after] = true;
-        }
-        provisional.extend(
-            before_claimed
-                .iter()
-                .enumerate()
-                .filter_map(|(index, claimed)| (!claimed).then_some(index))
-                .zip(
-                    after_claimed
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, claimed)| (!claimed).then_some(index)),
-                )
-                .map(|(before, after)| (OrderedMatch::new(before, after), false)),
-        );
-        provisional.sort_unstable_by_key(|(edge, _)| edge.before);
-        let crossing = crossing_match_members(
-            &provisional
-                .iter()
-                .map(|(edge, _)| *edge)
-                .collect::<Vec<_>>(),
-        );
-
-        before_claimed.fill(false);
-        after_claimed.fill(false);
-        for ((edge, exact), crossing) in provisional.into_iter().zip(crossing) {
-            if !exact || !crossing {
-                continue;
-            }
-            before_claimed[edge.before] = true;
-            after_claimed[edge.after] = true;
-            matches.push(OrderedMatch::new(
-                before_group[edge.before],
-                after_group[edge.after],
-            ));
-        }
-        matches.extend(
-            before_claimed
-                .iter()
-                .enumerate()
-                .filter_map(|(index, claimed)| (!claimed).then_some(index))
-                .zip(
-                    after_claimed
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, claimed)| (!claimed).then_some(index)),
-                )
-                .map(|(before, after)| OrderedMatch::new(before_group[before], after_group[after])),
-        );
-    }
-    matches.sort_unstable_by_key(|edge| edge.before);
-    matches
-}
-
-/// Mark every edge that participates in an inversion with another edge.
-fn crossing_match_members(matches: &[OrderedMatch]) -> Vec<bool> {
-    let mut prefix_max = vec![None; matches.len()];
-    let mut maximum = None;
-    for (index, edge) in matches.iter().enumerate() {
-        prefix_max[index] = maximum;
-        maximum = Some(maximum.map_or(edge.after, |value: usize| value.max(edge.after)));
-    }
-    let mut suffix_min = vec![None; matches.len()];
-    let mut minimum = None;
-    for (index, edge) in matches.iter().enumerate().rev() {
-        suffix_min[index] = minimum;
-        minimum = Some(minimum.map_or(edge.after, |value: usize| value.min(edge.after)));
-    }
-    matches
-        .iter()
-        .enumerate()
-        .map(|(index, edge)| {
-            prefix_max[index].is_some_and(|after| after > edge.after)
-                || suffix_min[index].is_some_and(|after| after < edge.after)
-        })
-        .collect()
-}
-
 struct ContextCandidates<'input> {
     nodes: &'input [NodeId],
     matched: &'input [Option<usize>],
@@ -4263,51 +4149,71 @@ struct ContextClaims<'input> {
 
 /// Decorations are aligned only inside one already-linked semantic owner pair.
 fn decoration_matches(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     context: &ContextLinks,
     before: ContextCandidates<'_>,
     after: ContextCandidates<'_>,
 ) -> Vec<OrderedMatch> {
     let mut matches = Vec::new();
-    let mut owner_pairs = context
-        .before
+    let mut before_by_owner = HashMap::<NodeId, Vec<usize>>::new();
+    for (index, id) in before.nodes.iter().copied().enumerate() {
+        if before.matched[index].is_some() || before.reserved[index] {
+            continue;
+        }
+        let Some(owner) = pair.before.node(id).decoration_owner else {
+            continue;
+        };
+        before_by_owner.entry(owner).or_default().push(index);
+    }
+    let mut after_by_owner = HashMap::<NodeId, Vec<usize>>::new();
+    for (index, id) in after.nodes.iter().copied().enumerate() {
+        if after.matched[index].is_some() || after.reserved[index] {
+            continue;
+        }
+        let Some(owner) = pair.after.node(id).decoration_owner else {
+            continue;
+        };
+        after_by_owner.entry(owner).or_default().push(index);
+    }
+    if before_by_owner.is_empty() || after_by_owner.is_empty() {
+        return matches;
+    }
+
+    let provisional_owners = before
+        .matched
         .iter()
-        .map(|(before, after)| (*before, *after))
-        .chain(before.matched.iter().copied().enumerate().filter_map(
-            |(before_index, after_index)| {
-                let after_index = after_index?;
-                let after = after.nodes.get(after_index)?;
-                Some((before.nodes[before_index], *after))
-            },
-        ))
-        .collect::<Vec<_>>();
+        .copied()
+        .enumerate()
+        .filter_map(|(before_index, after_index)| {
+            let after_index = after_index?;
+            let after = after.nodes.get(after_index)?;
+            Some((before.nodes[before_index], *after))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut owner_pairs = Vec::new();
+    for before_owner in before_by_owner.keys() {
+        for after_owner in [
+            context.before.get(before_owner),
+            provisional_owners.get(before_owner),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if after_by_owner.contains_key(after_owner) {
+                owner_pairs.push((*before_owner, *after_owner));
+            }
+        }
+    }
     owner_pairs.sort_unstable();
     owner_pairs.dedup();
+
     for (before_owner, after_owner) in owner_pairs {
-        let before_group = before
-            .nodes
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(index, id)| {
-                before.matched[*index].is_none()
-                    && !before.reserved[*index]
-                    && pair.before.node(*id).decoration_owner == Some(before_owner)
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let after_group = after
-            .nodes
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(index, id)| {
-                after.matched[*index].is_none()
-                    && !after.reserved[*index]
-                    && pair.after.node(*id).decoration_owner == Some(after_owner)
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let Some(before_group) = before_by_owner.get(&before_owner) else {
+            continue;
+        };
+        let Some(after_group) = after_by_owner.get(&after_owner) else {
+            continue;
+        };
         let before_exact = before_group
             .iter()
             .map(|index| before.fingerprints[before.nodes[*index].index()].full)
@@ -4392,7 +4298,7 @@ fn decoration_matches(
 
 /// Pair renamed identity-bearing siblings by local order, never by descendant payload.
 fn confident_renamed_context_matches(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before: &[NodeId],
     after: &[NodeId],
     before_claims: ContextClaims<'_>,
@@ -4455,7 +4361,7 @@ fn confident_renamed_context_matches(
         .map(|index| {
             let id = before[*index];
             (
-                pair.before.node(id).correspondence,
+                pair.before.node(id).sibling_matching,
                 context_shape(&pair.before, id),
             )
         })
@@ -4465,7 +4371,7 @@ fn confident_renamed_context_matches(
         .map(|index| {
             let id = after[*index];
             (
-                pair.after.node(id).correspondence,
+                pair.after.node(id).sibling_matching,
                 context_shape(&pair.after, id),
             )
         })
@@ -4477,20 +4383,20 @@ fn confident_renamed_context_matches(
 }
 
 fn descendant_identities<'source>(
-    projection: &'source Projection<'_>,
+    tree: &'source SyntaxTree<'_>,
     root: NodeId,
-) -> HashSet<(&'static str, &'source str)> {
+) -> HashSet<(SyntaxKind, &'source str)> {
     let mut identities = HashSet::new();
-    if projection.node(root).correspondence != CorrespondenceRole::Transparent {
+    if tree.node(root).sibling_matching != SiblingMatching::OrderedSyntax {
         return identities;
     }
-    let mut pending = projection.node(root).children.clone();
+    let mut pending = tree.node(root).children.clone();
     while let Some(candidate) = pending.pop() {
-        let node = projection.node(candidate);
-        if node.correspondence != CorrespondenceRole::Transparent {
+        let node = tree.node(candidate);
+        if node.sibling_matching != SiblingMatching::OrderedSyntax {
             continue;
         }
-        if let Some(identity) = projection.identity_text(candidate) {
+        if let Some(identity) = tree.identity_text(candidate) {
             identities.insert((node.kind, identity));
             continue;
         }
@@ -4500,106 +4406,97 @@ fn descendant_identities<'source>(
 }
 
 fn identity_key<'source>(
-    projection: &'source Projection<'source>,
+    tree: &'source SyntaxTree<'source>,
     id: NodeId,
-) -> (&'static str, &'source str) {
+) -> (SyntaxKind, &'source str) {
     (
-        projection.node(id).kind,
-        projection
-            .identity_text(id)
+        tree.node(id).kind,
+        tree.identity_text(id)
             .expect("identified context carries source identity"),
     )
 }
 
 fn contains_foreign_descendant_identity(
-    projection: &Projection<'_>,
+    tree: &SyntaxTree<'_>,
     root: NodeId,
-    opposite: &HashSet<(&'static str, &str)>,
+    opposite: &HashSet<(SyntaxKind, &str)>,
 ) -> bool {
-    let own = identity_key(projection, root);
-    descendant_identities(projection, root)
+    let own = identity_key(tree, root);
+    descendant_identities(tree, root)
         .into_iter()
         .any(|identity| identity != own && opposite.contains(&identity))
 }
 
-fn direct_composites(projection: &Projection<'_>, parent: NodeId) -> Vec<NodeId> {
-    projection
-        .node(parent)
+fn direct_composites(tree: &SyntaxTree<'_>, parent: NodeId) -> Vec<NodeId> {
+    tree.node(parent)
         .children
         .iter()
         .copied()
         .filter(|id| {
-            let node = projection.node(*id);
+            let node = tree.node(*id);
             node.named && node.leaf.is_none()
         })
         .collect()
 }
 
-fn context_shape(projection: &Projection<'_>, id: NodeId) -> ContextShape {
-    let node = projection.node(id);
+fn context_shape(tree: &SyntaxTree<'_>, id: NodeId) -> ContextShape {
+    let node = tree.node(id);
     ContextShape {
         kind: node.kind,
-        field: node.field,
+        slot: node.slot,
     }
 }
 
-/// Describe an anonymous sibling by the first semantic identities exposed on each child branch.
+/// Describe an anonymous sibling by identities exposed directly on its syntax shell.
+/// Nested composites form the next breadth layer after this occurrence is paired.
 fn anonymous_context_key<'source>(
-    projection: &'source Projection<'source>,
+    tree: &'source SyntaxTree<'source>,
     id: NodeId,
 ) -> AnonymousContextKey<'source> {
     let mut identities = Vec::new();
-    let mut pending = projection
-        .node(id)
-        .children
-        .iter()
-        .rev()
-        .copied()
-        .collect::<Vec<_>>();
-    while let Some(candidate) = pending.pop() {
-        let node = projection.node(candidate);
-        if node.correspondence != CorrespondenceRole::Transparent {
+    for candidate in tree.node(id).children.iter().copied() {
+        let node = tree.node(candidate);
+        if node.sibling_matching != SiblingMatching::OrderedSyntax {
             continue;
         }
-        if let Some(identity) = projection.identity_text(candidate) {
+        if let Some(identity) = tree.identity_text(candidate) {
             identities.push(ContextIdentity {
                 kind: node.kind,
-                field: node.field,
+                slot: node.slot,
                 identity,
             });
             continue;
         }
-        if node.field.is_some()
+        if matches!(node.slot, ChildSlot::Field(_))
             && node
                 .leaf
-                .is_some_and(|leaf| leaf.syntax == SyntaxClass::Identifier)
+                .is_some_and(|leaf| leaf.role == LeafRole::Identifier)
         {
             identities.push(ContextIdentity {
                 kind: node.kind,
-                field: node.field,
-                identity: projection
+                slot: node.slot,
+                identity: tree
                     .leaf_text(candidate)
                     .expect("a concrete identifier owns source spelling"),
             });
             continue;
         }
-        pending.extend(node.children.iter().rev().copied());
     }
     AnonymousContextKey {
-        shape: context_shape(projection, id),
+        shape: context_shape(tree, id),
         identities,
     }
 }
 
 fn context_identity<'source>(
-    projection: &'source Projection<'source>,
+    tree: &'source SyntaxTree<'source>,
     id: NodeId,
 ) -> ContextIdentity<'source> {
-    let node = projection.node(id);
+    let node = tree.node(id);
     ContextIdentity {
         kind: node.kind,
-        field: node.field,
-        identity: projection
+        slot: node.slot,
+        identity: tree
             .identity_text(id)
             .expect("identified context carries source identity"),
     }
@@ -4607,7 +4504,7 @@ fn context_identity<'source>(
 
 /// Movement is decided by semantic siblings; each decoration inherits its owner's result.
 fn contextual_match_placements(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before: &[NodeId],
     matches: &[OrderedMatch],
     links: &ContextLinks,
@@ -4676,13 +4573,13 @@ fn link_context(
     true
 }
 
-fn mark_subtree(projection: &Projection<'_>, root: NodeId, marked: &mut HashSet<NodeId>) {
-    marked.extend(std::iter::once(root).chain(projection.descendants(root)));
+fn mark_subtree(tree: &SyntaxTree<'_>, root: NodeId, marked: &mut HashSet<NodeId>) {
+    marked.extend(std::iter::once(root).chain(tree.descendants(root)));
 }
 
 /// Concrete node pairs implied by one collision-checked recursive fingerprint match.
 fn exact_subtree_nodes(
-    pair: &ProjectionPair<'_, '_>,
+    pair: &SyntaxPair<'_, '_>,
     before: NodeId,
     after: NodeId,
 ) -> Vec<(NodeId, NodeId)> {
@@ -4718,10 +4615,10 @@ fn exact_subtree_nodes(
     nodes
 }
 
-fn subtree_sizes(projection: &Projection<'_>) -> Vec<usize> {
-    let mut sizes = vec![1; projection.nodes.len()];
-    for index in (1..projection.nodes.len()).rev() {
-        let node = projection.node(NodeId::new(index));
+fn subtree_sizes(tree: &SyntaxTree<'_>) -> Vec<usize> {
+    let mut sizes = vec![1; tree.nodes.len()];
+    for index in (1..tree.nodes.len()).rev() {
+        let node = tree.node(NodeId::new(index));
         let Some(parent) = node.parent else {
             continue;
         };
@@ -4833,32 +4730,12 @@ impl CorrespondenceBuilder<'_, '_, '_> {
     }
 }
 
-fn trailing_delimiter_owner(projection: &Projection<'_>, leaf: NodeId) -> Option<NodeId> {
-    if !projection.node(leaf).leaf?.delimiter {
-        return None;
-    }
-    if !matches!(projection.leaf_text(leaf)?, "," | ";") {
-        return None;
-    }
-    let parent = projection.node(leaf).parent?;
-    let siblings = &projection.node(parent).children;
-    let position = siblings.iter().position(|candidate| *candidate == leaf)?;
-    siblings[..position]
-        .iter()
-        .rev()
-        .copied()
-        .find(|candidate| {
-            let node = projection.node(*candidate);
-            node.named && node.decoration_owner.is_none()
-        })
-}
-
-fn leaf_shape(projection: &Projection<'_>, id: NodeId) -> LeafShape {
-    let node = projection.node(id);
+fn leaf_shape(tree: &SyntaxTree<'_>, id: NodeId) -> LeafShape {
+    let node = tree.node(id);
     let leaf = node.leaf.expect("leaf collection contains only leaves");
     LeafShape {
         kind: node.kind,
-        field: node.field,
+        slot: node.slot,
         channel: leaf.channel,
         named: node.named,
         extra: node.extra,
@@ -5097,17 +4974,36 @@ fn greedy_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> 
 
 /// Quadratic dynamic programming reserved for small gaps between exact anchors.
 fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
+    #[derive(Clone, Copy, Default, Eq, PartialEq)]
+    struct AlignmentScore {
+        retained: usize,
+        drift: usize,
+    }
+
     let width = after.len() + 1;
-    let mut lengths = vec![0_usize; (before.len() + 1) * width];
+    let mut scores = vec![AlignmentScore::default(); (before.len() + 1) * width];
+    let better = |left: AlignmentScore, right: AlignmentScore| {
+        left.retained > right.retained
+            || (left.retained == right.retained && left.drift < right.drift)
+    };
     for before_index in (0..before.len()).rev() {
         for after_index in (0..after.len()).rev() {
-            let length = if before[before_index] == after[after_index] {
-                1 + lengths[(before_index + 1) * width + after_index + 1]
-            } else {
-                lengths[(before_index + 1) * width + after_index]
-                    .max(lengths[before_index * width + after_index + 1])
-            };
-            lengths[before_index * width + after_index] = length;
+            let mut score = scores[(before_index + 1) * width + after_index];
+            let skip_after = scores[before_index * width + after_index + 1];
+            if better(skip_after, score) {
+                score = skip_after;
+            }
+            if before[before_index] == after[after_index] {
+                let mut paired = scores[(before_index + 1) * width + after_index + 1];
+                paired.retained += 1;
+                paired.drift = paired
+                    .drift
+                    .saturating_add(before_index.abs_diff(after_index));
+                if better(paired, score) {
+                    score = paired;
+                }
+            }
+            scores[before_index * width + after_index] = score;
         }
     }
 
@@ -5116,18 +5012,30 @@ fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut after_index = 0;
     while before_index < before.len() && after_index < after.len() {
         if before[before_index] == after[after_index] {
-            matches.push(OrderedMatch::new(before_index, after_index));
-            before_index += 1;
-            after_index += 1;
-            continue;
+            let mut paired = scores[(before_index + 1) * width + after_index + 1];
+            paired.retained += 1;
+            paired.drift = paired
+                .drift
+                .saturating_add(before_index.abs_diff(after_index));
+            if paired == scores[before_index * width + after_index] {
+                matches.push(OrderedMatch::new(before_index, after_index));
+                before_index += 1;
+                after_index += 1;
+                continue;
+            }
         }
 
-        let skip_before = lengths[(before_index + 1) * width + after_index];
-        let skip_after = lengths[before_index * width + after_index + 1];
-        if skip_before >= skip_after {
-            before_index += 1;
-        } else {
-            after_index += 1;
+        let target = scores[before_index * width + after_index];
+        let skip_before = scores[(before_index + 1) * width + after_index];
+        let skip_after = scores[before_index * width + after_index + 1];
+        match (skip_before == target, skip_after == target) {
+            (true, false) => before_index += 1,
+            (false, true) => after_index += 1,
+            (true, true) if before.len() - before_index >= after.len() - after_index => {
+                before_index += 1;
+            }
+            (true, true) => after_index += 1,
+            (false, false) => unreachable!("alignment score has no reconstructible edge"),
         }
     }
     matches

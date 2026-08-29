@@ -1,7 +1,9 @@
-//! Terminal rendering of planner-owned rows; no diff structure is inferred here.
+//! Terminal rendering of presentation-owned rows; no diff structure is inferred here.
 
-use crate::diff::{DiffMark, DiffRow, DisplayLine, FileDiff, LineEnding, SyntaxClass, WordDiff};
-use crate::review::{FileNotice, FileReview};
+use crate::diff::{
+    DiffMark, LineEnding, PresentedFile, ReviewRow, SourceRow, SyntaxClass, WordDiff,
+};
+use crate::review::{FileNotice, ReviewItem};
 use anyhow::{Context, Result, ensure};
 use crossterm::{
     cursor::{Hide, Show},
@@ -42,7 +44,7 @@ struct GutterLayout {
     label_columns: usize,
 }
 
-/// Minimal review projection needed to lay out the file ribbon.
+/// Minimal review facts needed to lay out the file ribbon.
 #[derive(Clone, Copy, Debug)]
 struct RibbonItem<'a> {
     path: &'a str,
@@ -76,7 +78,7 @@ impl SourceMarker {
 }
 
 impl GutterLayout {
-    fn new(diff: &FileDiff) -> Self {
+    fn new(diff: &PresentedFile) -> Self {
         let label_columns = diff
             .hunks
             .iter()
@@ -99,36 +101,31 @@ impl GutterLayout {
     }
 }
 
-fn row_label_columns(row: &DiffRow) -> usize {
+fn row_label_columns(row: &ReviewRow) -> usize {
     match row {
-        DiffRow::Line(line) => UnicodeWidthStr::width(source_label(line.number, None).as_str()),
-        DiffRow::Reflow(line) => {
+        ReviewRow::Current(line) => {
+            UnicodeWidthStr::width(source_label(line.number, None).as_str())
+        }
+        ReviewRow::Reflow(line) => {
             UnicodeWidthStr::width(source_label(line.number, Some(SourceMarker::Reflow)).as_str())
         }
-        DiffRow::LineChange { before, after } => {
-            let before = before
-                .as_ref()
-                .map(|line| source_label(line.number, Some(SourceMarker::Removed)))
-                .map(|label| UnicodeWidthStr::width(label.as_str()))
-                .unwrap_or(0);
-            let after = after
-                .as_ref()
-                .map(|line| source_label(line.number, Some(SourceMarker::Added)))
-                .map(|label| UnicodeWidthStr::width(label.as_str()))
-                .unwrap_or(0);
-            before.max(after)
+        ReviewRow::Removed(line) => {
+            UnicodeWidthStr::width(source_label(line.number, Some(SourceMarker::Removed)).as_str())
         }
-        DiffRow::LineEnding { .. } | DiffRow::FileBoundary => 0,
-        DiffRow::Moved { before, after } => {
+        ReviewRow::Added(line) => {
+            UnicodeWidthStr::width(source_label(line.number, Some(SourceMarker::Added)).as_str())
+        }
+        ReviewRow::LineEnding { .. } | ReviewRow::FileBoundary => 0,
+        ReviewRow::Moved { before, after } => {
             UnicodeWidthStr::width(moved_label(*before, after.number).as_str())
         }
-        DiffRow::Wordwise(word) => word
+        ReviewRow::Wordwise(word) => word
             .after_line
             .or(word.before_line)
             .map(|number| source_label(number, None))
             .map(|label| UnicodeWidthStr::width(label.as_str()))
             .unwrap_or(0),
-        DiffRow::Elision(_) => UnicodeWidthStr::width(VERTICAL_ELLIPSIS),
+        ReviewRow::Elision(_) => UnicodeWidthStr::width(VERTICAL_ELLIPSIS),
     }
 }
 
@@ -146,8 +143,8 @@ fn moved_label(before: Option<usize>, after: usize) -> String {
     format!("{before} → {after}")
 }
 
-/// Opens one or more planned file reviews or retained input notices.
-pub fn run(reviews: Vec<FileReview>) -> Result<()> {
+/// Open one or more presented file reviews or retained input notices.
+pub fn run(reviews: Vec<ReviewItem>) -> Result<()> {
     ensure!(!reviews.is_empty(), "cannot open an empty review");
     let mut session = TerminalSession::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -234,7 +231,7 @@ impl Drop for TerminalSession {
 /// Viewport over one file inside a path-ordered review.
 #[derive(Debug)]
 struct App {
-    reviews: Vec<FileReview>,
+    reviews: Vec<ReviewItem>,
     file_index: usize,
     scroll: usize,
     viewport_rows: usize,
@@ -244,7 +241,7 @@ struct App {
 impl App {
     fn new<T>(reviews: Vec<T>) -> Self
     where
-        T: Into<FileReview>,
+        T: Into<ReviewItem>,
     {
         assert!(!reviews.is_empty(), "review needs at least one file");
         let reviews = reviews.into_iter().map(Into::into).collect();
@@ -257,13 +254,13 @@ impl App {
         }
     }
 
-    fn current_review(&self) -> &FileReview {
+    fn current_review(&self) -> &ReviewItem {
         &self.reviews[self.file_index]
     }
 
     #[cfg(test)]
-    fn current_diff(&self) -> &FileDiff {
-        let FileReview::Diff(diff) = self.current_review() else {
+    fn current_diff(&self) -> &PresentedFile {
+        let ReviewItem::Presented(diff) = self.current_review() else {
             panic!("current review is not a diff");
         };
         diff
@@ -379,8 +376,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, area);
 
     let gutter = match app.current_review() {
-        FileReview::Diff(diff) => GutterLayout::new(diff),
-        FileReview::Notice(_) => GutterLayout::default(),
+        ReviewItem::Presented(diff) => GutterLayout::new(diff),
+        ReviewItem::Notice(_) => GutterLayout::default(),
     };
     let required_width = gutter.width() + MIN_SOURCE_COLUMNS;
     if usize::from(area.width) < required_width || area.height < MIN_TERMINAL_HEIGHT {
@@ -581,7 +578,7 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, required_width: usize) {
     );
 }
 
-fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Line<'static>> {
+fn compose_review(diff: &PresentedFile, gutter: GutterLayout, width: usize) -> Vec<Line<'static>> {
     if diff.hunks.is_empty() {
         return vec![Line::from(""), Line::styled("  no changes", muted())];
     }
@@ -593,47 +590,40 @@ fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Li
         }
         for row in &hunk.rows {
             match row {
-                DiffRow::Line(line) => {
+                ReviewRow::Current(line) => {
                     rows.push(source_line(line, None, gutter, width, !line.has_changes()));
                 }
-                DiffRow::Reflow(line) => rows.push(source_line(
+                ReviewRow::Reflow(line) => rows.push(source_line(
                     line,
                     Some(SourceMarker::Reflow),
                     gutter,
                     width,
                     false,
                 )),
-                DiffRow::LineChange { before, after } => {
-                    if let Some(before) = before {
-                        // Before-side `-` rows are ghost lines: historical source kept visible
-                        // without competing with the current-world syntax palette.
-                        rows.push(source_line(
-                            before,
-                            Some(SourceMarker::Removed),
-                            gutter,
-                            width,
-                            false,
-                        ));
-                    }
-                    if let Some(after) = after {
-                        rows.push(source_line(
-                            after,
-                            Some(SourceMarker::Added),
-                            gutter,
-                            width,
-                            false,
-                        ));
-                    }
-                }
-                DiffRow::LineEnding { before, after } => {
+                // Historical rows stay ghosted without competing with current syntax.
+                ReviewRow::Removed(line) => rows.push(source_line(
+                    line,
+                    Some(SourceMarker::Removed),
+                    gutter,
+                    width,
+                    false,
+                )),
+                ReviewRow::Added(line) => rows.push(source_line(
+                    line,
+                    Some(SourceMarker::Added),
+                    gutter,
+                    width,
+                    false,
+                )),
+                ReviewRow::LineEnding { before, after } => {
                     rows.push(line_ending_diff(*before, *after, gutter, width));
                 }
-                DiffRow::Moved { before, after } => {
+                ReviewRow::Moved { before, after } => {
                     rows.push(moved_source_line(after, *before, gutter, width));
                 }
-                DiffRow::Wordwise(word) => rows.push(word_diff_line(word, gutter, width)),
-                DiffRow::Elision(_) => rows.push(elision_line(gutter, width)),
-                DiffRow::FileBoundary => rows.push(eof_guardian_line(gutter)),
+                ReviewRow::Wordwise(word) => rows.push(word_diff_line(word, gutter, width)),
+                ReviewRow::Elision(_) => rows.push(elision_line(gutter, width)),
+                ReviewRow::FileBoundary => rows.push(eof_guardian_line(gutter)),
             }
         }
     }
@@ -641,13 +631,13 @@ fn compose_review(diff: &FileDiff, gutter: GutterLayout, width: usize) -> Vec<Li
 }
 
 fn compose_file_review(
-    review: &FileReview,
+    review: &ReviewItem,
     gutter: GutterLayout,
     width: usize,
 ) -> Vec<Line<'static>> {
     match review {
-        FileReview::Diff(diff) => compose_review(diff, gutter, width),
-        FileReview::Notice(notice) => compose_notice(notice, width),
+        ReviewItem::Presented(diff) => compose_review(diff, gutter, width),
+        ReviewItem::Notice(notice) => compose_notice(notice, width),
     }
 }
 
@@ -784,7 +774,7 @@ fn line_ending_label(ending: LineEnding) -> &'static str {
 }
 
 fn source_line(
-    line: &DisplayLine,
+    line: &SourceRow,
     marker: Option<SourceMarker>,
     gutter: GutterLayout,
     width: usize,
@@ -839,7 +829,7 @@ fn source_line(
 }
 
 fn moved_source_line(
-    line: &DisplayLine,
+    line: &SourceRow,
     before: Option<usize>,
     gutter: GutterLayout,
     width: usize,
@@ -938,7 +928,7 @@ fn change_emphasis_style(mark: DiffMark) -> Style {
 
 fn softened_syntax_style(class: SyntaxClass) -> Style {
     let foreground = softened_syntax_foreground(class);
-    syntax_style(class, foreground)
+    Style::default().fg(foreground)
 }
 
 /// Monochrome body style for a rendered before-side `-` ghost line.
@@ -947,14 +937,6 @@ fn ghost_line_style(mark: DiffMark) -> Style {
         DiffMark::Removed => change_emphasis_style(mark),
         DiffMark::Context => Style::default().fg(Palette::GHOST),
         DiffMark::Added => unreachable!("before-side ghost lines cannot contain added source"),
-    }
-}
-
-fn syntax_style(class: SyntaxClass, foreground: Color) -> Style {
-    let style = Style::default().fg(foreground);
-    match class {
-        SyntaxClass::Comment => style.add_modifier(Modifier::ITALIC),
-        _ => style,
     }
 }
 
