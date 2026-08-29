@@ -66,19 +66,41 @@ fn move_merge_window_does_not_borrow_an_edit_halo() {
     assert!(merge_windows_touch(&first_edit, &distant_edit));
 }
 
-#[test]
-fn fallback_index_ignores_an_empty_counterpart_coordinate() {
-    let index = FallbackIndex::new(&[crate::diff::correspondence::LineFallback {
-        before: 7..8,
-        after: 7..7,
-    }]);
-
-    assert!(indexed_ranges_overlap(&index.before, &(2..9)));
-    assert!(!indexed_ranges_overlap(&index.after, &(2..10)));
-}
-
 fn line_text(line: &DisplayLine) -> String {
     line.spans.iter().map(|span| span.text.as_str()).collect()
+}
+
+fn line_fragment_has_mark(
+    line: &DisplayLine,
+    line_payload: &str,
+    fragment: &str,
+    mark: DiffMark,
+) -> bool {
+    let text = line_text(line);
+    let Some(payload_start) = text.find(line_payload) else {
+        return false;
+    };
+    let Some(fragment_start) = line_payload.find(fragment) else {
+        return false;
+    };
+    let fragment_start = payload_start + fragment_start;
+    let fragment_end = fragment_start + fragment.len();
+    let mut span_start = 0;
+
+    let mut intersects = false;
+    for span in &line.spans {
+        let span_end = span_start + span.text.len();
+        let span_intersects = span_start < fragment_end && fragment_start < span_end;
+        span_start = span_end;
+        if !span_intersects {
+            continue;
+        }
+        intersects = true;
+        if span.mark != mark {
+            return false;
+        }
+    }
+    intersects
 }
 
 fn current_line(row: &DiffRow) -> Option<&DisplayLine> {
@@ -166,8 +188,8 @@ fn line_cst_keeps_context_and_the_terminal_boundary() {
     let hunks = planned("notes.txt", "one\nold\nthree\n", "one\nnew\nthree\n");
 
     assert_eq!(hunks.len(), 1);
-    assert_eq!(hunks[0].coverage.before, Some(1..4));
-    assert_eq!(hunks[0].coverage.after, Some(1..4));
+    assert_eq!(hunks[0].coverage.before, Some(1..4), "{hunks:#?}");
+    assert_eq!(hunks[0].coverage.after, Some(1..4), "{hunks:#?}");
     assert!(matches!(hunks[0].rows.last(), Some(DiffRow::FileBoundary)));
     assert!(hunks[0].rows.iter().any(|row| {
         matches!(
@@ -182,9 +204,9 @@ fn line_cst_keeps_context_and_the_terminal_boundary() {
 
 #[test]
 fn display_syntax_does_not_change_structural_anchor_admission() {
-    let before = "<article>\n  <img\n  src=\"ada.webp\"\n  />\n</article>\n";
+    let before = "<article>\n  <img\n  src=\"alpha.webp\"\n  />\n</article>\n";
     let after =
-        "<article>\n  <div>\n    <img\n      src=\"ada.webp\"\n    />\n  </div>\n</article>\n";
+        "<article>\n  <div>\n    <img\n      src=\"alpha.webp\"\n    />\n  </div>\n</article>\n";
     let pair = project_pair(Path::new("view.html"), before, after, false).unwrap();
     let correspondence = correspond(&pair);
     let baseline_facts = AnchorFacts::new(&pair);
@@ -218,144 +240,10 @@ fn display_syntax_does_not_change_structural_anchor_admission() {
     assert!(
         baseline
             .iter()
-            .any(|(_, text)| text == "      src=\"ada.webp\""),
+            .any(|(_, text)| text == "      src=\"alpha.webp\""),
         "fixture must exercise a retained structural anchor: {baseline:#?}",
     );
     assert_eq!(baseline, reflows(&recolored));
-}
-
-#[test]
-fn replacement_group_uses_current_position_and_deletion_uses_its_gap() {
-    let graph = Correspondence {
-        units: Vec::new(),
-        line_ending_edits: Vec::new(),
-        line_fallbacks: Vec::new(),
-        line_links: vec![crate::diff::correspondence::LineLink {
-            before: 91,
-            after: 91,
-        }],
-        leaf_links: Vec::new(),
-        before_leaf: Vec::new(),
-        after_leaf: Vec::new(),
-        composites: Vec::new(),
-    };
-    let alignment = LineAlignment::new(&graph, 104);
-    let line = |number| DisplayLine {
-        number,
-        spans: Vec::new(),
-    };
-    let replacement = order_replacement_group(vec![
-        DiffRow::LineChange {
-            before: Some(line(94)),
-            after: Some(line(100)),
-        },
-        DiffRow::LineChange {
-            before: Some(line(95)),
-            after: Some(line(101)),
-        },
-    ]);
-    let replacement_current = replacement
-        .iter()
-        .filter_map(row_after_source_line)
-        .collect::<Vec<_>>();
-    let current = vec![DiffRow::Line(line(97))];
-    let deletion = vec![DiffRow::LineChange {
-        before: Some(line(94)),
-        after: None,
-    }];
-
-    assert_eq!(replacement_current, [100, 101]);
-    assert_eq!(
-        group_source_order(&replacement, &alignment),
-        SourceOrder::current(100)
-    );
-    assert!(
-        group_source_order(&current, &alignment) < group_source_order(&replacement, &alignment)
-    );
-    assert_eq!(
-        group_source_order(&deletion, &alignment),
-        alignment.before_order(94)
-    );
-}
-
-#[test]
-fn stable_line_claimed_by_distant_hunks_has_one_current_owner() {
-    let graph = Correspondence {
-        units: Vec::new(),
-        line_ending_edits: Vec::new(),
-        line_fallbacks: Vec::new(),
-        line_links: vec![crate::diff::correspondence::LineLink {
-            before: 3,
-            after: 8,
-        }],
-        leaf_links: Vec::new(),
-        before_leaf: Vec::new(),
-        after_leaf: Vec::new(),
-        composites: Vec::new(),
-    };
-    let alignment = LineAlignment::new(&graph, 12);
-    let line = |number, mark| DisplayLine {
-        number,
-        spans: vec![crate::diff::DisplaySpan {
-            text: "}".into(),
-            syntax: SyntaxClass::Punctuation,
-            mark,
-        }],
-    };
-    let signal = |before_line, after_line| {
-        DiffRow::Wordwise(crate::diff::WordDiff {
-            before_line: Some(before_line),
-            after_line: Some(after_line),
-            prefix: String::new(),
-            removed: "alpha".into(),
-            added: "beta".into(),
-            suffix: String::new(),
-        })
-    };
-    let mut hunks = vec![
-        Hunk {
-            coverage: LineCoverage {
-                before: Some(2..5),
-                after: Some(1..10),
-            },
-            rows: vec![DiffRow::Line(line(9, DiffMark::Context)), signal(2, 2)],
-        },
-        Hunk {
-            coverage: LineCoverage {
-                before: Some(10..13),
-                after: Some(8..11),
-            },
-            rows: vec![
-                DiffRow::LineChange {
-                    before: None,
-                    after: Some(line(9, DiffMark::Added)),
-                },
-                signal(11, 10),
-            ],
-        },
-    ];
-
-    normalize_stable_revision_rows(&mut hunks, &alignment);
-
-    let stable = hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .filter_map(current_line)
-        .filter(|line| line.number == 9)
-        .collect::<Vec<_>>();
-    assert_eq!(stable.len(), 1, "{hunks:#?}");
-    assert!(!stable[0].has_changes(), "{hunks:#?}");
-    assert!(!hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        matches!(row, DiffRow::LineChange { after: Some(line), .. } if line.number == 9)
-    }));
-    assert!(
-        hunks[1]
-            .rows
-            .iter()
-            .filter_map(current_line)
-            .any(|line| line.number == 9),
-        "the current structural claim owns the stable line: {hunks:#?}"
-    );
 }
 
 #[test]
@@ -418,50 +306,6 @@ fn extracted_payload_follows_its_new_declaration() {
             .all(|rows| rows[0].0 < rows[1].0 && rows[0].1 < rows[1].1),
         "extracted payload retains current source order: {hunks:#?}"
     );
-}
-
-#[test]
-fn deletion_gaps_are_stable_before_first_between_anchors_at_eof_and_when_empty() {
-    let graph = Correspondence {
-        units: Vec::new(),
-        line_ending_edits: Vec::new(),
-        line_fallbacks: Vec::new(),
-        line_links: vec![
-            crate::diff::correspondence::LineLink {
-                before: 1,
-                after: 0,
-            },
-            crate::diff::correspondence::LineLink {
-                before: 3,
-                after: 1,
-            },
-        ],
-        leaf_links: Vec::new(),
-        before_leaf: Vec::new(),
-        after_leaf: Vec::new(),
-        composites: Vec::new(),
-    };
-    let alignment = LineAlignment::new(&graph, 2);
-
-    assert_eq!(alignment.before_order(1).after_gap(), AfterGap::new(0));
-    assert_eq!(alignment.before_order(3).after_gap(), AfterGap::new(1));
-    assert_eq!(alignment.before_order(5).after_gap(), AfterGap::new(2));
-    assert!(alignment.before_order(3) < SourceOrder::current(2));
-
-    let empty = Correspondence {
-        units: Vec::new(),
-        line_ending_edits: Vec::new(),
-        line_fallbacks: Vec::new(),
-        line_links: Vec::new(),
-        leaf_links: Vec::new(),
-        before_leaf: Vec::new(),
-        after_leaf: Vec::new(),
-        composites: Vec::new(),
-    };
-    let empty = LineAlignment::new(&empty, 0);
-
-    assert_eq!(empty.before_order(1).after_gap(), AfterGap::BEFORE_FIRST);
-    assert_eq!(empty.current_anchor(1), None);
 }
 
 #[test]
@@ -603,24 +447,36 @@ fn reordered_subtree_inside_unit_is_not_rendered_as_all_context() {
 }
 
 #[test]
-fn exact_leaf_reparented_inside_unit_remains_visible() {
-    let before = "fn run() { left(alpha); right(beta); }\n";
-    let after = "fn run() { left(beta); right(alpha); }\n";
-    let hunks = planned("lib.rs", before, after);
+fn cross_parent_leaf_is_rendered_as_local_replacements() {
+    let before = "fn alpha() { beta(ALPHA); gamma(BETA); }\n";
+    let after = "fn alpha() { beta(BETA); gamma(ALPHA); }\n";
+    let hunks = planned("alpha.rs", before, after);
 
-    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        let DiffRow::Line(line) = row else {
-            return false;
-        };
-        line.spans
-            .iter()
-            .any(|span| span.text == "alpha" && span.mark == DiffMark::Added)
-    }));
+    assert!(
+        hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+            let DiffRow::LineChange {
+                before: Some(before),
+                after: Some(after),
+            } = row
+            else {
+                return false;
+            };
+            line_fragment_has_mark(before, "beta(ALPHA)", "ALPH", DiffMark::Removed)
+                && line_fragment_has_mark(before, "gamma(BETA)", "BET", DiffMark::Removed)
+                && line_fragment_has_mark(after, "beta(BETA)", "BET", DiffMark::Added)
+                && line_fragment_has_mark(after, "gamma(ALPHA)", "ALPH", DiffMark::Added)
+        }),
+        "{hunks:#?}"
+    );
 }
 
 #[test]
-fn wiring_units_share_affixes() {
-    let hunks = planned("lib.rs", "use crate::old_name;\n", "use crate::new_name;\n");
+fn unicode_edits_preserve_shared_affixes_and_byte_boundaries() {
+    let hunks = planned(
+        "alpha.rs",
+        "use crate::café_old_name;\nfn alpha() { beta(\"αoldω\"); }\n",
+        "use crate::café_new_name;\nfn alpha() { beta(\"αnewω\"); }\n",
+    );
     let word = hunks.iter().flat_map(|hunk| &hunk.rows).find_map(|row| {
         let DiffRow::Wordwise(word) = row else {
             return None;
@@ -629,10 +485,25 @@ fn wiring_units_share_affixes() {
     });
 
     let word = word.expect("wiring edit");
-    assert_eq!(word.prefix, "use crate::");
+    assert_eq!(word.prefix, "use crate::café_");
     assert_eq!(word.removed, "old");
     assert_eq!(word.added, "new");
     assert_eq!(word.suffix, "_name;");
+    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+        let DiffRow::LineChange {
+            before: Some(before),
+            after: Some(after),
+        } = row
+        else {
+            return false;
+        };
+        line_fragment_has_mark(before, "αoldω", "old", DiffMark::Removed)
+            && line_fragment_has_mark(before, "αoldω", "α", DiffMark::Context)
+            && line_fragment_has_mark(before, "αoldω", "ω", DiffMark::Context)
+            && line_fragment_has_mark(after, "αnewω", "new", DiffMark::Added)
+            && line_fragment_has_mark(after, "αnewω", "α", DiffMark::Context)
+            && line_fragment_has_mark(after, "αnewω", "ω", DiffMark::Context)
+    }));
 }
 
 #[test]
@@ -886,186 +757,64 @@ fn multiline_replacement_renders_each_revision_as_one_run() {
 }
 
 #[test]
-fn changed_chain_limits_replacement_to_linked_parent_context() {
+fn inserted_parameter_stays_wholly_added_ahead_of_a_changed_loop() {
     let before = concat!(
-        "fn alpha(node: Node) {\n",
-        "    if node.kind() == \"alpha\" {\n",
-        "        let beta = node\n",
-        "            .child_by_field_name(\"beta\")\n",
-        "            .map(|beta| beta.byte_range());\n",
-        "        consume(beta);\n",
+        "fn alpha(\n",
+        "    beta: &Beta,\n",
+        "    gamma: Gamma,\n",
+        "    delta: Delta,\n",
+        ") {\n",
+        "    let mut zeta = beta(gamma, delta);\n",
+        "    while let Some((eta, theta)) = zeta.pop_front() {\n",
+        "        let iota = beta(eta, theta);\n",
+        "        for kappa in iota {\n",
+        "            lambda(kappa);\n",
+        "        }\n",
         "    }\n",
         "}\n",
     );
     let after = concat!(
-        "fn alpha(node: Node) {\n",
-        "    if node.kind() == \"alpha\" || gamma(node) {\n",
-        "        let beta = node\n",
-        "            .child_by_field_name(\"beta\")\n",
-        "            .or_else(|| node.child_by_field_name(\"gamma\"))\n",
-        "            .map(|beta| beta.byte_range());\n",
-        "        consume(beta);\n",
+        "fn alpha(\n",
+        "    beta: &Beta,\n",
+        "    gamma: Gamma,\n",
+        "    delta: Delta,\n",
+        "    epsilon: Epsilon,\n",
+        ") {\n",
+        "    let mut zeta = beta(gamma, delta);\n",
+        "    while let Some((eta, theta)) = zeta.pop_front() {\n",
+        "        let iota = beta(eta, theta);\n",
+        "        let mu = gamma(&iota, epsilon);\n",
+        "        for (kappa, lambda) in iota.into_iter().zip(mu) {\n",
+        "            nu(kappa, lambda);\n",
+        "        }\n",
         "    }\n",
         "}\n",
     );
     let hunks = planned("alpha.rs", before, after);
-    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        matches!(
-            row,
-                DiffRow::Line(line)
-                    if line.number == 2
-                        && line.has_changes()
-                    && line_text(line).contains("gamma(node)")
-        )
-    }));
-    assert!(hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
-        matches!(
-            row,
-            DiffRow::Line(line)
-                if line.number == 4
-                    && !line.has_changes()
-                    && line_text(line).contains("child_by_field_name(\"beta\")")
-        )
-    }));
-    let replacement = hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .filter_map(|row| match row {
-            DiffRow::LineChange {
-                before: Some(line),
-                after: None,
-            } => Some(('-', line.number, line_text(line).trim().to_owned())),
-            DiffRow::LineChange {
-                before: None,
-                after: Some(line),
-            } => Some(('+', line.number, line_text(line).trim().to_owned())),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        replacement,
-        [(
-            '+',
-            5,
-            ".or_else(|| node.child_by_field_name(\"gamma\"))".to_owned(),
-        )],
-        "{hunks:#?}",
-    );
-}
-
-#[test]
-fn changed_loop_pattern_does_not_pair_with_an_inserted_parameter() {
-    let before = concat!(
-        "fn contextual_links(\n",
-        "    pair: &ProjectionPair<'_, '_>,\n",
-        "    before_unit: NodeId,\n",
-        "    after_unit: NodeId,\n",
-        "    before_fingerprints: &[NodeFingerprints],\n",
-        "    after_fingerprints: &[NodeFingerprints],\n",
-        ") -> ContextLinks {\n",
-        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
-        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
-        "        let pairs = contextual_child_matches(pair, before_parent, after_parent);\n",
-        "        for edge in pairs {\n",
-        "            link_context(edge);\n",
-        "        }\n",
-        "    }\n",
-        "}\n",
-    );
-    let after = concat!(
-        "fn contextual_links(\n",
-        "    pair: &ProjectionPair<'_, '_>,\n",
-        "    before_unit: NodeId,\n",
-        "    after_unit: NodeId,\n",
-        "    unit_placement: Placement,\n",
-        "    before_fingerprints: &[NodeFingerprints],\n",
-        "    after_fingerprints: &[NodeFingerprints],\n",
-        ") -> ContextLinks {\n",
-        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
-        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
-        "        let pairs = contextual_child_matches(pair, before_parent, after_parent);\n",
-        "        let placements = contextual_match_placements(&pairs);\n",
-        "        for (edge, placement) in pairs.into_iter().zip(placements) {\n",
-        "            link_context(edge, placement);\n",
-        "        }\n",
-        "    }\n",
-        "}\n",
-    );
-    let hunks = planned("correspondence.rs", before, after);
     let rows = hunks.iter().flat_map(|hunk| &hunk.rows).collect::<Vec<_>>();
-    let old_loop = rows
+    let loop_change = rows
         .iter()
         .position(|row| {
-            matches!(
-                row,
-                DiffRow::LineChange {
-                    before: Some(line),
-                    ..
-                } if line_text(line).contains("for edge in pairs")
-            )
+            current_line(row).is_some_and(|line| {
+                line_text(line).contains("for (kappa, lambda)") && line.has_changes()
+            })
         })
-        .expect("old loop header remains visible");
+        .unwrap_or_else(|| panic!("changed loop header remains visible: {hunks:#?}"));
     let parameter = rows
         .iter()
         .position(|row| {
-            current_line(row)
-                .is_some_and(|line| line_text(line).contains("unit_placement: Placement"))
+            current_line(row).is_some_and(|line| {
+                line_text(line).contains("epsilon: Epsilon")
+                    && line
+                        .spans
+                        .iter()
+                        .filter(|span| !span.text.trim().is_empty())
+                        .all(|span| span.mark == DiffMark::Added)
+            })
         })
-        .expect("inserted parameter remains visible");
+        .expect("inserted parameter remains wholly added");
 
-    assert!(parameter < old_loop, "{hunks:#?}");
-    assert!(!rows.iter().any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(before),
-                after: Some(after),
-            } if line_text(before).contains("for edge in pairs")
-                && line_text(after).contains("unit_placement: Placement")
-        )
-    }));
-}
-
-#[test]
-fn reordered_links_cannot_veto_stable_display_anchors() {
-    let before = "fn run() {\n    alpha();\n    beta();\n}\n";
-    let after = "fn run() {\n    beta();\n    alpha();\n}\n";
-    let pair = project_pair(Path::new("run.rs"), before, after, false).unwrap();
-    let node_on_line = |projection: &Projection<'_>, line: usize| {
-        projection
-            .nodes
-            .iter()
-            .position(|node| node.kind == "expression_statement" && node.lines.start == line)
-            .map(NodeId::new)
-            .expect("statement on source line")
-    };
-    let links = [
-        NodeLink {
-            before: node_on_line(&pair.before, 2),
-            after: node_on_line(&pair.after, 3),
-            placement: Placement::Stable,
-            reparented: false,
-        },
-        NodeLink {
-            before: node_on_line(&pair.before, 3),
-            after: node_on_line(&pair.after, 2),
-            placement: Placement::Reordered,
-            reparented: false,
-        },
-    ];
-    let facts = AnchorFacts::new(&pair);
-
-    let retained = retained_regions(&pair, &facts, &links, &(0..4), &(0..4));
-
-    assert!(matches!(
-        retained.as_slice(),
-        [RetainedRegion {
-            before,
-            after,
-            retention: Retention::Exact,
-        }] if *before == (1..2) && *after == (2..3)
-    ));
+    assert!(parameter < loop_change, "{hunks:#?}");
 }
 
 #[test]

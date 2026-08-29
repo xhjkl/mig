@@ -1,5 +1,5 @@
 use super::{
-    ContentChannel, Language, Leaf, NodeId, Projection, ProjectionHealth, ReviewUnit, SyntaxNode,
+    ContentChannel, CorrespondenceRole, Language, Leaf, NodeId, Projection, ReviewUnit, SyntaxNode,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -15,18 +15,8 @@ const MAX_SYNTAX_NODES: usize = 500_000;
 
 /// Source-owned failures fall back; frontend setup defects remain explicit errors.
 pub(super) enum ProjectFailure<'source> {
-    Fallback(SourceFailure<'source>, SyntaxFailure),
+    Fallback(Source<'source>),
     Setup(anyhow::Error),
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum SyntaxFailure {
-    Parse,
-    Complexity,
-}
-
-pub(super) struct SourceFailure<'source> {
-    pub(super) source: Source<'source>,
 }
 
 /// Parser-node view available only while a language adapter annotates the neutral arena.
@@ -81,6 +71,7 @@ pub(super) struct NodeAnnotation {
     pub(super) decoration: DecorationHint,
     /// Whether this semantic boundary may own decorations.
     pub(super) owns_decorations: bool,
+    pub(super) correspondence: CorrespondenceRole,
     /// Language-owned extent when the grammar stops before the semantic content does.
     pub(super) extent: Option<Range<usize>>,
     /// Treat the node's complete byte range as one payload and discard parser children.
@@ -173,23 +164,14 @@ fn project_with_node_limit<'source>(
     };
     let root = tree.root_node();
     if root.is_missing() {
-        return Err(ProjectFailure::Fallback(
-            SourceFailure { source },
-            SyntaxFailure::Parse,
-        ));
+        return Err(ProjectFailure::Fallback(source));
     }
     if tree_exceeds_node_limit(root, node_limit) {
-        return Err(ProjectFailure::Fallback(
-            SourceFailure { source },
-            SyntaxFailure::Complexity,
-        ));
+        return Err(ProjectFailure::Fallback(source));
     }
     let recovered = root.has_error();
     if recovered && !adapter.accepts_error_recovery(root, source.as_str()) {
-        return Err(ProjectFailure::Fallback(
-            SourceFailure { source },
-            SyntaxFailure::Parse,
-        ));
+        return Err(ProjectFailure::Fallback(source));
     }
 
     let highlight_queries = adapter
@@ -198,16 +180,9 @@ fn project_with_node_limit<'source>(
         .map_err(ProjectFailure::Setup)?;
     let highlights = collect_highlights(highlight_queries, root, source.as_str().as_bytes());
     let nodes = project_nodes(&source, root, adapter, &highlights);
-    let health = if recovered {
-        ProjectionHealth::Recovered
-    } else {
-        ProjectionHealth::Parsed
-    };
-
     Ok(Projection::from_nodes(
         source,
         adapter.projected_language(),
-        health,
         NodeId::new(0),
         nodes,
     ))
@@ -266,7 +241,7 @@ fn project_nodes(
     source: &Source<'_>,
     root: Node<'_>,
     adapter: &impl Adapter,
-    highlights: &HashMap<usize, Highlight>,
+    highlights: &HashMap<usize, SyntaxClass>,
 ) -> Vec<SyntaxNode> {
     let mut nodes = Vec::<SyntaxNode>::new();
     let mut decoration_hints = Vec::<DecorationHint>::new();
@@ -310,6 +285,7 @@ fn project_nodes(
                     }),
                     identity: None,
                     decoration_owner: None,
+                    correspondence: CorrespondenceRole::Transparent,
                     review: None,
                     named: false,
                     extra: false,
@@ -338,10 +314,22 @@ fn project_nodes(
             .unwrap_or(ContentChannel::Syntax);
         let inherited_syntax = highlights
             .get(&pending_node.node.id())
-            .map(|highlight| highlight.syntax)
+            .copied()
             .or(pending_node.inherited_syntax);
 
         let node = pending_node.node;
+        let parser_owns_local_content = ["body", "consequence", "alternative"]
+            .into_iter()
+            .any(|field| node.child_by_field_name(field).is_some());
+        let correspondence = if annotation.correspondence == CorrespondenceRole::HardOwner {
+            CorrespondenceRole::HardOwner
+        } else if annotation.correspondence == CorrespondenceRole::LocalOwner
+            || parser_owns_local_content
+        {
+            CorrespondenceRole::LocalOwner
+        } else {
+            CorrespondenceRole::Transparent
+        };
         let id = NodeId::new(nodes.len());
         if let Some(parent) = pending_node.parent {
             nodes[parent.index()].children.push(id);
@@ -389,6 +377,7 @@ fn project_nodes(
             leaf,
             identity: annotation.identity,
             decoration_owner: None,
+            correspondence,
             review: annotation.review,
             named: node.is_named(),
             extra: node.is_extra(),
@@ -528,16 +517,11 @@ fn fragment_pending<'tree>(
     })
 }
 
-#[derive(Clone, Copy)]
-struct Highlight {
-    syntax: SyntaxClass,
-}
-
 fn collect_highlights(
     queries: &[Query],
     root: Node<'_>,
     source: &[u8],
-) -> HashMap<usize, Highlight> {
+) -> HashMap<usize, SyntaxClass> {
     let mut highlights = HashMap::new();
     for query in queries {
         let mut cursor = QueryCursor::new();
@@ -549,7 +533,7 @@ fn collect_highlights(
             let Some(syntax) = syntax else {
                 continue;
             };
-            highlights.insert(capture.node.id(), Highlight { syntax });
+            highlights.insert(capture.node.id(), syntax);
         }
     }
     highlights
@@ -704,10 +688,7 @@ mod tests {
         };
         let result = project_with_node_limit(Source::new("fn {"), &adapter, 1);
 
-        assert!(matches!(
-            result,
-            Err(ProjectFailure::Fallback(_, SyntaxFailure::Complexity))
-        ));
+        assert!(matches!(result, Err(ProjectFailure::Fallback(_))));
         assert!(!adapter.called.get());
     }
 }

@@ -7,10 +7,10 @@ use tempfile::TempDir;
 fn clean_scan_does_not_require_a_git_executable() {
     let repository = TempDir::new().expect("temporary repository");
     git(repository.path(), &["init", "--quiet"]);
-    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(repository.path(), &["config", "user.name", "Alpha"]);
     git(
         repository.path(),
-        &["config", "user.email", "mig@example.invalid"],
+        &["config", "user.email", "alpha@example.invalid"],
     );
     fs::write(repository.path().join("tracked.txt"), "stable\n").expect("write tracked file");
     git(repository.path(), &["add", "tracked.txt"]);
@@ -35,10 +35,10 @@ fn clean_scan_does_not_require_a_git_executable() {
 fn commitish_resolution_does_not_require_a_git_executable() {
     let repository = TempDir::new().expect("temporary repository");
     git(repository.path(), &["init", "--quiet"]);
-    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(repository.path(), &["config", "user.name", "Alpha"]);
     git(
         repository.path(),
-        &["config", "user.email", "mig@example.invalid"],
+        &["config", "user.email", "alpha@example.invalid"],
     );
     git(
         repository.path(),

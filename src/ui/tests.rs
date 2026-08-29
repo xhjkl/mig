@@ -24,25 +24,25 @@ fn fixture_renders_as_a_quiet_inline_file_diff() {
     let buffer = terminal.backend().buffer();
     let screen = buffer_text(buffer);
     assert!(screen.contains(LABEL));
-    assert!(screen.contains("fn load_profile"));
-    assert!(screen.contains("cached.and_then(validate_profile)"));
-    assert!(screen.contains("- 26 │     // Cached profiles are already trusted."));
-    assert!(screen.contains("+ 19 │     // Cached profiles must be revalidated."));
+    assert!(screen.contains("fn gamma"));
+    assert!(screen.contains("epsilon.and_then(alpha)"));
+    assert!(screen.contains("- 26 │     // Alpha is already beta."));
+    assert!(screen.contains("+ 19 │     // Alpha must become beta."));
     assert!(screen.contains(" 24 │"));
-    assert!(screen.contains("fn should_refresh"));
-    assert!(screen.contains("Stale and legacy profiles need refreshing"));
-    assert!(screen.contains("profile.schema < 4 || age > Duration::from_secs(300)"));
-    assert!(screen.contains("fn display_label"));
+    assert!(screen.contains("fn epsilon"));
+    assert!(screen.contains("Alpha and beta need gamma"));
+    assert!(screen.contains("gamma.beta < 4 || alpha > Duration::from_secs(300)"));
+    assert!(screen.contains("fn zeta"));
     assert!(screen.contains(".to_owned().replace('\\n', \" \")"));
-    assert!(screen.contains("16 → 38 │ fn cache_key"));
+    assert!(screen.contains("16 → 38 │ fn beta"));
     assert!(screen.contains("⋮ │ ⋮"));
-    assert!(!screen.contains("session.tenant()"));
-    assert!(!screen.contains("key.push"), "{screen}");
+    assert!(!screen.contains("alpha.beta()"));
+    assert!(!screen.contains("delta.push"), "{screen}");
     assert!(screen.contains("43 │ }"));
-    assert_eq!(screen.matches("fn cache_key").count(), 1);
-    assert!(screen.contains("legacy_counter → {Metric, ReviewMeter}"));
-    assert!(screen.contains("25 │ fn render_response(profile: &Profile) -> Response {"));
-    assert!(screen.contains("~ 26 │     Response::new(StatusCode::OK, profile.display_name())"));
+    assert_eq!(screen.matches("fn beta").count(), 1);
+    assert!(screen.contains("theta → {Theta, Iota}"));
+    assert!(screen.contains("25 │ fn delta(gamma: &Gamma) -> Delta {"));
+    assert!(screen.contains("~ 26 │     Delta::new(Epsilon::ALPHA, gamma.alpha())"));
     assert!(screen.contains("27 │ }"));
 
     let lines = screen.lines().collect::<Vec<_>>();
@@ -52,11 +52,11 @@ fn fixture_renders_as_a_quiet_inline_file_diff() {
         .expect("move must have a closing row");
     let import = lines
         .iter()
-        .position(|line| line.contains("legacy_counter → {Metric, ReviewMeter}"))
+        .position(|line| line.contains("theta → {Theta, Iota}"))
         .expect("import must be rendered");
     let definition = lines
         .iter()
-        .position(|line| line.contains("fn load_profile"))
+        .position(|line| line.contains("fn gamma"))
         .expect("definition must be rendered");
     assert!(definition < move_end);
     assert!(move_end < import);
@@ -92,45 +92,25 @@ fn fixture_renders_as_a_quiet_inline_file_diff() {
     assert!(ascii_run_has_modifier(buffer, "16 │", Modifier::DIM));
     assert!(run_on_line_matches(
         buffer,
-        "already trusted",
-        "// Cached profiles ",
-        |cell| {
-            cell.fg == Palette::GHOST
-                && !cell.modifier.contains(Modifier::DIM)
-                && !cell.modifier.contains(Modifier::ITALIC)
-        }
-    ));
-    assert!(run_on_line_matches(
-        buffer,
-        "already trusted",
+        "already beta",
         "26 │",
         |cell| cell.fg == Palette::GHOST && !cell.modifier.contains(Modifier::DIM)
     ));
-    assert!(run_on_line_matches(
-        buffer,
-        "fn load_profile",
-        "fn",
-        |cell| {
-            cell.fg == softened_syntax_foreground(SyntaxClass::Keyword)
-                && !cell.modifier.contains(Modifier::DIM)
-                && !cell.modifier.contains(Modifier::BOLD)
-        }
-    ));
-    assert!(run_on_line_matches(
-        buffer,
-        "fn load_profile",
-        "ProfileCache",
-        |cell| {
-            cell.fg == softened_syntax_foreground(SyntaxClass::Type)
-                && !cell.modifier.contains(Modifier::DIM)
-        }
-    ));
+    assert!(run_on_line_matches(buffer, "fn gamma", "fn", |cell| {
+        cell.fg == softened_syntax_foreground(SyntaxClass::Keyword)
+            && !cell.modifier.contains(Modifier::DIM)
+            && !cell.modifier.contains(Modifier::BOLD)
+    }));
+    assert!(run_on_line_matches(buffer, "fn gamma", "Beta", |cell| {
+        cell.fg == softened_syntax_foreground(SyntaxClass::Type)
+            && !cell.modifier.contains(Modifier::DIM)
+    }));
     for (line, gutter) in [
-        ("already trusted", "26 │"),
-        ("must be revalidated", "19 │"),
-        ("cached.and_then", "20 │"),
-        ("Response::new", "26 │"),
-        ("legacy_counter", "3 │"),
+        ("already beta", "26 │"),
+        ("must become beta", "19 │"),
+        ("epsilon.and_then", "20 │"),
+        ("Delta::new", "26 │"),
+        ("theta", "3 │"),
     ] {
         assert!(run_on_line_matches(buffer, line, gutter, |cell| {
             !cell.modifier.contains(Modifier::DIM)
@@ -138,44 +118,34 @@ fn fixture_renders_as_a_quiet_inline_file_diff() {
     }
     assert!(run_on_line_matches(
         buffer,
-        "legacy_counter",
-        "use crate::telemetry::",
+        "theta",
+        "use crate::gamma::",
         |cell| {
             cell.fg == softened_syntax_foreground(SyntaxClass::Plain)
                 && !cell.modifier.contains(Modifier::DIM)
         }
     ));
-    assert!(run_on_line_matches(
-        buffer,
-        "fn render_response",
-        "fn",
-        |cell| {
-            cell.fg == softened_syntax_foreground(SyntaxClass::Keyword)
-                && !cell.modifier.contains(Modifier::DIM)
-        }
-    ));
-    assert!(run_on_line_matches(buffer, "fn cache_key", "fn", |cell| {
+    assert!(run_on_line_matches(buffer, "fn delta", "fn", |cell| {
         cell.fg == softened_syntax_foreground(SyntaxClass::Keyword)
+            && !cell.modifier.contains(Modifier::DIM)
+    }));
+    assert!(run_on_line_matches(buffer, "fn beta", "fn", |cell| {
+        cell.fg == softened_syntax_foreground(SyntaxClass::Keyword)
+            && !cell.modifier.contains(Modifier::DIM)
+    }));
+    assert!(run_on_line_matches(buffer, "Delta::new", "Delta", |cell| {
+        cell.fg == softened_syntax_foreground(SyntaxClass::Type)
             && !cell.modifier.contains(Modifier::DIM)
     }));
     assert!(run_on_line_matches(
         buffer,
-        "Response::new",
-        "Response",
-        |cell| {
-            cell.fg == softened_syntax_foreground(SyntaxClass::Type)
-                && !cell.modifier.contains(Modifier::DIM)
-        }
-    ));
-    assert!(run_on_line_matches(
-        buffer,
-        "cached.and_then",
-        ".and_then(validate_profile)",
+        "epsilon.and_then",
+        ".and_then(alpha)",
         |cell| { cell.fg == Palette::CURRENT && cell.modifier.contains(Modifier::BOLD) }
     ));
     for (line, removed) in [
-        ("already trusted", "already"),
-        ("legacy_counter → {Metric, ReviewMeter}", "legacy_counter"),
+        ("already beta", "already"),
+        ("theta → {Theta, Iota}", "theta"),
     ] {
         assert!(run_on_line_matches(buffer, line, removed, |cell| {
             cell.fg == Palette::GHOST_EMPHASIS && cell.modifier.contains(Modifier::BOLD)
@@ -183,14 +153,14 @@ fn fixture_renders_as_a_quiet_inline_file_diff() {
     }
     assert!(run_on_line_matches(
         buffer,
-        "legacy_counter → {Metric, ReviewMeter}",
-        "{Metric, ReviewMeter}",
+        "theta → {Theta, Iota}",
+        "{Theta, Iota}",
         |cell| { cell.fg == Palette::CURRENT && cell.modifier.contains(Modifier::BOLD) }
     ));
     for (line, marker, foreground) in [
-        ("already trusted", "- ", Palette::GHOST),
-        ("must be revalidated", "+ ", Palette::CURRENT),
-        ("Response::new", "~ ", Palette::FAINT),
+        ("already beta", "- ", Palette::GHOST),
+        ("must become beta", "+ ", Palette::CURRENT),
+        ("Delta::new", "~ ", Palette::FAINT),
     ] {
         assert!(run_on_line_matches(buffer, line, marker, |cell| {
             cell.fg == foreground && !cell.modifier.contains(Modifier::BOLD)
@@ -419,7 +389,7 @@ fn html_wrapper_surrounds_one_reflowed_image_with_additions() {
 
     let screen = buffer_text(terminal.backend().buffer());
     let opening = screen
-        .find("+ 2 │   <div class=\"profile-card__portrait\">")
+        .find("+ 2 │   <div class=\"alpha__gamma\">")
         .expect("added wrapper opening");
     let image = screen
         .find("~ 3 │     <img")
@@ -428,20 +398,20 @@ fn html_wrapper_surrounds_one_reflowed_image_with_additions() {
         .find("+ 8 │   </div>")
         .expect("added wrapper closing");
     assert!(opening < image && image < closing);
-    assert_eq!(screen.matches("src=\"/avatars/ada.webp\"").count(), 1);
+    assert_eq!(screen.matches("src=\"alpha.webp\"").count(), 1);
     assert!(!screen.contains("- 2 │   <img"));
 }
 
 #[test]
 fn tabbed_html_reflow_renders_current_source_indentation() {
-    let before = "<article>\n\t<img\n\t\tsrc=\"avatar.webp\"\n\t/>\n</article>\n";
+    let before = "<article>\n\t<img\n\t\tsrc=\"alpha.webp\"\n\t/>\n</article>\n";
     let after = concat!(
         "<article>\n",
         "\t<div>\n",
         "\t\t<img",
         "                           ",
         "\n",
-        "\t\t\tsrc=\"avatar.webp\"\n",
+        "\t\t\tsrc=\"alpha.webp\"\n",
         "\t\t/>\n",
         "\t</div>\n",
         "</article>\n",
@@ -459,7 +429,7 @@ fn tabbed_html_reflow_renders_current_source_indentation() {
     for expected in [
         "+ 2 │     <div>",
         "~ 3 │         <img",
-        "~ 4 │             src=\"avatar.webp\"",
+        "~ 4 │             src=\"alpha.webp\"",
         "~ 5 │         />",
         "+ 6 │     </div>",
     ] {

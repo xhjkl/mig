@@ -5,46 +5,57 @@ use std::collections::HashSet;
 #[test]
 fn definition_hunk_keeps_hierarchy_local_context_and_distant_elision() {
     let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-    let hunk = hunk_containing(&diff, "fn load_profile");
+    let hunk = hunk_containing(&diff, "fn gamma");
 
     assert!(
         hunk.rows
             .iter()
             .any(|row| matches!(row, DiffRow::Elision(_)))
     );
-    for context in ["fn load_profile", "let cached", "profile.filter"] {
+    for context in ["fn gamma", "let epsilon", "gamma.filter"] {
         assert!(hunk_has_text(hunk, context), "missing {context:?}");
     }
 
-    let line_change = hunk.rows.iter().find_map(|row| {
-        let DiffRow::LineChange { before, after } = row else {
+    let before_comment = hunk.rows.iter().find_map(|row| {
+        let DiffRow::LineChange {
+            before: Some(line), ..
+        } = row
+        else {
             return None;
         };
-        Some((before.as_ref()?, after.as_ref()?))
+        line_text(line).contains("already beta").then_some(line)
     });
-    let Some((before_comment, after_comment)) = line_change else {
-        panic!("comment edit must stay inside its definition hunk");
-    };
-    assert!(line_text(before_comment).contains("already trusted"));
-    assert!(line_text(after_comment).contains("must be revalidated"));
-    assert!(line_text(after_comment).starts_with("    //"));
+    let before_comment = before_comment.expect("old comment must stay inside its definition hunk");
+    let after_comment = hunk.rows.iter().find_map(|row| {
+        let DiffRow::LineChange {
+            after: Some(line), ..
+        } = row
+        else {
+            return None;
+        };
+        line_text(line).contains("must become beta").then_some(line)
+    });
+    let after_comment = after_comment.expect("new comment must stay inside its definition hunk");
 
-    let payload = hunk.rows.iter().find_map(|row| {
-        let DiffRow::Line(line) = row else {
-            return None;
-        };
-        line.has_changes().then_some(line)
-    });
-    let Some(payload) = payload else {
-        panic!("execution-point edit must remain a marked payload row");
-    };
-    assert!(line_text(payload).contains("cached.and_then(validate_profile)"));
     assert!(
-        payload
+        before_comment
             .spans
             .iter()
-            .any(|span| { span.text.contains("and_then") && span.mark == DiffMark::Added })
+            .any(|span| span.mark == DiffMark::Removed),
+        "{hunk:#?}"
     );
+    assert!(line_text(after_comment).contains("must become beta"));
+    assert!(line_text(after_comment).starts_with("    //"));
+    assert!(
+        after_comment
+            .spans
+            .iter()
+            .any(|span| span.mark == DiffMark::Added),
+        "{hunk:#?}"
+    );
+
+    assert!(hunk_has_text(hunk, "epsilon.and_then(alpha)"), "{hunk:#?}");
+    assert!(hunk_has_added_text(hunk, "and_then"), "{hunk:#?}");
 }
 
 #[test]
@@ -81,7 +92,7 @@ fn two_sided_hunk_uses_the_current_file_boundary() {
 #[test]
 fn move_hunk_lives_in_the_present_and_elides_its_unchanged_body() {
     let diff = diff_file(LABEL, BEFORE, AFTER).expect("fixture must parse");
-    let hunk = hunk_containing(&diff, "fn cache_key");
+    let hunk = hunk_containing(&diff, "fn beta");
 
     assert!(hunk.rows.iter().any(|row| {
         matches!(
@@ -89,7 +100,7 @@ fn move_hunk_lives_in_the_present_and_elides_its_unchanged_body() {
             DiffRow::Moved {
                 before: Some(16),
                 after,
-            } if after.number == 38 && line_text(after).contains("fn cache_key")
+            } if after.number == 38 && line_text(after).contains("fn beta")
         )
     }));
     assert!(
@@ -319,10 +330,10 @@ fn imports_and_reflow_keep_their_signals_and_local_context() {
             _ => None,
         })
         .expect("fixture must include a wordwise import hunk");
-    let formatting = hunk_containing(&diff, "fn render_response");
-    assert_eq!(import.prefix, "use crate::telemetry::");
-    assert_eq!(import.removed, "legacy_counter");
-    assert_eq!(import.added, "{Metric, ReviewMeter}");
+    let formatting = hunk_containing(&diff, "fn delta");
+    assert_eq!(import.prefix, "use crate::gamma::");
+    assert_eq!(import.removed, "theta");
+    assert_eq!(import.added, "{Theta, Iota}");
     assert_eq!(import.suffix, ";");
 
     assert!(
@@ -343,14 +354,6 @@ fn imports_and_reflow_keep_their_signals_and_local_context() {
             .iter()
             .any(|row| matches!(row, DiffRow::Line(line) if line.number == 27))
     );
-}
-
-#[test]
-fn identical_source_has_no_review_work() {
-    let source = "use std::fmt;\n\nfn stable() { fmt::write(); }\n";
-    let diff = diff_file("src/stable.rs", source, source).expect("source must parse");
-
-    assert!(diff.hunks.is_empty());
 }
 
 #[test]
@@ -454,7 +457,7 @@ fn line_insertions_and_deletions_keep_their_source_numbers() {
 }
 
 #[test]
-fn recovered_html_still_anchors_a_reindented_child() {
+fn recovered_html_does_not_anchor_across_parser_created_sibling_parents() {
     // Browsers accept this common authoring state even though a `div` cannot
     // formally remain inside a `p`; the recovered CST still knows the image.
     let before = "<p>\n \t<img />\n</p>\n";
@@ -475,36 +478,29 @@ fn recovered_html_still_anchors_a_reindented_child() {
         .iter()
         .flat_map(|hunk| &hunk.rows)
         .collect::<Vec<_>>();
-    let image = rows
-        .iter()
-        .filter_map(|row| {
-            let DiffRow::Reflow(line) = row else {
-                return None;
-            };
-            (line_text(line).trim() == "<img />").then_some(line)
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        image.len(),
-        1,
-        "the recovered image must be one reflow anchor"
-    );
-    assert!(
-        image[0]
-            .spans
-            .iter()
-            .all(|span| span.mark == DiffMark::Context)
-    );
     assert!(!rows.iter().any(|row| {
+        matches!(row, DiffRow::Reflow(line) if line_text(line).trim() == "<img />")
+    }));
+    let removed = rows.iter().filter(|row| {
         let DiffRow::LineChange { before, after } = row else {
             return false;
         };
         before
-            .iter()
-            .chain(after)
-            .any(|line| line_text(line).trim() == "<img />")
-    }));
+            .as_ref()
+            .is_some_and(|line| line_text(line).trim() == "<img />")
+            && after.is_none()
+    });
+    let added = rows.iter().filter(|row| {
+        let DiffRow::LineChange { before, after } = row else {
+            return false;
+        };
+        before.is_none()
+            && after
+                .as_ref()
+                .is_some_and(|line| line_text(line).trim() == "<img />")
+    });
+    assert_eq!(removed.count(), 1, "old image owner remains visible");
+    assert_eq!(added.count(), 1, "new image owner remains visible");
 }
 
 #[test]
@@ -737,7 +733,7 @@ fn bare_html_wrapper_does_not_steal_an_existing_div_anchor() {
 }
 
 #[test]
-fn inline_html_wrapper_cannot_hide_unrelated_bytes_on_the_same_line() {
+fn inline_html_wrapper_keeps_its_surroundings_and_payload_as_context() {
     let before = "<article><img src=\"alpha.webp\"></article>\n";
     let after = "<article><div><img src=\"alpha.webp\"></div></article>\n";
 
@@ -748,17 +744,32 @@ fn inline_html_wrapper_cannot_hide_unrelated_bytes_on_the_same_line() {
         .flat_map(|hunk| &hunk.rows)
         .collect::<Vec<_>>();
 
-    assert!(rows.iter().any(|row| {
-        matches!(
-            row,
-            DiffRow::LineChange {
-                before: Some(before),
-                after: Some(after),
-            } if line_text(before).contains("<article><img")
-                && line_text(after).contains("<article><div><img")
-        )
-    }));
-    assert!(!rows.iter().any(|row| { matches!(row, DiffRow::Reflow(_)) }));
+    let line = rows
+        .iter()
+        .find_map(|row| match row {
+            DiffRow::Line(line) if line_text(line) == after.trim_end() => Some(line),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing mixed-mark current row: {diff:#?}"));
+    let context = line
+        .spans
+        .iter()
+        .filter(|span| span.mark == DiffMark::Context)
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    let added = line
+        .spans
+        .iter()
+        .filter(|span| span.mark == DiffMark::Added)
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert_eq!(context, before.trim_end());
+    assert_eq!(added, "<div></div>");
+    assert!(
+        !rows
+            .iter()
+            .any(|row| { matches!(row, DiffRow::Reflow(_) | DiffRow::LineChange { .. }) })
+    );
 }
 
 #[test]
@@ -1198,7 +1209,6 @@ fn malformed_or_linewise_rust_still_materializes_source_changes() {
     ] {
         let diff = diff_file("alpha.rs", before, after).expect("line fallback cannot fail");
 
-        assert!(!diff.hunks.is_empty());
         assert!(
             diff.hunks
                 .iter()

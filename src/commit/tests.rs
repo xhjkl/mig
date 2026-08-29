@@ -185,10 +185,10 @@ fn sha256_root_commit_uses_the_repository_empty_tree() {
             "--object-format=sha256",
         ],
     );
-    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(repository.path(), &["config", "user.name", "Alpha"]);
     git(
         repository.path(),
-        &["config", "user.email", "mig@example.invalid"],
+        &["config", "user.email", "alpha@example.invalid"],
     );
     write(repository.path(), "root.txt", "root\n");
     git(repository.path(), &["add", "."]);
@@ -209,10 +209,10 @@ fn initialized_repository() -> TempDir {
         repository.path(),
         &["init", "--quiet", "--initial-branch=main"],
     );
-    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(repository.path(), &["config", "user.name", "Alpha"]);
     git(
         repository.path(),
-        &["config", "user.email", "mig@example.invalid"],
+        &["config", "user.email", "alpha@example.invalid"],
     );
     repository
 }

@@ -1,5 +1,6 @@
 //! Symmetric neutral CST projections; an exact line-leaf tree is the universal fallback.
 
+mod c;
 mod css;
 mod html;
 mod line;
@@ -32,6 +33,7 @@ impl NodeId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum Language {
     Lines,
+    C,
     Rust,
     Html,
     Css,
@@ -39,32 +41,6 @@ pub(crate) enum Language {
     Tsx,
     JavaScript,
     Jsx,
-}
-
-/// Why a pair could not safely use its selected syntax grammar.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum FallbackReason {
-    Generated,
-    Unsupported,
-    ParseError(ParseSide),
-    SyntaxComplexity(ParseSide),
-}
-
-/// Revision whose parse prevented symmetric syntax correspondence.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ParseSide {
-    Before,
-    After,
-    Both,
-}
-
-/// Whether an arena came from a complete parse, certified recovery, or exact line fallback.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ProjectionHealth {
-    Parsed,
-    /// Byte-total grammar recovery accepted by the language adapter.
-    Recovered,
-    Fallback(FallbackReason),
 }
 
 /// Whether leaf payload participates as syntax, commentary, or exact opaque text.
@@ -111,6 +87,18 @@ pub(crate) enum LayoutOwnership {
     AdjacentBlankLines,
 }
 
+/// How one syntax occurrence participates in correspondence under its paired parent.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) enum CorrespondenceRole {
+    /// Grammar scaffolding eligible for exact matching and unique containment.
+    #[default]
+    Transparent,
+    /// Contents pair locally before their payload can influence another sibling.
+    LocalOwner,
+    /// Semantic owner whose unmatched descendants cannot escape into another owner.
+    HardOwner,
+}
+
 /// Frontend-selected review behavior and layout ownership for one syntax node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReviewUnit {
@@ -149,6 +137,7 @@ pub(crate) struct SyntaxNode {
     pub(crate) identity: Option<Range<usize>>,
     /// Semantic syntax node decorated by this occurrence, independent of source extent.
     pub(crate) decoration_owner: Option<NodeId>,
+    pub(crate) correspondence: CorrespondenceRole,
     /// Presence promotes this syntax node to an independently matched review unit.
     pub(crate) review: Option<ReviewUnit>,
     pub(crate) named: bool,
@@ -156,16 +145,29 @@ pub(crate) struct SyntaxNode {
     pub(crate) missing: bool,
 }
 
+impl SyntaxNode {
+    /// Whether this node establishes an uncrossable breadth domain.
+    pub(crate) const fn is_hard_owner(&self) -> bool {
+        matches!(self.correspondence, CorrespondenceRole::HardOwner)
+    }
+
+    /// Whether this node fences correspondence to its own matched parent pair.
+    pub(crate) const fn is_scope_boundary(&self) -> bool {
+        self.leaf.is_none() || self.review.is_some()
+    }
+}
+
 /// Source plus a parser-independent arena suitable for graph correspondence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Projection<'source> {
     pub(crate) source: Source<'source>,
     pub(crate) language: Language,
-    pub(crate) health: ProjectionHealth,
     pub(crate) root: NodeId,
     pub(crate) nodes: Vec<SyntaxNode>,
     /// Source-ordered leaves keep presentation and source certification linear.
     leaves: Vec<NodeId>,
+    /// Exclusive preorder end of each node's contiguous subtree.
+    subtree_ends: Vec<usize>,
 }
 
 impl<'source> Projection<'source> {
@@ -173,7 +175,6 @@ impl<'source> Projection<'source> {
     pub(super) fn from_nodes(
         source: Source<'source>,
         language: Language,
-        health: ProjectionHealth,
         root: NodeId,
         nodes: Vec<SyntaxNode>,
     ) -> Self {
@@ -182,16 +183,24 @@ impl<'source> Projection<'source> {
             .enumerate()
             .filter_map(|(index, node)| node.leaf.map(|_| NodeId::new(index)))
             .collect::<Vec<_>>();
+        let mut subtree_ends = (1..=nodes.len()).collect::<Vec<_>>();
+        for index in (0..nodes.len()).rev() {
+            let Some(parent) = nodes[index].parent else {
+                continue;
+            };
+            debug_assert!(parent.index() < index, "projection arenas are preorder");
+            subtree_ends[parent.index()] = subtree_ends[parent.index()].max(subtree_ends[index]);
+        }
         debug_assert!(leaves.windows(2).all(|pair| {
             nodes[pair[0].index()].bytes.start <= nodes[pair[1].index()].bytes.start
         }));
         Self {
             source,
             language,
-            health,
             root,
             nodes,
             leaves,
+            subtree_ends,
         }
     }
 
@@ -231,19 +240,12 @@ impl<'source> Projection<'source> {
 
     /// Arena descendants in source preorder, excluding the supplied root.
     pub(crate) fn descendants(&self, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        let mut descendants = Vec::new();
-        let mut pending = self
-            .node(root)
-            .children
-            .iter()
-            .rev()
-            .copied()
-            .collect::<Vec<_>>();
-        while let Some(node) = pending.pop() {
-            descendants.push(node);
-            pending.extend(self.node(node).children.iter().rev().copied());
-        }
-        descendants.into_iter()
+        (root.index() + 1..self.subtree_ends[root.index()]).map(NodeId::new)
+    }
+
+    /// Whether one arena node belongs to another node's preorder subtree.
+    pub(crate) fn contains(&self, outer: NodeId, inner: NodeId) -> bool {
+        outer.index() <= inner.index() && inner.index() < self.subtree_ends[outer.index()]
     }
 
     /// Independently matched review units in source preorder.
@@ -253,6 +255,35 @@ impl<'source> Projection<'source> {
             Some((NodeId::new(index), node))
         })
     }
+}
+
+/// Whether one syntax node owns complete physical rows apart from indentation.
+pub(crate) fn node_is_line_isolated(projection: &Projection<'_>, node: NodeId) -> bool {
+    let node = projection.node(node);
+    let Some(first) = projection.source.line(node.lines.start) else {
+        return false;
+    };
+    let Some(last_number) = node.lines.end.checked_sub(1) else {
+        return false;
+    };
+    let Some(last) = projection.source.line(last_number) else {
+        return false;
+    };
+    if node.bytes.start < first.content_bytes.start || node.bytes.end > last.content_bytes.end {
+        return false;
+    }
+
+    let prefix = projection
+        .source
+        .slice(first.content_bytes.start..node.bytes.start);
+    let suffix = projection
+        .source
+        .slice(node.bytes.end..last.content_bytes.end);
+    prefix.is_some_and(horizontal_layout) && suffix.is_some_and(horizontal_layout)
+}
+
+pub(crate) fn horizontal_layout(text: &str) -> bool {
+    text.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
 }
 
 /// Symmetric before/after projections selected as one atomic frontend decision.
@@ -270,12 +301,12 @@ pub(crate) fn project_pair<'before, 'after>(
     generated: bool,
 ) -> Result<ProjectionPair<'before, 'after>> {
     if generated {
-        return Ok(line_pair(before, after, FallbackReason::Generated));
+        return Ok(line_pair(before, after));
     }
 
     let language = language_for_path(path);
     let Some(language) = language else {
-        return Ok(line_pair(before, after, FallbackReason::Unsupported));
+        return Ok(line_pair(before, after));
     };
 
     let before = project_language(language, Source::new(before));
@@ -294,23 +325,15 @@ pub(crate) fn project_pair<'before, 'after>(
     };
     match (before, after) {
         (
-            Err(tree_sitter::ProjectFailure::Fallback(before, before_reason)),
-            Err(tree_sitter::ProjectFailure::Fallback(after, after_reason)),
-        ) => Ok(line_pair(
-            before.source.as_str(),
-            after.source.as_str(),
-            fallback_reason(before_reason, Some(after_reason), ParseSide::Both),
-        )),
-        (Err(tree_sitter::ProjectFailure::Fallback(before, reason)), Ok(after)) => Ok(line_pair(
-            before.source.as_str(),
-            after.source.as_str(),
-            fallback_reason(reason, None, ParseSide::Before),
-        )),
-        (Ok(before), Err(tree_sitter::ProjectFailure::Fallback(after, reason))) => Ok(line_pair(
-            before.source.as_str(),
-            after.source.as_str(),
-            fallback_reason(reason, None, ParseSide::After),
-        )),
+            Err(tree_sitter::ProjectFailure::Fallback(before)),
+            Err(tree_sitter::ProjectFailure::Fallback(after)),
+        ) => Ok(line_pair(before.as_str(), after.as_str())),
+        (Err(tree_sitter::ProjectFailure::Fallback(before)), Ok(after)) => {
+            Ok(line_pair(before.as_str(), after.source.as_str()))
+        }
+        (Ok(before), Err(tree_sitter::ProjectFailure::Fallback(after))) => {
+            Ok(line_pair(before.source.as_str(), after.as_str()))
+        }
         (Ok(before), Ok(after)) => Ok(ProjectionPair { before, after }),
         (Err(tree_sitter::ProjectFailure::Setup(_)), _)
         | (_, Err(tree_sitter::ProjectFailure::Setup(_))) => {
@@ -319,24 +342,12 @@ pub(crate) fn project_pair<'before, 'after>(
     }
 }
 
-fn fallback_reason(
-    reason: tree_sitter::SyntaxFailure,
-    other: Option<tree_sitter::SyntaxFailure>,
-    side: ParseSide,
-) -> FallbackReason {
-    if matches!(reason, tree_sitter::SyntaxFailure::Complexity)
-        || matches!(other, Some(tree_sitter::SyntaxFailure::Complexity))
-    {
-        return FallbackReason::SyntaxComplexity(side);
-    }
-    FallbackReason::ParseError(side)
-}
-
 fn project_language<'source>(
     language: Language,
     source: Source<'source>,
 ) -> std::result::Result<Projection<'source>, tree_sitter::ProjectFailure<'source>> {
     match language {
+        Language::C => c::project(source),
         Language::Rust => rust::project(source),
         Language::Html => html::project(source),
         Language::Css => css::project(source),
@@ -352,11 +363,10 @@ fn project_language<'source>(
 pub(crate) fn line_pair<'before, 'after>(
     before: &'before str,
     after: &'after str,
-    reason: FallbackReason,
 ) -> ProjectionPair<'before, 'after> {
     ProjectionPair {
-        before: line::project(Source::new(before), reason),
-        after: line::project(Source::new(after), reason),
+        before: line::project(Source::new(before)),
+        after: line::project(Source::new(after)),
     }
 }
 
@@ -364,6 +374,7 @@ fn language_for_path(path: &Path) -> Option<Language> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
         "rs" => Some(Language::Rust),
+        "c" | "h" => Some(Language::C),
         "html" | "htm" => Some(Language::Html),
         "css" => Some(Language::Css),
         "ts" | "mts" | "cts" => Some(Language::TypeScript),

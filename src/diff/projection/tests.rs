@@ -4,10 +4,7 @@ use super::*;
 fn line_projection_is_an_exact_leaf_cst_including_terminators() {
     let pair = project_pair(Path::new("notes.txt"), "a\r\n\nlast", "", false).unwrap();
 
-    assert_eq!(
-        pair.before.health,
-        ProjectionHealth::Fallback(FallbackReason::Unsupported)
-    );
+    assert_eq!(pair.before.language, Language::Lines);
     let root = pair.before.node(pair.before.root);
     let payloads = root
         .children
@@ -30,48 +27,34 @@ fn one_bad_parse_falls_both_revisions_back_to_lines() {
 
     assert_eq!(pair.before.language, Language::Lines);
     assert_eq!(pair.after.language, Language::Lines);
-    assert_eq!(
-        pair.before.health,
-        ProjectionHealth::Fallback(FallbackReason::ParseError(ParseSide::After))
-    );
-    assert_eq!(pair.before.health, pair.after.health);
 }
 
 #[test]
-fn html_optional_paragraph_end_tag_keeps_structural_anchors() {
-    use crate::diff::correspondence::correspond;
-
+fn recovered_html_places_the_image_under_the_parser_created_div() {
     let before = "<p>\n \t<img />\n</p>\n";
     let after = concat!(
         "<p>\n",
         "\t<div\n",
-        "\t\tid=\"gege\"\n",
-        "\t\tx-aria=\"takogoNet\"\t\n",
+        "\t\tid=\"alpha\"\n",
+        "\t\tdata-beta=\"gamma\"\t\n",
         "\t>\n",
         " \t\t<img />\n",
         "\t</div>\n",
         "</p>\n",
     );
-    let pair = project_pair(Path::new("view.html"), before, after, false).unwrap();
+    let pair = project_pair(Path::new("alpha.html"), before, after, false).unwrap();
 
     assert_eq!(pair.before.language, Language::Html);
     assert_eq!(pair.after.language, Language::Html);
-    assert_eq!(pair.before.health, ProjectionHealth::Parsed);
-    assert_eq!(pair.after.health, ProjectionHealth::Recovered);
-
     let before_img = node_with_identity(&pair.before, "img");
+    let before_paragraph = node_with_identity(&pair.before, "p");
     let after_img = node_with_identity(&pair.after, "img");
+    let after_paragraph = node_with_identity(&pair.after, "p");
     let after_div = node_with_identity(&pair.after, "div");
-    assert!(is_descendant(&pair.after, after_img, after_div));
 
-    let graph = correspond(&pair);
-    assert!(graph.line_fallbacks.is_empty());
-    assert!(graph.composites.iter().any(|link| {
-        link.before == before_img
-            && link.after == after_img
-            && link.reparented
-            && link.placement == crate::diff::correspondence::Placement::Stable
-    }));
+    assert!(is_descendant(&pair.before, before_img, before_paragraph));
+    assert!(is_descendant(&pair.after, after_img, after_div));
+    assert!(!is_descendant(&pair.after, after_img, after_paragraph));
 }
 
 #[test]
@@ -91,11 +74,6 @@ fn html_nonlocal_raw_text_errors_remain_line_fallback() {
 
     assert_eq!(pair.before.language, Language::Lines);
     assert_eq!(pair.after.language, Language::Lines);
-    assert_eq!(
-        pair.before.health,
-        ProjectionHealth::Fallback(FallbackReason::ParseError(ParseSide::After))
-    );
-    assert_eq!(pair.before.health, pair.after.health);
 }
 
 #[test]
@@ -104,10 +82,6 @@ fn generated_source_never_enters_a_language_grammar() {
 
     assert_eq!(pair.before.language, Language::Lines);
     assert_eq!(pair.after.language, Language::Lines);
-    assert_eq!(
-        pair.before.health,
-        ProjectionHealth::Fallback(FallbackReason::Generated)
-    );
 }
 
 #[test]
@@ -125,15 +99,56 @@ fn web_extensions_select_real_grammars() {
         let pair = project_pair(Path::new(path), source, source, false).unwrap();
         assert_eq!(pair.before.language, language, "{path}");
         assert_eq!(pair.after.language, language, "{path}");
-        assert_eq!(pair.before.health, ProjectionHealth::Parsed, "{path}");
+    }
+}
+
+#[test]
+fn c_extensions_select_structural_function_owners() {
+    let source = concat!(
+        "static int alpha(void) { return 0; }\n",
+        "static int beta(void) { return alpha(); }\n",
+    );
+
+    for path in ["alpha.c", "alpha.h"] {
+        let pair = project_pair(Path::new(path), source, source, false).unwrap();
+        assert_eq!(pair.before.language, Language::C, "{path}");
+        let functions = pair
+            .before
+            .review_units()
+            .filter(|(_, node)| node.kind == "function_definition")
+            .map(|(id, node)| {
+                (
+                    pair.before.identity_text(id),
+                    node.correspondence,
+                    node.review.unwrap().mode,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            functions,
+            [
+                (
+                    Some("alpha"),
+                    CorrespondenceRole::HardOwner,
+                    ReviewMode::Structural,
+                ),
+                (
+                    Some("beta"),
+                    CorrespondenceRole::HardOwner,
+                    ReviewMode::Structural,
+                ),
+            ],
+            "{path}"
+        );
     }
 }
 
 #[test]
 fn html_wrapper_and_child_are_distinct_trackable_nodes() {
-    let before = "<article>\n  <img src=\"ada.webp\">\n</article>\n";
+    let before = "<article>\n  <img src=\"alpha.webp\">\n</article>\n";
     let after =
-        "<article>\n  <div class=\"portrait\">\n    <img src=\"ada.webp\">\n  </div>\n</article>\n";
+        "<article>\n  <div class=\"beta\">\n    <img src=\"alpha.webp\">\n  </div>\n</article>\n";
     let pair = project_pair(Path::new("view.html"), before, after, false).unwrap();
 
     let before_img = node_with_identity(&pair.before, "img");

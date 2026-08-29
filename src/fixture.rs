@@ -8,108 +8,108 @@ pub struct Fixture {
     pub after: &'static str,
 }
 
-/// Display name for Mig's structural-review fixture.
-pub const LABEL: &str = "src/profile.rs";
+/// Display name for the metasyntactic structural-review fixture.
+pub const LABEL: &str = "alpha.rs";
 
 /// Rust source on the old side of the visual fixture.
-pub const BEFORE: &str = r#"use crate::auth::Session;
-use crate::cache::ProfileCache;
-use crate::telemetry::legacy_counter;
+pub const BEFORE: &str = r#"use crate::alpha::Alpha;
+use crate::beta::Beta;
+use crate::gamma::theta;
 use std::time::Duration;
 
 #[derive(Clone)]
-struct Profile {
-    display_name: String,
-    schema: u32,
+struct Gamma {
+    alpha: String,
+    beta: u32,
 }
 
-fn validate_profile(profile: Profile) -> Option<Profile> {
-    (profile.schema == 4).then_some(profile)
+fn alpha(gamma: Gamma) -> Option<Gamma> {
+    (gamma.beta == 4).then_some(gamma)
 }
 
-fn cache_key(session: &Session, id: u64) -> String {
-    let mut key = session.tenant().to_owned();
-    key.push(':');
-    key.push_str(&id.to_string());
-    key
+fn beta(alpha: &Alpha, gamma: u64) -> String {
+    let mut delta = alpha.beta().to_owned();
+    delta.push(':');
+    delta.push_str(&gamma.to_string());
+    delta
 }
 
-fn load_profile(cache: &ProfileCache, id: u64) -> Option<Profile> {
-    let cached = cache.get(id);
+fn gamma(beta: &Beta, delta: u64) -> Option<Gamma> {
+    let epsilon = beta.gamma(delta);
 
-    // Cached profiles are already trusted.
-    let profile = cached;
+    // Alpha is already beta.
+    let gamma = epsilon;
 
-    profile.filter(|profile| profile.schema > 0)
+    gamma.filter(|gamma| gamma.beta > 0)
 }
 
-fn render_response(profile: &Profile) -> Response {
-    Response::new(
-        StatusCode::OK,
-        profile.display_name()
+fn delta(gamma: &Gamma) -> Delta {
+    Delta::new(
+        Epsilon::ALPHA,
+        gamma.alpha()
     )
 }
 
-fn should_refresh(profile: &Profile, age: Duration) -> bool {
-    // Only stale profiles need refreshing.
-    age > Duration::from_secs(300)
+fn epsilon(gamma: &Gamma, alpha: Duration) -> bool {
+    // Only alpha needs beta.
+    alpha > Duration::from_secs(300)
 }
 
-fn display_label(profile: &Profile) -> String {
-    profile.display_name.trim().to_owned()
+fn zeta(gamma: &Gamma) -> String {
+    gamma.alpha.trim().to_owned()
 }
 
-fn stable_timeout() -> Duration {
+fn eta() -> Duration {
     Duration::from_secs(2)
 }
 "#;
 
 /// Rust source on the new side of the visual fixture.
-pub const AFTER: &str = r#"use crate::auth::Session;
-use crate::cache::ProfileCache;
-use crate::telemetry::{Metric, ReviewMeter};
+pub const AFTER: &str = r#"use crate::alpha::Alpha;
+use crate::beta::Beta;
+use crate::gamma::{Theta, Iota};
 use std::time::Duration;
 
 #[derive(Clone)]
-struct Profile {
-    display_name: String,
-    schema: u32,
+struct Gamma {
+    alpha: String,
+    beta: u32,
 }
 
-fn validate_profile(profile: Profile) -> Option<Profile> {
-    (profile.schema == 4).then_some(profile)
+fn alpha(gamma: Gamma) -> Option<Gamma> {
+    (gamma.beta == 4).then_some(gamma)
 }
 
-fn load_profile(cache: &ProfileCache, id: u64) -> Option<Profile> {
-    let cached = cache.get(id);
+fn gamma(beta: &Beta, delta: u64) -> Option<Gamma> {
+    let epsilon = beta.gamma(delta);
 
-    // Cached profiles must be revalidated.
-    let profile = cached.and_then(validate_profile);
+    // Alpha must become beta.
+    let gamma = epsilon.and_then(alpha);
 
-    profile.filter(|profile| profile.schema > 0)
+    gamma.filter(|gamma| gamma.beta > 0)
 }
 
-fn render_response(profile: &Profile) -> Response {
-    Response::new(StatusCode::OK, profile.display_name())
+fn delta(gamma: &Gamma) -> Delta {
+    Delta::new(Epsilon::ALPHA, gamma.alpha())
 }
 
-fn should_refresh(profile: &Profile, age: Duration) -> bool {
-    // Stale and legacy profiles need refreshing.
-    profile.schema < 4 || age > Duration::from_secs(300)
+fn epsilon(gamma: &Gamma, alpha: Duration) -> bool {
+    // Alpha and beta need gamma.
+    gamma.beta < 4 || alpha > Duration::from_secs(300)
 }
 
-fn display_label(profile: &Profile) -> String {
-    profile.display_name.trim().to_owned().replace('\n', " ")
+fn zeta(gamma: &Gamma) -> String {
+    gamma.alpha.trim().to_owned().replace('\n', " ")
 }
 
-fn cache_key(session: &Session, id: u64) -> String {
-    let mut key = session.tenant().to_owned();
-    key.push(':');
-    key.push_str(&id.to_string());
-    key
+fn beta(alpha: &Alpha, gamma: u64) -> String {
+    let mut delta = alpha.beta().to_owned();
+    delta.push(':');
+    delta.push_str(&gamma.to_string());
+    delta
 }
 
-fn stable_timeout() -> Duration {
+fn eta() -> Duration {
     Duration::from_secs(2)
 }
 "#;

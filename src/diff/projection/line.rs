@@ -1,15 +1,12 @@
 use super::{
-    ContentChannel, FallbackReason, Language, LayoutOwnership, Leaf, NodeId, Projection,
-    ProjectionHealth, ReviewMode, ReviewUnit, SyntaxNode,
+    ContentChannel, CorrespondenceRole, Language, LayoutOwnership, Leaf, NodeId, Projection,
+    ReviewMode, ReviewUnit, SyntaxNode,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
 
 /// Degenerate CST whose file root owns one exact leaf per physical source line.
-pub(super) fn project<'source>(
-    source: Source<'source>,
-    reason: FallbackReason,
-) -> Projection<'source> {
+pub(super) fn project(source: Source<'_>) -> Projection<'_> {
     let root = NodeId::new(0);
     let root_lines = source
         .line_coverage(0..source.as_str().len())
@@ -24,6 +21,7 @@ pub(super) fn project<'source>(
         leaf: None,
         identity: None,
         decoration_owner: None,
+        correspondence: CorrespondenceRole::HardOwner,
         review: None,
         named: true,
         extra: false,
@@ -47,6 +45,7 @@ pub(super) fn project<'source>(
             }),
             identity: Some(line.full_bytes.clone()),
             decoration_owner: None,
+            correspondence: CorrespondenceRole::Transparent,
             review: Some(ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None)),
             named: true,
             extra: false,
@@ -54,11 +53,5 @@ pub(super) fn project<'source>(
         });
     }
 
-    Projection::from_nodes(
-        source,
-        Language::Lines,
-        ProjectionHealth::Fallback(reason),
-        root,
-        nodes,
-    )
+    Projection::from_nodes(source, Language::Lines, root, nodes)
 }

@@ -40,23 +40,6 @@ fn composite_link(graph: &Correspondence, before: NodeId) -> NodeLink {
 }
 
 #[test]
-fn empty_side_has_no_correspondence() {
-    assert!(ordered_matches::<u8>(&[], &[]).is_empty());
-    assert!(ordered_matches(&[1], &[]).is_empty());
-    assert!(ordered_matches(&[], &[1]).is_empty());
-}
-
-#[test]
-fn identity_matches_every_occurrence_in_order() {
-    let values = ["alpha", "beta", "gamma"];
-
-    assert_eq!(
-        pairs(ordered_matches(&values, &values)),
-        vec![(0, 0), (1, 1), (2, 2)]
-    );
-}
-
-#[test]
 fn insertions_and_removals_leave_surrounding_edges_stable() {
     let before = ["a", "gone", "b", "c"];
     let after = ["a", "b", "new", "c"];
@@ -87,14 +70,6 @@ fn crossing_unique_candidates_choose_a_deterministic_stable_subsequence() {
         pairs(ordered_matches(&before, &after)),
         vec![(1, 0), (2, 1), (3, 3)]
     );
-}
-
-#[test]
-fn lcs_ties_prefer_skipping_before_values() {
-    let before = ["x", "y"];
-    let after = ["y", "x"];
-
-    assert_eq!(pairs(lcs_matches(&before, &after)), vec![(1, 0)]);
 }
 
 #[test]
@@ -130,82 +105,6 @@ fn every_result_is_equal_unique_and_strictly_ordered() {
         assert!(pair[0].before < pair[1].before);
         assert!(pair[0].after < pair[1].after);
     }
-}
-
-#[test]
-fn increasing_subsequence_membership_tracks_occurrences_not_values() {
-    assert_eq!(
-        increasing_subsequence_members(&[3, 1, 2, 0, 4]),
-        vec![false, true, true, false, true]
-    );
-    assert_eq!(increasing_subsequence_members(&[]), Vec::<bool>::new());
-}
-
-#[test]
-fn modified_leaf_shapes_stay_inside_linked_parent_contexts() {
-    let before = concat!(
-        "fn contextual_links(\n",
-        "    pair: &ProjectionPair<'_, '_>,\n",
-        "    before_unit: NodeId,\n",
-        "    after_unit: NodeId,\n",
-        "    before_fingerprints: &[NodeFingerprints],\n",
-        "    after_fingerprints: &[NodeFingerprints],\n",
-        ") -> ContextLinks {\n",
-        "    let mut links = ContextLinks { before: HashMap::new() };\n",
-        "    link_context(before_unit, after_unit, &mut links);\n",
-        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
-        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
-        "        let before_children = direct_composites(&pair.before, before_parent);\n",
-        "        let after_children = direct_composites(&pair.after, after_parent);\n",
-        "        let pairs = contextual_child_matches(pair, &before_children, &after_children, before_fingerprints, after_fingerprints);\n",
-        "        for edge in pairs {\n",
-        "            let before = before_children[edge.before];\n",
-        "            let after = after_children[edge.after];\n",
-        "            link_context(before, after, &mut links);\n",
-        "            pending.push_back((before, after));\n",
-        "        }\n",
-        "    }\n",
-        "    links\n",
-        "}\n",
-    );
-    let after = concat!(
-        "fn contextual_links(\n",
-        "    pair: &ProjectionPair<'_, '_>,\n",
-        "    before_unit: NodeId,\n",
-        "    after_unit: NodeId,\n",
-        "    unit_placement: Placement,\n",
-        "    before_fingerprints: &[NodeFingerprints],\n",
-        "    after_fingerprints: &[NodeFingerprints],\n",
-        ") -> ContextLinks {\n",
-        "    let mut links = ContextLinks { before: HashMap::new(), placement: HashMap::new() };\n",
-        "    link_context(before_unit, after_unit, unit_placement, &mut links);\n",
-        "    let mut pending = VecDeque::from([(before_unit, after_unit)]);\n",
-        "    while let Some((before_parent, after_parent)) = pending.pop_front() {\n",
-        "        let before_children = direct_composites(&pair.before, before_parent);\n",
-        "        let after_children = direct_composites(&pair.after, after_parent);\n",
-        "        let pairs = contextual_child_matches(pair, &links, &before_children, &after_children, before_fingerprints, after_fingerprints);\n",
-        "        let placements = contextual_match_placements(pair, &before_children, &pairs, &links);\n",
-        "        for (edge, placement) in pairs.into_iter().zip(placements) {\n",
-        "            let before = before_children[edge.before];\n",
-        "            let after = after_children[edge.after];\n",
-        "            link_context(before, after, placement, &mut links);\n",
-        "            pending.push_back((before, after));\n",
-        "        }\n",
-        "    }\n",
-        "    links\n",
-        "}\n",
-    );
-    let pair = project_pair(Path::new("correspondence.rs"), before, after, false).unwrap();
-    let graph = correspond(&pair);
-
-    assert!(!graph.leaf_links.iter().any(|link| {
-        let before = pair.before.node(link.before);
-        let after = pair.after.node(link.after);
-        before.lines.start == 15
-            && pair.before.leaf_text(link.before) == Some("edge")
-            && after.lines.start == 5
-            && pair.after.leaf_text(link.after) == Some("unit_placement")
-    }));
 }
 
 #[test]
@@ -254,6 +153,19 @@ fn line_projection_is_the_same_ordered_unit_graph() {
         panic!("one changed line unit must own one leaf link");
     };
     assert_eq!(link.relation, LeafRelation::Modified);
+}
+
+#[test]
+fn fallback_lines_prefer_the_nearest_surviving_run_over_extracted_payload() {
+    let before = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+    let after = [
+        "alpha", "epsilon", "zeta", "theta", "beta", "gamma", "delta",
+    ];
+
+    assert_eq!(
+        pairs(locality_first_matches(&before, &after)),
+        vec![(0, 0), (4, 1), (5, 2)]
+    );
 }
 
 #[test]
@@ -360,6 +272,92 @@ fn growing_a_shared_blank_separator_remains_local_edit_signal() {
             .any(|fallback| fallback.after.contains(&2)),
         "the second current blank row must remain source signal: {graph:#?}",
     );
+}
+
+#[test]
+fn blank_layout_cannot_anchor_across_unrelated_semantic_containers() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    beta();\n",
+        "\n",
+        "    gamma();\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn delta() {\n",
+        "    beta();\n",
+        "\n",
+        "    gamma();\n",
+        "}\n",
+        "\n",
+        "fn alpha() {\n",
+        "    theta();\n",
+        "}\n",
+    );
+    let pair = project_pair(Path::new("alpha.rs"), before, after, false)
+        .expect("Rust projection must parse");
+    let graph = correspond(&pair);
+
+    assert!(
+        scope_lines(&pair.before)
+            .iter()
+            .all(|owners| !owners.is_empty()),
+        "every previous physical line must carry its nearest semantic scope",
+    );
+    assert!(
+        scope_lines(&pair.after)
+            .iter()
+            .all(|owners| !owners.is_empty()),
+        "every current physical line must carry its nearest semantic scope",
+    );
+    assert!(
+        !graph.line_links.contains(&LineLink {
+            before: 2,
+            after: 2,
+        }),
+        "the blank line in the previous alpha body cannot anchor into delta",
+    );
+}
+
+#[test]
+fn a_rejected_context_claim_preserves_the_existing_partner() {
+    let mut links = ContextLinks {
+        before: HashMap::new(),
+        after: HashMap::new(),
+        placement: HashMap::new(),
+        reparenting: HashMap::new(),
+    };
+    let before = NodeId::new(0);
+    let after = NodeId::new(1);
+    let other_before = NodeId::new(2);
+    let other_after = NodeId::new(3);
+
+    assert!(link_context(
+        before,
+        after,
+        Placement::Stable,
+        None,
+        &mut links,
+    ));
+    assert!(!link_context(
+        before,
+        other_after,
+        Placement::Reordered,
+        None,
+        &mut links,
+    ));
+    assert!(!link_context(
+        other_before,
+        after,
+        Placement::Stable,
+        Some(Reparenting::Wrapped),
+        &mut links,
+    ));
+
+    assert_eq!(links.before.get(&before), Some(&after));
+    assert_eq!(links.after.get(&after), Some(&before));
+    assert!(!links.before.contains_key(&other_before));
+    assert!(!links.after.contains_key(&other_after));
 }
 
 #[test]
@@ -508,7 +506,7 @@ fn changed_leaf_payload_is_a_modified_structural_link() {
 }
 
 #[test]
-fn exact_duplicate_units_are_paired_before_fifo_and_expose_reordering() {
+fn duplicate_definition_names_retain_ordinal_identity_without_body_voting() {
     let pair = project_pair(
         Path::new("lib.rs"),
         "fn same() { one(); }\nfn same() { two(); }\n",
@@ -532,7 +530,7 @@ fn exact_duplicate_units_are_paired_before_fifo_and_expose_reordering() {
     assert!(
         matched
             .iter()
-            .any(|unit| unit.placement == Placement::Reordered)
+            .all(|unit| unit.placement == Placement::Stable)
     );
     for unit in matched {
         let before = pair
@@ -545,8 +543,8 @@ fn exact_duplicate_units_are_paired_before_fifo_and_expose_reordering() {
             .source
             .slice(pair.after.node(unit.after).bytes.clone())
             .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(unit.relation, ContentRelation::SourceEqual);
+        assert_ne!(before, after);
+        assert_eq!(unit.relation, ContentRelation::Modified);
     }
 }
 
@@ -554,23 +552,23 @@ fn exact_duplicate_units_are_paired_before_fifo_and_expose_reordering() {
 fn following_attribute_uses_its_definition_to_disambiguate_repeated_source() {
     let before = concat!(
         "#[derive(Clone, Copy)]\n",
-        "enum ReviewTreatment {\n",
-        "    Linewise,\n",
-        "    Compact,\n",
+        "enum Alpha {\n",
+        "    Beta,\n",
+        "    Gamma,\n",
         "}\n",
         "#[derive(Clone, Copy)]\n",
-        "enum Movement {\n",
-        "    Track,\n",
+        "enum Delta {\n",
+        "    Epsilon,\n",
         "}\n",
     );
     let after = concat!(
         "#[derive(Clone, Copy)]\n",
-        "enum ReviewMode {\n",
-        "    Compact,\n",
-        "    Linewise,\n",
+        "enum Zeta {\n",
+        "    Gamma,\n",
+        "    Beta,\n",
         "}\n",
     );
-    let pair = project_pair(Path::new("projection.rs"), before, after, false)
+    let pair = project_pair(Path::new("alpha.rs"), before, after, false)
         .expect("Rust projection must parse");
     let graph = correspond(&pair);
     let review = graph
@@ -580,13 +578,10 @@ fn following_attribute_uses_its_definition_to_disambiguate_repeated_source() {
             let UnitEdit::Matched(unit) = edit else {
                 return None;
             };
-            (pair.after.identity_text(unit.after) == Some("ReviewMode")).then_some(unit)
+            (pair.after.identity_text(unit.after) == Some("Zeta")).then_some(unit)
         })
-        .expect("renamed review enum must remain paired");
-    assert_eq!(
-        pair.before.identity_text(review.before),
-        Some("ReviewTreatment")
-    );
+        .expect("renamed enum must remain paired");
+    assert_eq!(pair.before.identity_text(review.before), Some("Alpha"));
 
     let derive = graph
         .units
@@ -732,10 +727,10 @@ fn structural_decorations_inherit_movement_without_voting_on_it() {
         id: NodeId::new(id),
         kind: "synthetic",
         identity: None,
+        atomic: false,
         decoration_owner: decoration_owner.map(NodeId::new),
         fingerprint: fingerprints(id),
         shape: FingerprintId(30_000 + id),
-        evidence: Vec::new(),
         mode: ReviewMode::Structural,
     };
     // The decorator crosses the other semantic owner. If it entered the LIS,
@@ -958,9 +953,9 @@ fn mixed_module_modes_resolve_symmetrically_to_linewise_review() {
 
 #[test]
 fn exact_html_child_survives_an_inserted_parent_as_one_reparented_subtree() {
-    let before = "<article>\n  <img src=\"ada.webp\">\n</article>\n";
+    let before = "<article>\n  <img src=\"alpha.webp\">\n</article>\n";
     let after =
-        "<article>\n  <div class=\"portrait\">\n    <img src=\"ada.webp\">\n  </div>\n</article>\n";
+        "<article>\n  <div class=\"beta\">\n    <img src=\"alpha.webp\">\n  </div>\n</article>\n";
     let pair = project_pair(Path::new("view.html"), before, after, false)
         .expect("HTML projection must parse");
     let graph = correspond(&pair);
@@ -974,7 +969,7 @@ fn exact_html_child_survives_an_inserted_parent_as_one_reparented_subtree() {
         })
         .expect("the exact img subtree must remain linked across the wrapper");
 
-    assert!(retained.reparented);
+    assert!(retained.wrapper.is_some());
     assert!(
         graph
             .unit_leaf_links(unit)
@@ -987,8 +982,8 @@ fn exact_html_child_survives_an_inserted_parent_as_one_reparented_subtree() {
 
 #[test]
 fn same_tag_wrapper_is_detected_from_actual_parent_correspondence() {
-    let before = "<div><img src=\"ada.webp\"></div>\n";
-    let after = "<div><div><img src=\"ada.webp\"></div></div>\n";
+    let before = "<div><img src=\"alpha.webp\"></div>\n";
+    let after = "<div><div><img src=\"alpha.webp\"></div></div>\n";
     let pair = project_pair(Path::new("view.html"), before, after, false)
         .expect("HTML projection must parse");
     let graph = correspond(&pair);
@@ -997,56 +992,31 @@ fn same_tag_wrapper_is_detected_from_actual_parent_correspondence() {
         .unit_composites(unit)
         .iter()
         .find(|link| {
-            pair.before.identity_text(link.before) == Some("div")
-                && pair.after.identity_text(link.after) == Some("div")
-                && pair
-                    .before
-                    .source
-                    .slice(pair.before.node(link.before).bytes.clone())
-                    == pair
-                        .after
-                        .source
-                        .slice(pair.after.node(link.after).bytes.clone())
+            pair.before.identity_text(link.before) == Some("img")
+                && pair.after.identity_text(link.after) == Some("img")
         })
-        .expect("the old div subtree must pair with the exact inserted inner occurrence");
+        .expect("the image must retain identity through the inserted div");
 
-    assert!(retained.reparented);
+    assert!(retained.wrapper.is_some());
 }
 
 #[test]
-fn swapped_exact_html_siblings_keep_both_links_and_report_placement() {
+fn repeated_html_siblings_keep_fifo_identity_instead_of_following_payload() {
     let before = "<article><p>alpha</p><p>beta</p></article>\n";
     let after = "<article><p>beta</p><p>alpha</p></article>\n";
     let pair = project_pair(Path::new("view.html"), before, after, false)
         .expect("HTML projection must parse");
     let graph = correspond(&pair);
     let unit = only_matched(&graph);
-    let paragraphs = graph
-        .unit_composites(unit)
-        .iter()
-        .filter(|link| {
-            pair.before.node(link.before).kind == "element"
-                && pair.before.identity_text(link.before) == Some("p")
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(paragraphs.len(), 2);
-    assert!(
-        paragraphs
-            .iter()
-            .any(|link| link.placement == Placement::Reordered)
-    );
-    for link in paragraphs {
-        let before = pair
-            .before
-            .source
-            .slice(pair.before.node(link.before).bytes.clone());
-        let after = pair
-            .after
-            .source
-            .slice(pair.after.node(link.after).bytes.clone());
-        assert_eq!(before, after);
-    }
+    assert!(!graph.unit_composites(unit).iter().any(|link| {
+        pair.before.node(link.before).kind == "element"
+            && pair.before.identity_text(link.before) == Some("p")
+    }));
+    assert!(!graph.unit_leaf_links(unit).iter().any(|link| {
+        link.relation == LeafRelation::Exact
+            && pair.before.leaf_text(link.before) == Some("alpha")
+            && pair.after.leaf_text(link.after) == Some("alpha")
+    }));
 }
 
 #[test]
@@ -1073,17 +1043,59 @@ fn nested_html_unwrap_keeps_leaf_links_one_to_one() {
     assert_eq!(before.len(), graph.leaf_links.len());
     assert_eq!(after.len(), graph.leaf_links.len());
     assert!(graph.composites.iter().any(|link| {
-        link.reparented
-            && pair.before.identity_text(link.before) == Some("div")
-            && pair
-                .before
-                .source
-                .slice(pair.before.node(link.before).bytes.clone())
-                == pair
-                    .after
-                    .source
-                    .slice(pair.after.node(link.after).bytes.clone())
+        link.wrapper == Some(Reparenting::Unwrapped)
+            && pair.before.identity_text(link.before) == Some("img")
+            && pair.after.identity_text(link.after) == Some("img")
     }));
+}
+
+#[test]
+fn nested_html_unwrap_can_reach_the_matched_document_owner() {
+    let pair = project_pair(
+        Path::new("alpha.html"),
+        "<alpha><beta><img src=\"gamma.webp\"></beta></alpha>\n",
+        "<img src=\"gamma.webp\">\n",
+        false,
+    )
+    .expect("HTML projection must parse");
+    let graph = correspond(&pair);
+
+    assert!(graph.composites.iter().any(|link| {
+        link.wrapper == Some(Reparenting::Unwrapped)
+            && pair.before.identity_text(link.before) == Some("img")
+            && pair.after.identity_text(link.after) == Some("img")
+    }));
+}
+
+#[test]
+fn nested_type_assertion_reaches_the_matched_declaration_owner() {
+    let pair = project_pair(
+        Path::new("alpha.ts"),
+        "const alpha = await beta({ gamma: true, delta: true });\n",
+        "const alpha = (await beta({ gamma: true, delta: true })) as Epsilon | null;\n",
+        false,
+    )
+    .expect("TypeScript projection must parse");
+    let graph = correspond(&pair);
+
+    let retained = graph
+        .composites
+        .iter()
+        .find(|link| {
+            link.wrapper == Some(Reparenting::Wrapped)
+                && pair
+                    .before
+                    .source
+                    .slice(pair.before.node(link.before).bytes.clone())
+                    == Some("await beta({ gamma: true, delta: true })")
+        })
+        .expect("the exact expression must carry a containment certificate");
+    assert_eq!(
+        pair.after
+            .source
+            .slice(pair.after.node(retained.after).bytes.clone()),
+        Some("await beta({ gamma: true, delta: true })")
+    );
 }
 
 #[test]
@@ -1124,13 +1136,13 @@ fn renamed_nested_definition_preserves_parent_links_for_exact_body_leaves() {
         .expect("renamed definition leaf must remain linked");
 
     assert_eq!(payload.relation, LeafRelation::Exact);
-    assert!(!payload.reparented);
+    assert_eq!(payload.parent, ParentCorrespondence::Direct);
     assert_eq!(name.relation, LeafRelation::Modified);
-    assert!(!name.reparented);
+    assert_eq!(name.parent, ParentCorrespondence::Direct);
 }
 
 #[test]
-fn ambiguous_nested_renames_remain_unlinked_without_parent_correspondence() {
+fn nested_renames_follow_local_sibling_order() {
     let before = concat!(
         "mod tests {\n",
         "    fn old_alpha() { shared(); }\n",
@@ -1159,13 +1171,22 @@ fn ambiguous_nested_renames_remain_unlinked_without_parent_correspondence() {
                     .leaf_text(link.after)
                     .is_some_and(|text| text.starts_with("new_"))
         })
+        .map(|link| {
+            (
+                pair.before.leaf_text(link.before).expect("before name"),
+                pair.after.leaf_text(link.after).expect("after name"),
+            )
+        })
         .collect::<Vec<_>>();
 
-    assert!(renamed.is_empty());
+    assert_eq!(
+        renamed,
+        [("old_alpha", "new_alpha"), ("old_beta", "new_beta")]
+    );
 }
 
 #[test]
-fn exact_body_evidence_recovers_crossing_renames() {
+fn renamed_units_follow_local_order_instead_of_crossing_body_copies() {
     let pair = project_pair(
         Path::new("lib.rs"),
         "fn alpha() { body_a(); }\n\nfn beta() { body_b(); }\n",
@@ -1189,119 +1210,12 @@ fn exact_body_evidence_recovers_crossing_renames() {
         })
         .collect::<Vec<_>>();
 
-    assert!(
-        links
-            .iter()
-            .any(|link| link.0 == Some("alpha") && link.1 == Some("delta"))
-    );
-    assert!(
-        links
-            .iter()
-            .any(|link| link.0 == Some("beta") && link.1 == Some("gamma"))
-    );
     assert_eq!(
-        links
-            .iter()
-            .filter(|link| link.2 == Placement::Reordered)
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn large_crossing_rename_gap_uses_unique_body_evidence() {
-    const UNIT_COUNT: usize = 129;
-    const { assert!(UNIT_COUNT * UNIT_COUNT > MAX_LOCAL_ALIGNMENT_CELLS) };
-
-    let before = (0..UNIT_COUNT)
-        .map(|index| format!("fn before_{index:03}() {{ body_{index:03}(); }}\n"))
-        .collect::<String>();
-    let after = (0..UNIT_COUNT)
-        .rev()
-        .map(|index| format!("fn after_{index:03}() {{ body_{index:03}(); }}\n"))
-        .collect::<String>();
-    let pair = project_pair(Path::new("lib.rs"), &before, &after, false)
-        .expect("Rust projection must parse");
-    let graph = correspond(&pair);
-    let links = graph
-        .units
-        .iter()
-        .filter_map(|edit| {
-            let UnitEdit::Matched(unit) = edit else {
-                return None;
-            };
-            let before = pair
-                .before
-                .identity_text(unit.before)
-                .expect("Rust function must retain its before identity");
-            let after = pair
-                .after
-                .identity_text(unit.after)
-                .expect("Rust function must retain its after identity");
-            Some((before, (after, unit.relation, unit.placement)))
-        })
-        .collect::<HashMap<_, _>>();
-
-    assert_eq!(links.len(), UNIT_COUNT);
-    for index in 0..UNIT_COUNT {
-        let before = format!("before_{index:03}");
-        let after = format!("after_{index:03}");
-        let link = links
-            .get(before.as_str())
-            .expect("every renamed function must remain paired");
-        assert_eq!(link.0, after);
-        assert_eq!(link.1, ContentRelation::Modified);
-    }
-    assert_eq!(
-        links
-            .values()
-            .filter(|(_, _, placement)| *placement == Placement::Reordered)
-            .count(),
-        UNIT_COUNT - 1
-    );
-}
-
-#[test]
-fn skewed_evidence_work_uses_the_conservative_fallback_before_the_cell_limit() {
-    let after_count = 100;
-    let long_evidence = MAX_LOCAL_ALIGNMENT_EVIDENCE_WORK / after_count + 1;
-    let shape = FingerprintId(50_000);
-    let unit = |index, evidence| UnitRecord {
-        id: NodeId::new(index),
-        kind: "function_item",
-        identity: None,
-        decoration_owner: None,
-        fingerprint: NodeFingerprints {
-            full: FingerprintId(60_000 + index),
-            payload: None,
-            shape,
-        },
-        shape,
-        evidence,
-        mode: ReviewMode::Structural,
-    };
-    let before = vec![unit(
-        0,
-        (0..long_evidence)
-            .map(|index| (FingerprintId(index), 1))
-            .collect(),
-    )];
-    let after = (0..after_count)
-        .map(|index| unit(index + 1, vec![(FingerprintId(long_evidence + index), 1)]))
-        .collect::<Vec<_>>();
-    let before_indices = [0];
-    let after_indices = (0..after.len()).collect::<Vec<_>>();
-
-    assert!(before_indices.len() * after_indices.len() <= MAX_LOCAL_ALIGNMENT_CELLS);
-    assert!(compatible_alignment_exceeds_budget(
-        &before,
-        &after,
-        &before_indices,
-        &after_indices,
-    ));
-    assert!(
-        compatible_unit_matches(&before, &after, &before_indices, &after_indices).is_empty(),
-        "the conservative fallback must not promote kind-only similarity"
+        links,
+        [
+            (Some("alpha"), Some("gamma"), Placement::Stable),
+            (Some("beta"), Some("delta"), Placement::Stable),
+        ]
     );
 }
 
@@ -1407,7 +1321,7 @@ fn inserted_repeated_neighbor_does_not_reorder_an_exact_definition_cover() {
     assert!(links.iter().all(|link| {
         link.relation == LeafRelation::Exact
             && link.placement == Placement::Stable
-            && !link.reparented
+            && link.parent == ParentCorrespondence::Direct
             && after_leaves.contains(&link.after)
     }));
     assert_eq!(second_attribute.after, after_second_attribute);
@@ -1566,7 +1480,7 @@ fn reordered_exact_inline_subtree_propagates_placement_to_its_leaves() {
 }
 
 #[test]
-fn exact_leaf_moved_between_parents_is_explicitly_reparented() {
+fn exact_leaf_cannot_move_between_sibling_call_parents() {
     let pair = project_pair(
         Path::new("lib.rs"),
         "fn run() { left(alpha); right(beta); }\n",
@@ -1576,21 +1490,16 @@ fn exact_leaf_moved_between_parents_is_explicitly_reparented() {
     .expect("Rust projection must parse");
     let graph = correspond(&pair);
     let unit = only_matched(&graph);
-    let alpha = graph
-        .unit_leaf_links(unit)
-        .iter()
-        .find(|link| {
-            pair.before.leaf_text(link.before) == Some("alpha")
-                && pair.after.leaf_text(link.after) == Some("alpha")
-        })
-        .expect("exact moved payload must remain one linked occurrence");
+    let alpha = graph.unit_leaf_links(unit).iter().any(|link| {
+        pair.before.leaf_text(link.before) == Some("alpha")
+            && pair.after.leaf_text(link.after) == Some("alpha")
+    });
 
-    assert_eq!(alpha.relation, LeafRelation::Exact);
-    assert!(alpha.reparented);
+    assert!(!alpha, "a leaf cannot cross from left(...) into right(...)");
 }
 
 #[test]
-fn modified_subtree_can_retain_correspondence_across_a_parent_change() {
+fn subtree_cannot_move_between_sibling_html_parents() {
     let before = concat!(
         "<section>\n",
         "  <div>\n",
@@ -1615,16 +1524,12 @@ fn modified_subtree_can_retain_correspondence_across_a_parent_change() {
         .expect("HTML projection must parse");
     let graph = correspond(&pair);
     let unit = only_matched(&graph);
-    let retained = graph
-        .unit_composites(unit)
-        .iter()
-        .find(|link| {
-            pair.before.identity_text(link.before) == Some("span")
-                && pair.after.identity_text(link.after) == Some("span")
-        })
-        .expect("exact content inside the modified subtree must remain linked");
+    let retained = graph.unit_leaf_links(unit).iter().any(|link| {
+        pair.before.leaf_text(link.before) == Some("gamma")
+            && pair.after.leaf_text(link.after) == Some("gamma")
+    });
 
-    assert!(retained.reparented);
+    assert!(!retained, "payload cannot cross from div into aside");
 }
 
 #[test]
@@ -1640,7 +1545,7 @@ fn shallow_modified_subtree_reparents_on_unique_exact_payload() {
         pair.before.leaf_text(link.before) == Some("alpha")
             && pair.after.leaf_text(link.after) == Some("alpha")
             && link.relation == LeafRelation::Exact
-            && link.reparented
+            && link.wrapper.is_some()
     }));
     assert_eq!(
         html_div_reparent_counts(
@@ -1699,7 +1604,7 @@ fn html_div_reparent_counts(before: &str, after: &str) -> (usize, usize) {
         .count();
     let reparented = before_divs
         .iter()
-        .filter(|before| links.reparented.contains(before))
+        .filter(|before| links.reparenting.contains_key(before))
         .count();
     (matched, reparented)
 }

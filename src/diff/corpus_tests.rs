@@ -7,10 +7,223 @@ fn overlapping_syntax_on_one_line_has_one_review_owner() {
 
     let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
 
-    assert_unchanged_payload(&diff, "#![allow(alpha)]// beta");
+    assert_context_payload(&diff, "#![allow(alpha)]// beta");
     assert_added_payload(&diff, "2");
     assert_removed_payload(&diff, "1");
     assert_source_ownership(&diff);
+}
+
+#[test]
+fn decorated_module_insertion_preserves_an_unchanged_boolean_chain() {
+    // Four operands retain the nested repeated wrapper that exposed this boundary conflict.
+    let stable = concat!(
+        "fn alpha(beta: &str) -> bool {\n",
+        "    let gamma = beta.starts_with(\"alpha\")\n",
+        "        || beta.starts_with(\"beta\")\n",
+        "        || beta.starts_with(\"gamma\")\n",
+        "        || beta.starts_with(\"delta\");\n",
+        "    if !gamma {\n",
+        "        return false;\n",
+        "    }\n",
+        "    true\n",
+        "}\n",
+    );
+    let before = format!("{stable}#[cfg(test)]\nmod alpha;\n");
+    let after = format!("{stable}#[cfg(test)]\nmod beta;\n#[cfg(test)]\nmod alpha;\n");
+    let inserted = stable.lines().count() + 1;
+
+    let diff = diff_file("alpha.rs", &before, &after).expect("Rust must plan");
+
+    assert_added_subtree(&diff, inserted..inserted + 2);
+    for number in inserted + 2..=inserted + 3 {
+        assert!(
+            source_lines(&diff)
+                .any(|(line, current)| { current && line.number == number && !line.has_changes() }),
+            "existing decorated module line {number} lost its stable scope: {diff:#?}"
+        );
+    }
+    assert_eq!(current_payload_count(&diff, "#[cfg(test)]"), 2, "{diff:#?}");
+    assert_current_payload_once(&diff, "mod alpha;");
+    assert_no_removed_payload(&diff, "mod alpha;");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn extracted_multiline_expression_keeps_its_removed_syntax_complete() {
+    let before = concat!(
+        "fn alpha(beta: u64) -> bool {\n",
+        "    let gamma = beta + 1;\n",
+        "    (gamma > ALPHA)\n",
+        "        && delta(gamma)\n",
+        "        && epsilon(beta)\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha(beta: u64) -> bool {\n",
+        "    zeta(beta)\n",
+        "}\n",
+        "fn zeta(beta: u64) -> bool {\n",
+        "    let gamma = beta + 1;\n",
+        "    (gamma > BETA)\n",
+        "        && delta(gamma)\n",
+        "        && epsilon(beta)\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_subtree(&diff, 4..10);
+    for payload in [
+        "let gamma = beta + 1;",
+        "(gamma > ALPHA)",
+        "&& delta(gamma)",
+        "&& epsilon(beta)",
+    ] {
+        assert_removed_payload(&diff, payload);
+    }
+    assert_current_payload_once(&diff, "let gamma = beta + 1;");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn copied_multiline_call_keeps_its_edited_source_complete() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    beta(\n",
+        "        alpha,\n",
+        "        gamma,\n",
+        "        delta,\n",
+        "    );\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    beta(epsilon);\n",
+        "}\n",
+        "fn zeta() {\n",
+        "    beta(\n",
+        "        alpha,\n",
+        "        gamma,\n",
+        "        delta,\n",
+        "    );\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_payload(&diff, "beta(epsilon)");
+    assert_added_subtree(&diff, 4..11);
+    for payload in ["beta(", "alpha,", "gamma,", "delta,", ");"] {
+        assert_removed_payload(&diff, payload);
+    }
+    assert_current_payload_once(&diff, "gamma,");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn multiline_expansion_replaces_a_complete_parseable_statement() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    let beta = gamma(delta, epsilon);\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    let beta = gamma(\n",
+        "        delta,\n",
+        "        zeta,\n",
+        "    );\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert!(
+        diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+            matches!(
+                row,
+                DiffRow::LineChange {
+                    before: Some(line),
+                    after: None,
+                } if line.number == 2
+                    && line.spans.iter().all(|span| span.mark == DiffMark::Removed)
+            )
+        }),
+        "the old statement must remain one complete removal: {diff:#?}"
+    );
+    assert_added_subtree(&diff, 2..6);
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn multiline_wrapper_retains_the_complete_nested_statement() {
+    let before = concat!("fn alpha() {\n", "    gamma();\n", "}\n");
+    let after = concat!(
+        "fn alpha() {\n",
+        "    if beta {\n",
+        "        gamma();\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert!(
+        !source_lines(&diff).any(|(line, current)| !current && line.number == 2),
+        "a certified wrapper left an old statement ghost: {diff:#?}"
+    );
+    assert_line_fragment_mark(&diff, "gamma();", "gamma();", DiffMark::Context);
+    assert_added_payload(&diff, "if beta {");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn reordered_multiline_leaf_arguments_keep_their_trailing_commas() {
+    for (first, second) in [("gamma", "delta"), ("1", "2")] {
+        let before =
+            format!("fn alpha() {{\n    beta(\n        {first},\n        {second},\n    );\n}}\n");
+        let after =
+            format!("fn alpha() {{\n    beta(\n        {second},\n        {first},\n    );\n}}\n");
+
+        let diff = diff_file("alpha.rs", &before, &after).expect("Rust must plan");
+
+        for value in [first, second] {
+            let payload = format!("{value},");
+            let lines = source_lines(&diff)
+                .filter(|(line, _)| line_text(line).trim() == payload)
+                .collect::<Vec<_>>();
+            assert!(!lines.is_empty(), "missing argument {payload:?}: {diff:#?}");
+            for (line, _) in lines {
+                let owner = line
+                    .spans
+                    .iter()
+                    .find(|span| span.text.contains(value))
+                    .expect("the argument line contains its semantic owner");
+                let delimiter = line
+                    .spans
+                    .iter()
+                    .find(|span| span.text.contains(','))
+                    .expect("the argument line contains its trailing comma");
+                assert_eq!(
+                    owner.mark, delimiter.mark,
+                    "trailing comma split from {value:?}: {diff:#?}"
+                );
+            }
+            assert_current_payload_once(&diff, &payload);
+        }
+        assert!(
+            [first, second].into_iter().any(|value| {
+                let payload = format!("{value},");
+                source_lines(&diff).any(|(line, current)| {
+                    !current && line_has_marked_payload(line, &payload, DiffMark::Removed)
+                }) && source_lines(&diff).any(|(line, current)| {
+                    current && line_has_marked_payload(line, &payload, DiffMark::Added)
+                })
+            }),
+            "the reordered argument was not shown atomically: {diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
 }
 
 #[test]
@@ -35,7 +248,7 @@ fn renamed_declaration_keeps_its_body_as_context() {
     let diff = diff_file("alpha.ts", before, after).expect("TypeScript must plan");
 
     for payload in ["alpha: beta.string(),", "beta: beta.boolean(),", "})"] {
-        assert_unchanged_payload(&diff, payload);
+        assert_context_payload(&diff, payload);
         assert_current_payload_once(&diff, payload);
     }
     assert_added_payload(&diff, "Beta");
@@ -63,11 +276,11 @@ fn edited_opaque_block_keeps_unchanged_physical_lines() {
     let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
 
     for payload in ["const ALPHA: &str", "alpha", "gamma", "\"#;"] {
-        assert_unchanged_payload(&diff, payload);
+        assert_context_payload(&diff, payload);
         assert_current_payload_once(&diff, payload);
     }
-    assert_added_payload(&diff, "delta");
-    assert_removed_payload(&diff, "beta");
+    assert_added_payload(&diff, "del");
+    assert_removed_payload(&diff, "be");
     assert_source_ownership(&diff);
 }
 
@@ -79,11 +292,11 @@ fn stylesheet_edit_keeps_the_rule_frame_as_context() {
     let diff = diff_file("alpha.css", before, after).expect("CSS must plan");
 
     for payload in [".alpha {", "margin: 0;", "}"] {
-        assert_unchanged_payload(&diff, payload);
+        assert_context_payload(&diff, payload);
         assert_current_payload_once(&diff, payload);
     }
-    assert_added_payload(&diff, "beta");
-    assert_removed_payload(&diff, "alpha;");
+    assert_added_payload(&diff, "bet");
+    assert_removed_payload(&diff, "alph");
     assert_source_ownership(&diff);
 }
 
@@ -124,33 +337,551 @@ fn edited_reparented_subtree_preserves_its_unchanged_child() {
 }
 
 #[test]
-fn extracted_block_is_shown_once_in_its_current_home() {
+fn added_function_is_closed_to_anchors_from_an_existing_function() {
     let before = concat!(
         "fn alpha() {\n",
-        "    alpha();\n",
         "    beta();\n",
+        "    gamma(ALPHA);\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    delta();\n",
+        "}\n",
+        "fn delta() {\n",
+        "    beta();\n",
+        "    gamma(BETA);\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_line_predecessor(&diff, 3, 2, "gamma(ALPHA)", "delta();");
+    assert_added_subtree(&diff, 4..8);
+    assert_current_payload_once(&diff, "beta();");
+    assert_removed_payload(&diff, "beta();");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn extracted_c_body_is_removed_locally_and_the_new_function_is_fully_added() {
+    let before = concat!(
+        "static int alpha(struct Beta *beta)\n",
+        "{\n",
+        "    int gamma = beta->gamma;\n",
+        "    gamma += delta(beta);\n",
+        "    if (gamma < 0)\n",
+        "        return -1;\n",
+        "    beta->gamma = gamma;\n",
+        "    return 0;\n",
+        "}\n",
+    );
+    let after = concat!(
+        "static int alpha(struct Beta *beta)\n",
+        "{\n",
+        "    if (epsilon(beta) < 0)\n",
+        "        return -1;\n",
+        "    return 0;\n",
+        "}\n",
+        "\n",
+        "static int epsilon(struct Beta *beta)\n",
+        "{\n",
+        "    int gamma = beta->gamma;\n",
+        "    gamma += delta(beta);\n",
+        "    if (gamma < 0)\n",
+        "        return -1;\n",
+        "    beta->gamma = gamma;\n",
+        "    return 0;\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.c", before, after).expect("C must plan");
+
+    assert_added_subtree(&diff, 8..17);
+    for payload in [
+        "int gamma = beta->gamma;",
+        "gamma += delta(beta);",
+        "beta->gamma = gamma;",
+    ] {
+        assert_removed_payload(&diff, payload);
+    }
+    assert_current_payload_once(&diff, "gamma += delta(beta);");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn line_fallback_prefers_nearby_survivors_to_a_farther_copied_run() {
+    let before = concat!(
+        "static int alpha(void)\n",
+        "{\n",
+        "    beta();\n",
+        "    while (gamma()) {\n",
+        "        delta();\n",
+        "    }\n",
+        "    epsilon();\n",
+        "    zeta();\n",
+        "    eta();\n",
+        "}\n",
+    );
+    let after = concat!(
+        "static int alpha(void)\n",
+        "{\n",
+        "    theta();\n",
+        "    zeta();\n",
+        "    eta();\n",
+        "}\n",
+        "\n",
+        "static int theta(void)\n",
+        "{\n",
+        "    beta();\n",
+        "    while (gamma()) {\n",
+        "        delta();\n",
+        "    }\n",
+        "    epsilon();\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.txt", before, after).expect("line fallback must plan");
+
+    assert_added_subtree(&diff, 8..16);
+    for payload in ["beta();", "while (gamma())", "delta();", "epsilon();"] {
+        assert_removed_payload(&diff, payload);
+        assert_current_payload_once(&diff, payload);
+    }
+    for (payload, before_line) in [("zeta();", 8), ("eta();", 9)] {
+        assert_context_payload(&diff, payload);
+        assert!(
+            !source_lines(&diff).any(|(line, current)| !current && line.number == before_line),
+            "a nearby survivor was removed in favor of a farther copy: {diff:#?}"
+        );
+    }
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn added_nested_function_is_closed_to_sibling_body_anchors() {
+    let before = concat!(
+        "impl Alpha {\n",
+        "    fn alpha() {\n",
+        "        beta();\n",
+        "        gamma(ALPHA);\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "impl Alpha {\n",
+        "    fn alpha() {\n",
+        "        delta();\n",
+        "    }\n",
+        "    fn delta() {\n",
+        "        beta();\n",
+        "        gamma(BETA);\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_line_predecessor(&diff, 4, 3, "gamma(ALPHA)", "delta();");
+    assert_added_subtree(&diff, 5..9);
+    assert_current_payload_once(&diff, "beta();");
+    assert_removed_payload(&diff, "beta();");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn field_added_to_another_structure_cannot_borrow_its_old_owner() {
+    let before = concat!(
+        "struct Alpha {\n",
+        "    beta: Beta,\n",
+        "    gamma: Alpha,\n",
+        "}\n",
+        "struct Delta {\n",
+        "    epsilon: Epsilon,\n",
+        "}\n",
+    );
+    let after = concat!(
+        "struct Alpha {\n",
+        "    gamma: Alpha,\n",
+        "}\n",
+        "struct Delta {\n",
+        "    beta: Beta,\n",
+        "    epsilon: Epsilon,\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_payload(&diff, "beta: Beta");
+    assert_removed_payload(&diff, "beta: Beta");
+    assert_added_subtree(&diff, 5..6);
+    assert_context_payload(&diff, "epsilon: Epsilon");
+    assert_current_payload_once(&diff, "beta: Beta");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn field_edit_stays_inside_its_structure() {
+    let before = concat!("struct Alpha {\n", "    beta: Alpha,\n", "}\n");
+    let after = concat!("struct Alpha {\n", "    beta: Beta,\n", "}\n");
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "Alph");
+    assert_added_payload(&diff, "Bet");
+    assert_context_payload(&diff, "struct Alpha");
+    assert_line_fragment_mark(&diff, "beta: Beta", "beta", DiffMark::Context);
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn copied_body_cannot_choose_a_later_renamed_function() {
+    let before = concat!("fn alpha() {\n", "    beta();\n", "}\n");
+    let after = concat!(
+        "fn gamma() {\n",
+        "    delta();\n",
+        "}\n",
+        "fn delta() {\n",
+        "    beta();\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_subtree(&diff, 4..7);
+    assert_current_payload_once(&diff, "beta();");
+    assert_removed_payload(&diff, "beta();");
+    assert_removed_payload(&diff, "alpha");
+    assert_added_payload(&diff, "gamma");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn a_nested_owner_cannot_veto_its_containing_sibling_match() {
+    let before = concat!(
+        "mod alpha {\n",
+        "    fn beta() {\n",
+        "        fn delta() {}\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod alpha {\n",
+        "    fn epsilon() {}\n",
+        "    fn delta() {}\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "beta");
+    assert_added_payload(&diff, "epsilon");
+    assert_removed_payload(&diff, "fn delta() {}");
+    assert_added_payload(&diff, "fn delta() {}");
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "fn delta() {}", DiffMark::Context)
+        }),
+        "a nested owner escaped into its containing owner's sibling layer: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn copied_closure_payload_cannot_steal_the_local_closure() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    consume(\n",
+        "        || gamma(ALPHA),\n",
+        "    );\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    consume(\n",
+        "        || gamma(BETA),\n",
+        "        || gamma(ALPHA),\n",
+        "    );\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "ALPH");
+    assert_added_payload(&diff, "BET");
+    assert_line_fragment_mark(&diff, "gamma(BETA)", "gamma", DiffMark::Context);
+    assert_added_subtree(&diff, 4..5);
+    assert_current_payload_once(&diff, "gamma(ALPHA)");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn sibling_anonymous_bodies_pair_locally_before_their_payloads() {
+    let cases = [
+        (
+            "alpha.rs",
+            concat!(
+                "fn alpha() {\n",
+                "    let beta = [\n",
+                "        || { gamma(); },\n",
+                "        || {},\n",
+                "    ];\n",
+                "}\n",
+            ),
+            concat!(
+                "fn alpha() {\n",
+                "    let beta = [\n",
+                "        || {},\n",
+                "        || { gamma(); },\n",
+                "    ];\n",
+                "}\n",
+            ),
+        ),
+        (
+            "alpha.ts",
+            concat!(
+                "const alpha = [\n",
+                "    () => { gamma(); },\n",
+                "    () => {},\n",
+                "];\n",
+            ),
+            concat!(
+                "const alpha = [\n",
+                "    () => {},\n",
+                "    () => { gamma(); },\n",
+                "];\n",
+            ),
+        ),
+    ];
+
+    for (path, before, after) in cases {
+        let diff = diff_file(path, before, after).expect("anonymous bodies must plan");
+
+        assert_removed_payload(&diff, "gamma();");
+        assert_added_payload(&diff, "gamma();");
+        assert!(
+            !source_lines(&diff).any(|(line, current)| {
+                current && line_has_marked_payload(line, "gamma", DiffMark::Context)
+            }),
+            "a sibling body borrowed the old payload in {path}: {diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
+fn repeated_callable_headers_cannot_let_body_payload_choose_their_occurrence() {
+    let before = concat!(
+        "const alpha = [\n",
+        "    beta => { gamma(); },\n",
+        "    beta => {},\n",
+        "];\n",
+    );
+    let after = concat!(
+        "const alpha = [\n",
+        "    beta => {},\n",
+        "    beta => { gamma(); },\n",
+        "];\n",
+    );
+
+    let diff = diff_file("alpha.ts", before, after).expect("TypeScript must plan");
+
+    assert_removed_payload(&diff, "gamma();");
+    assert_added_payload(&diff, "gamma();");
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "gamma();", DiffMark::Context)
+        }),
+        "a repeated callable header let body payload choose its sibling: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn repeated_named_owners_pair_fifo_before_their_bodies() {
+    let before = concat!(
+        "mod alpha {\n",
+        "    impl Beta { fn gamma() { delta(); } }\n",
+        "    impl Beta {}\n",
+        "}\n",
+    );
+    let after = concat!(
+        "mod alpha {\n",
+        "    impl Beta {}\n",
+        "    impl Beta { fn gamma() { delta(); } }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "fn gamma() { delta(); }");
+    assert_added_payload(&diff, "fn gamma() { delta(); }");
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "delta();", DiffMark::Context)
+        }),
+        "a repeated named owner let its body choose another occurrence: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn copied_object_payload_cannot_steal_the_local_object() {
+    let before = concat!("const alpha = [\n", "  { beta: ALPHA },\n", "];\n",);
+    let after = concat!(
+        "const alpha = [\n",
+        "  { beta: BETA },\n",
+        "  { beta: ALPHA },\n",
+        "];\n",
+    );
+
+    let diff = diff_file("alpha.ts", before, after).expect("TypeScript must plan");
+
+    assert_removed_payload(&diff, "ALPH");
+    assert_added_payload(&diff, "BET");
+    assert_line_fragment_mark(&diff, "beta: BETA", "beta", DiffMark::Context);
+    assert_added_subtree(&diff, 3..4);
+    assert_current_payload_once(&diff, "beta: ALPHA");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn sibling_object_fields_cannot_choose_another_object_occurrence() {
+    let before = concat!(
+        "const alpha = [\n",
+        "    { beta: gamma() },\n",
+        "    { beta: null },\n",
+        "];\n",
+    );
+    let after = concat!(
+        "const alpha = [\n",
+        "    { beta: null },\n",
+        "    { beta: gamma() },\n",
+        "];\n",
+    );
+
+    let diff = diff_file("alpha.ts", before, after).expect("TypeScript must plan");
+
+    for payload in ["gamma", "null"] {
+        assert_removed_payload(&diff, payload);
+        assert_added_payload(&diff, payload);
+    }
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "gamma", DiffMark::Context)
+        }),
+        "a field payload selected another object occurrence: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn copied_if_payload_cannot_steal_the_local_branch() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    if beta() {\n",
+        "        gamma(ALPHA);\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    if beta() {\n",
+        "        gamma(BETA);\n",
+        "    }\n",
+        "    if delta() {\n",
+        "        gamma(ALPHA);\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "ALPH");
+    assert_added_payload(&diff, "BET");
+    assert_line_fragment_mark(&diff, "gamma(BETA)", "gamma", DiffMark::Context);
+    assert_added_subtree(&diff, 5..8);
+    assert_current_payload_once(&diff, "gamma(ALPHA)");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn repeated_conditions_cannot_let_branch_payload_choose_their_occurrence() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    if beta() { gamma(); }\n",
+        "    if beta() {}\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    if beta() {}\n",
+        "    if beta() { gamma(); }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "gamma();");
+    assert_added_payload(&diff, "gamma();");
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "gamma();", DiffMark::Context)
+        }),
+        "a repeated condition let branch payload choose its sibling: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn decorated_payload_cannot_cross_into_an_inserted_branch() {
+    let before = concat!("fn alpha() {\n", "    //! gamma\n", "    beta();\n", "}\n",);
+    let after = concat!(
+        "fn alpha() {\n",
+        "    if true {\n",
+        "        //! gamma\n",
+        "        beta();\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_subtree(&diff, 2..6);
+    assert_current_payload_once(&diff, "//! gamma");
+    assert_current_payload_once(&diff, "beta();");
+    assert_removed_payload(&diff, "//! gamma");
+    assert_removed_payload(&diff, "beta();");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn repeated_lines_cannot_be_consumed_by_an_inserted_function() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    gamma();\n",
+        "}\n",
+        "fn beta() {\n",
         "    gamma();\n",
         "}\n",
     );
     let after = concat!(
         "fn alpha() {\n",
-        "    alpha();\n",
         "    delta();\n",
         "}\n",
-        "\n",
-        "fn delta() {\n",
-        "    beta();\n",
+        "fn gamma() {\n",
+        "    gamma();\n",
+        "}\n",
+        "fn beta() {\n",
         "    gamma();\n",
         "}\n",
     );
 
     let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
 
-    for payload in ["beta();", "gamma();"] {
-        assert_unchanged_payload(&diff, payload);
-        assert_current_payload_once(&diff, payload);
-    }
-    assert_added_payload(&diff, "delta");
+    assert_added_subtree(&diff, 4..7);
+    assert_line_fragment_mark(&diff, "gamma();", "gamma", DiffMark::Context);
+    assert_eq!(current_payload_count(&diff, "gamma();"), 2, "{diff:#?}");
     assert_source_ownership(&diff);
 }
 
@@ -174,6 +905,521 @@ fn isolated_expression_edit_does_not_repeat_distant_breadcrumbs() {
     assert_added_payload(&diff, "unwrap_or");
     assert_line_fragment_mark(&diff, "unwrap_or", "Beta", DiffMark::Context);
     assert_line_fragment_mark(&diff, "unwrap_or", "Alpha", DiffMark::Context);
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn duplicated_wrapper_payload_keeps_fifo_sibling_identity() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    consume(x);\n",
+        "    consume(y.unwrap_or(x));\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    consume(y.unwrap_or(x));\n",
+        "    consume(y.unwrap_or(x));\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_line_fragment_mark(&diff, "unwrap_or", "y.unwrap_or(", DiffMark::Added);
+    assert_line_fragment_mark(&diff, "unwrap_or", "x", DiffMark::Context);
+    assert_no_removed_payload(&diff, "x");
+    let wrapped = source_lines(&diff).any(|(line, current)| {
+        current && line.number == 2 && line.has_changes() && line_text(line).contains("unwrap_or")
+    });
+    assert!(
+        wrapped,
+        "the first sibling did not receive its local wrapper: {diff:#?}"
+    );
+    assert_eq!(
+        current_payload_count(&diff, "consume(y.unwrap_or(x));"),
+        2,
+        "both current siblings must remain visible: {diff:#?}"
+    );
+    let retained = source_lines(&diff).any(|(line, current)| {
+        current && line.number == 3 && !line.has_changes() && line_text(line).contains("unwrap_or")
+    });
+    assert!(
+        retained,
+        "the existing second sibling lost its identity: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn nested_closures_retain_their_unique_payload_at_any_depth() {
+    let before = concat!("fn alpha() {\n", "    let beta = x;\n", "}\n");
+    let after = concat!("fn alpha() {\n", "    let beta = || || || x;\n", "}\n");
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_payload(&diff, "|| || ||");
+    assert_line_fragment_mark(&diff, "|| || || x", "x", DiffMark::Context);
+    assert_no_removed_payload(&diff, "x");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn multiline_wrapper_is_one_green_only_structural_edit() {
+    let before = concat!("fn alpha() {\n", "    let beta = x;\n", "}\n");
+    let after = concat!(
+        "fn alpha() {\n",
+        "    let beta = Some(\n",
+        "        x\n",
+        "    );\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_line_fragment_mark(&diff, "let beta = Some(", "let beta = ", DiffMark::Context);
+    assert_line_fragment_mark(&diff, "let beta = Some(", "Some(", DiffMark::Added);
+    assert_line_fragment_mark(&diff, "        x", "x", DiffMark::Context);
+    assert_line_fragment_mark(&diff, "    );", ")", DiffMark::Added);
+    assert!(
+        source_lines(&diff).all(|(_, current)| current),
+        "a green-only wrapper retained an old-world ghost: {diff:#?}"
+    );
+    let current = source_lines(&diff)
+        .filter_map(|(line, current)| current.then_some(line.number))
+        .collect::<Vec<_>>();
+    assert!(
+        current.windows(2).all(|pair| pair[0] <= pair[1]),
+        "one wrapper transition reordered its own rows: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn multiline_unwrapper_is_one_red_only_structural_edit() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    let beta = Some(\n",
+        "        x\n",
+        "    );\n",
+        "}\n",
+    );
+    let after = concat!("fn alpha() {\n", "    let beta = x;\n", "}\n");
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "Some(");
+    assert_removed_payload(&diff, ")");
+    assert_context_payload(&diff, "let beta = x;");
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "let beta = x;", DiffMark::Added)
+        }),
+        "an unwrap painted retained current syntax green: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn nested_type_assertion_retains_its_unique_payload_at_any_depth() {
+    let before = "const alpha = await beta({ gamma: true, delta: true });\n";
+    let after = "const alpha = (await beta({ gamma: true, delta: true })) as Epsilon | null;\n";
+
+    let diff = diff_file("alpha.ts", before, after).expect("TypeScript must plan");
+
+    assert_line_fragment_mark(
+        &diff,
+        "as Epsilon | null",
+        "await beta({ gamma: true, delta: true })",
+        DiffMark::Context,
+    );
+    for fragment in ["(", ")", "as", "Epsilon", "|", "null"] {
+        assert_line_fragment_mark(&diff, "as Epsilon | null", fragment, DiffMark::Added);
+    }
+    assert_no_removed_payload(&diff, "await beta({ gamma: true, delta: true })");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn removing_nested_elements_retains_their_unique_payload_at_any_depth() {
+    let before = "<alpha><beta><img src=\"gamma.webp\"></beta></alpha>\n";
+    let after = "<img src=\"gamma.webp\">\n";
+
+    let diff = diff_file("alpha.html", before, after).expect("HTML must plan");
+
+    assert_context_payload(&diff, "<img src=\"gamma.webp\">");
+    assert_no_removed_payload(&diff, "<img src=\"gamma.webp\">");
+    assert_removed_payload(&diff, "<alpha><beta>");
+    assert_removed_payload(&diff, "</beta></alpha>");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn nested_elements_retain_their_unique_payload_at_any_depth() {
+    let before = "<img src=\"alpha.webp\">\n";
+    let after = concat!(
+        "<div>\n",
+        "  <section>\n",
+        "    <img src=\"alpha.webp\">\n",
+        "  </section>\n",
+        "</div>\n",
+    );
+
+    let diff = diff_file("alpha.html", before, after).expect("HTML must plan");
+
+    assert_context_payload(&diff, "<img src=\"alpha.webp\">");
+    assert_no_removed_payload(&diff, "<img src=\"alpha.webp\">");
+    for payload in ["<div>", "<section>", "</section>", "</div>"] {
+        assert_added_payload(&diff, payload);
+    }
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn repeated_elements_cannot_choose_an_occurrence_by_their_payload() {
+    let before = concat!("<div><span></span></div>\n", "<div></div>\n",);
+    let after = concat!("<div></div>\n", "<div><span></span></div>\n",);
+
+    let diff = diff_file("alpha.html", before, after).expect("HTML must plan");
+
+    assert_removed_payload(&diff, "<span></span>");
+    assert_added_payload(&diff, "<span></span>");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn repeated_jsx_elements_cannot_choose_an_occurrence_by_their_payload() {
+    let before = concat!(
+        "const alpha = [\n",
+        "  <div><span /></div>,\n",
+        "  <div></div>,\n",
+        "];\n",
+    );
+    let after = concat!(
+        "const alpha = [\n",
+        "  <div></div>,\n",
+        "  <div><span /></div>,\n",
+        "];\n",
+    );
+
+    let diff = diff_file("alpha.tsx", before, after).expect("TSX must plan");
+
+    assert_removed_payload(&diff, "<span />");
+    assert_added_payload(&diff, "<span />");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn repeated_declarations_cannot_choose_an_occurrence_by_their_value() {
+    let before = concat!(".alpha {\n", "  color: alpha;\n", "  color: beta;\n", "}\n",);
+    let after = concat!(".alpha {\n", "  color: beta;\n", "  color: alpha;\n", "}\n",);
+
+    let diff = diff_file("alpha.css", before, after).expect("CSS must plan");
+
+    assert_removed_payload(&diff, "alph");
+    assert_added_payload(&diff, "alph");
+    assert_removed_payload(&diff, "bet");
+    assert_added_payload(&diff, "bet");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn duplicated_payload_does_not_certify_a_wrapper_spine() {
+    let before = concat!("fn alpha() {\n", "    let beta = x;\n", "}\n");
+    let after = concat!("fn alpha() {\n", "    let beta = (x, x);\n", "}\n");
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "x");
+    assert_line_fragment_mark(&diff, "(x, x)", "(x, x)", DiffMark::Added);
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current
+                && line_text(line).contains("(x, x)")
+                && line_has_marked_payload(line, "x", DiffMark::Context)
+        }),
+        "an ambiguous duplicate was retained as the wrapper payload: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn a_new_local_function_is_not_a_wrapper_around_an_old_statement() {
+    let before = concat!("fn alpha() {\n", "    beta();\n", "}\n");
+    let after = concat!(
+        "fn alpha() {\n",
+        "    fn gamma() {\n",
+        "        beta();\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_removed_payload(&diff, "beta();");
+    assert_added_subtree(&diff, 2..5);
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn payload_moved_between_arrow_bodies_is_not_a_wrapper_transition() {
+    let before = concat!(
+        "const alpha = () => {\n",
+        "    gamma();\n",
+        "};\n",
+        "const beta = () => {};\n",
+    );
+    let after = concat!(
+        "const alpha = () => {};\n",
+        "const beta = () => {\n",
+        "    gamma();\n",
+        "};\n",
+    );
+
+    let diff = diff_file("alpha.ts", before, after).expect("TypeScript must plan");
+
+    assert_removed_payload(&diff, "gamma();");
+    assert_added_payload(&diff, "gamma();");
+    assert!(
+        !source_lines(&diff).any(|(line, current)| {
+            current && line_has_marked_payload(line, "gamma();", DiffMark::Context)
+        }),
+        "a sibling function body borrowed the old payload: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn swapped_calls_cannot_tunnel_between_function_owners() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    gamma();\n",
+        "}\n",
+        "fn beta() {\n",
+        "    delta();\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    delta();\n",
+        "}\n",
+        "fn beta() {\n",
+        "    gamma();\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    for payload in ["gamm", "delt"] {
+        assert_removed_payload(&diff, payload);
+        assert_added_payload(&diff, payload);
+    }
+    assert_line_predecessor(&diff, 2, 2, "gamma();", "delta();");
+    assert_line_predecessor(&diff, 5, 5, "delta();", "gamma();");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn an_inserted_call_cannot_consume_the_following_exact_sibling() {
+    let before = concat!("fn alpha() {\n", "    beta();\n", "}\n");
+    let after = concat!("fn alpha() {\n", "    gamma();\n", "    beta();\n", "}\n",);
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_payload(&diff, "gamma();");
+    assert_context_payload(&diff, "beta();");
+    assert_current_payload_once(&diff, "beta();");
+    assert_no_removed_payload(&diff, "beta();");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn an_inserted_parameter_cannot_consume_the_following_exact_sibling() {
+    let before = concat!("fn alpha(\n", "    beta: Beta,\n", ") {}\n");
+    let after = concat!(
+        "fn alpha(\n",
+        "    gamma: Gamma,\n",
+        "    beta: Beta,\n",
+        ") {}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_payload(&diff, "gamma: Gamma,");
+    assert_context_payload(&diff, "beta: Beta,");
+    assert_current_payload_once(&diff, "beta: Beta,");
+    assert_no_removed_payload(&diff, "beta: Beta,");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn an_inserted_branch_statement_cannot_consume_the_exact_tail() {
+    let before = concat!(
+        "fn alpha(beta: bool) {\n",
+        "    if beta {\n",
+        "        gamma();\n",
+        "    } else {\n",
+        "        delta();\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha(beta: bool) {\n",
+        "    if beta {\n",
+        "        gamma();\n",
+        "    } else {\n",
+        "        epsilon();\n",
+        "        delta();\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert_added_payload(&diff, "epsilon();");
+    assert_context_payload(&diff, "delta();");
+    assert_current_payload_once(&diff, "delta();");
+    assert_no_removed_payload(&diff, "delta();");
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn a_breadcrumb_and_context_share_one_physical_row() {
+    let before = concat!(
+        "struct Alpha {\n",
+        "    beta: Old,\n",
+        "}\n",
+        "\n",
+        "impl Alpha {\n",
+        "    fn gamma() {\n",
+        "        let a = 1;\n",
+        "        let b = 2;\n",
+        "        let c = 3;\n",
+        "        let d = 4;\n",
+        "        old();\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = before.replace("Old", "New").replace("old();", "new();");
+
+    let diff = diff_file("alpha.rs", before, &after).expect("Rust must plan");
+
+    assert_eq!(
+        current_payload_count(&diff, "impl Alpha {"),
+        1,
+        "one physical context row was emitted twice: {diff:#?}"
+    );
+    for payload in ["Old", "old"] {
+        assert_removed_payload(&diff, payload);
+    }
+    for payload in ["New", "new"] {
+        assert_added_payload(&diff, payload);
+    }
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn separate_leaf_edits_stay_with_their_own_expressions() {
+    let before = concat!(
+        "fn alpha() {\n",
+        "    beta(&[\"gamma\", \"ALPHA\"]);\n",
+        "    beta(\n",
+        "        &[\"gamma\", \"ALPHA\"],\n",
+        "    );\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha() {\n",
+        "    beta(&[\"gamma\", \"BETA\"]);\n",
+        "    beta(\n",
+        "        &[\"gamma\", \"BETA\"],\n",
+        "    );\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    for line in [2, 4] {
+        assert_line_predecessor(&diff, line, line, "ALPHA", "BETA");
+        let displays = source_lines(&diff)
+            .filter(|(display, _)| {
+                let text = line_text(display);
+                display.number == line && (text.contains("ALPHA") || text.contains("BETA"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            displays.len(),
+            2,
+            "both revisions must stay local: {diff:#?}"
+        );
+        for (display, current) in displays {
+            let suffix = if line == 2 { "]);" } else { "]," };
+            assert!(
+                display
+                    .spans
+                    .iter()
+                    .any(|span| span.mark == DiffMark::Context && span.text.contains(suffix)),
+                "the {:?} suffix became {:?} syntax: {diff:#?}",
+                if current { "current" } else { "before" },
+                if current { "added" } else { "removed" },
+            );
+        }
+    }
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn changed_chain_marks_the_inserted_link_and_keeps_outer_context() {
+    let before = concat!(
+        "fn alpha(beta: Beta) {\n",
+        "    if beta.gamma() == \"alpha\" {\n",
+        "        let delta = beta\n",
+        "            .epsilon(\"beta\")\n",
+        "            .map(|zeta| zeta.eta());\n",
+        "        theta(delta);\n",
+        "    }\n",
+        "}\n",
+    );
+    let after = concat!(
+        "fn alpha(beta: Beta) {\n",
+        "    if beta.gamma() == \"alpha\" || gamma(&beta) {\n",
+        "        let delta = beta\n",
+        "            .epsilon(\"beta\")\n",
+        "            .or_else(|| beta.epsilon(\"gamma\"))\n",
+        "            .map(|zeta| zeta.eta());\n",
+        "        theta(delta);\n",
+        "    }\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.rs", before, after).expect("Rust must plan");
+
+    assert!(source_lines(&diff).any(|(line, current)| {
+        current
+            && line.number == 2
+            && line.has_changes()
+            && line_text(line).contains("gamma(&beta)")
+    }));
+    assert_context_payload(&diff, ".epsilon(\"beta\")");
+    assert_current_payload_once(&diff, ".epsilon(\"beta\")");
+    assert_no_removed_payload(&diff, ".epsilon(\"beta\")");
+    for (line_number, payload, mark) in [
+        (5, "or_else", DiffMark::Added),
+        (6, ".map", DiffMark::Context),
+    ] {
+        let line = source_lines(&diff)
+            .find_map(|(line, current)| {
+                (current && line.number == line_number && line_text(line).contains(payload))
+                    .then_some(line)
+            })
+            .unwrap_or_else(|| panic!("missing chain link {payload:?}: {diff:#?}"));
+        assert!(
+            line.spans
+                .iter()
+                .filter(|span| !span.text.trim().is_empty())
+                .all(|span| span.mark == mark),
+            "chain link {payload:?} contains a mark other than {mark:?}: {diff:#?}"
+        );
+    }
     assert_source_ownership(&diff);
 }
 
@@ -210,15 +1456,28 @@ fn deep_edit_keeps_ancestor_breadcrumbs_and_a_local_halo() {
         "    }\n",
         "\n",
         "    fn beta(&self) {\n",
-        "        beta();\n",
+        "        delta();\n",
         "    }\n",
         "}\n",
     );
     let after = before.replace("self.beta()", "self.gamma()");
+    let sibling_line = before
+        .lines()
+        .position(|line| line.contains("fn beta"))
+        .expect("fixture has a distant sibling")
+        + 1;
 
     let diff = diff_file("alpha.rs", before, &after).expect("Rust must plan");
     let hunk = diff.hunks.first().expect("the edit must be visible");
 
+    assert_eq!(diff.hunks.len(), 1, "one edit needs one focused hunk");
+    assert!(
+        hunk.coverage
+            .after
+            .as_ref()
+            .is_some_and(|coverage| coverage.end <= sibling_line),
+        "the local halo reached the distant sibling: {hunk:#?}"
+    );
     for payload in [
         "impl Alpha",
         "fn alpha",
@@ -229,6 +1488,12 @@ fn deep_edit_keeps_ancestor_breadcrumbs_and_a_local_halo() {
         assert!(
             hunk_contains(hunk, payload),
             "missing {payload:?}: {hunk:#?}"
+        );
+    }
+    for payload in ["fn beta", "delta();"] {
+        assert!(
+            !hunk_contains(hunk, payload),
+            "distant sibling payload {payload:?} leaked into the local halo: {hunk:#?}"
         );
     }
     assert_source_ownership(&diff);
@@ -374,20 +1639,6 @@ fn line_text(line: &DisplayLine) -> String {
     line.spans.iter().map(|span| span.text.as_str()).collect()
 }
 
-fn assert_unchanged_payload(diff: &FileDiff, payload: &str) {
-    let matching = source_lines(diff)
-        .filter(|(line, _)| line_text(line).contains(payload))
-        .collect::<Vec<_>>();
-    assert!(
-        !matching.is_empty(),
-        "missing stable payload {payload:?}: {diff:#?}"
-    );
-    assert!(
-        matching.iter().all(|(line, _)| !line.has_changes()),
-        "stable payload {payload:?} became a material change: {matching:#?}"
-    );
-}
-
 fn assert_current_payload_once(diff: &FileDiff, payload: &str) {
     let occurrences = current_payload_count(diff, payload);
     assert_eq!(occurrences, 1, "current payload {payload:?}: {diff:#?}");
@@ -396,11 +1647,7 @@ fn assert_current_payload_once(diff: &FileDiff, payload: &str) {
 fn assert_context_payload(diff: &FileDiff, payload: &str) {
     assert!(
         source_lines(diff).any(|(line, current)| {
-            current
-                && line
-                    .spans
-                    .iter()
-                    .any(|span| span.mark == DiffMark::Context && span.text.contains(payload))
+            current && line_has_marked_payload(line, payload, DiffMark::Context)
         }),
         "missing retained payload {payload:?}: {diff:#?}"
     );
@@ -411,10 +1658,7 @@ fn assert_line_fragment_mark(diff: &FileDiff, line_payload: &str, fragment: &str
         source_lines(diff).any(|(line, current)| {
             current
                 && line_text(line).contains(line_payload)
-                && line
-                    .spans
-                    .iter()
-                    .any(|span| span.mark == mark && span.text.contains(fragment))
+                && line_has_marked_payload(line, fragment, mark)
         }),
         "missing {mark:?} fragment {fragment:?} on {line_payload:?}: {diff:#?}"
     );
@@ -429,9 +1673,7 @@ fn current_payload_count(diff: &FileDiff, payload: &str) -> usize {
 fn assert_added_payload(diff: &FileDiff, payload: &str) {
     assert!(
         source_lines(diff).any(|(line, current)| {
-            current
-                && line_text(line).contains(payload)
-                && line.spans.iter().any(|span| span.mark == DiffMark::Added)
+            current && line_has_marked_payload(line, payload, DiffMark::Added)
         }) || diff
             .hunks
             .iter()
@@ -441,17 +1683,163 @@ fn assert_added_payload(diff: &FileDiff, payload: &str) {
     );
 }
 
+fn assert_added_subtree(diff: &FileDiff, lines: Range<usize>) {
+    let expected = lines.clone().collect::<Vec<_>>();
+    let mut seen = Vec::new();
+    for (hunk_index, hunk) in diff.hunks.iter().enumerate() {
+        for (row_index, row) in hunk.rows.iter().enumerate() {
+            let current = match row {
+                DiffRow::LineChange { before, after } => {
+                    let Some(after) = after else {
+                        continue;
+                    };
+                    if !lines.contains(&after.number) {
+                        continue;
+                    }
+                    assert!(
+                        before.is_none(),
+                        "added subtree line {} borrowed old source: {diff:#?}",
+                        after.number
+                    );
+                    after
+                }
+                DiffRow::Line(line)
+                | DiffRow::Reflow(line)
+                | DiffRow::Moved { after: line, .. }
+                    if lines.contains(&line.number) =>
+                {
+                    panic!(
+                        "added subtree line {} was retained instead of added: {diff:#?}",
+                        line.number
+                    );
+                }
+                DiffRow::Wordwise(word)
+                    if word.after_line.is_some_and(|line| lines.contains(&line)) =>
+                {
+                    panic!("added subtree borrowed a wordwise predecessor: {diff:#?}");
+                }
+                _ => continue,
+            };
+            assert!(
+                current
+                    .spans
+                    .iter()
+                    .all(|span| span.mark == DiffMark::Added),
+                "added subtree line {} contains a retained span: {diff:#?}",
+                current.number
+            );
+            seen.push((hunk_index, row_index, current.number));
+        }
+    }
+
+    assert_eq!(
+        seen.iter().map(|(_, _, line)| *line).collect::<Vec<_>>(),
+        expected,
+        "added subtree coverage: {diff:#?}"
+    );
+    assert!(
+        seen.iter().all(|(hunk, _, _)| *hunk == seen[0].0),
+        "added subtree was split across hunks: {diff:#?}"
+    );
+    assert!(
+        seen.windows(2)
+            .all(|rows| rows[0].1.checked_add(1) == Some(rows[1].1)),
+        "added subtree rows were interleaved: {diff:#?}"
+    );
+}
+
+fn assert_line_predecessor(
+    diff: &FileDiff,
+    before_number: usize,
+    after_number: usize,
+    before_payload: &str,
+    after_payload: &str,
+) {
+    let paired = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .any(|row| match row {
+            DiffRow::LineChange {
+                before: Some(before),
+                after: Some(after),
+            } => {
+                before.number == before_number
+                    && after.number == after_number
+                    && line_text(before).contains(before_payload)
+                    && line_text(after).contains(after_payload)
+            }
+            DiffRow::Wordwise(word) => {
+                word.before_line == Some(before_number)
+                    && word.after_line == Some(after_number)
+                    && format!("{}{}{}", word.prefix, word.removed, word.suffix)
+                        .contains(before_payload)
+                    && format!("{}{}{}", word.prefix, word.added, word.suffix)
+                        .contains(after_payload)
+            }
+            _ => false,
+        });
+    let adjacent = diff.hunks.iter().any(|hunk| {
+        hunk.rows.windows(2).any(|rows| {
+            matches!(
+                rows,
+                [
+                    DiffRow::LineChange {
+                        before: Some(before),
+                        after: None,
+                    },
+                    DiffRow::LineChange {
+                        before: None,
+                        after: Some(after),
+                    },
+                ] if before.number == before_number
+                    && after.number == after_number
+                    && line_text(before).contains(before_payload)
+                    && line_text(after).contains(after_payload)
+            )
+        })
+    });
+    assert!(
+        paired || adjacent,
+        "before line {before_number} did not directly precede current line {after_number}: {diff:#?}"
+    );
+}
+
+fn assert_no_removed_payload(diff: &FileDiff, payload: &str) {
+    assert!(
+        !source_lines(diff).any(|(line, current)| {
+            !current && line_has_marked_payload(line, payload, DiffMark::Removed)
+        }) && !diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+            matches!(row, DiffRow::Wordwise(word) if word.removed.contains(payload))
+        }),
+        "redundant old payload {payload:?} remained visible: {diff:#?}"
+    );
+}
+
 fn assert_removed_payload(diff: &FileDiff, payload: &str) {
     assert!(
         source_lines(diff).any(|(line, current)| {
-            !current
-                && line_text(line).contains(payload)
-                && line.spans.iter().any(|span| span.mark == DiffMark::Removed)
+            !current && line_has_marked_payload(line, payload, DiffMark::Removed)
         }) || diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
             matches!(row, DiffRow::Wordwise(word) if word.removed.contains(payload))
         }),
         "missing removed payload {payload:?}: {diff:#?}"
     );
+}
+
+fn line_has_marked_payload(line: &DisplayLine, payload: &str, mark: DiffMark) -> bool {
+    let mut run = String::new();
+    for span in &line.spans {
+        if span.mark != mark {
+            run.clear();
+            continue;
+        }
+        run.push_str(&span.text);
+        if run.contains(payload) {
+            return true;
+        }
+    }
+    false
 }
 
 fn assert_source_ownership(diff: &FileDiff) {

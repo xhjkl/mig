@@ -6,10 +6,10 @@ use tempfile::TempDir;
 fn real_git_scan_covers_the_net_recursive_worktree() {
     let repository = TempDir::new().expect("temporary repository");
     git(repository.path(), &["init", "--quiet"]);
-    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(repository.path(), &["config", "user.name", "Alpha"]);
     git(
         repository.path(),
-        &["config", "user.email", "mig@example.invalid"],
+        &["config", "user.email", "alpha@example.invalid"],
     );
 
     write(repository.path(), ".gitignore", "ignored.rs\n");
@@ -403,10 +403,10 @@ fn initialized_repository() -> TempDir {
 fn initialized_repository_with(init_args: &[&str]) -> TempDir {
     let repository = TempDir::new().expect("temporary repository");
     git(repository.path(), init_args);
-    git(repository.path(), &["config", "user.name", "Mig Test"]);
+    git(repository.path(), &["config", "user.name", "Alpha"]);
     git(
         repository.path(),
-        &["config", "user.email", "mig@example.invalid"],
+        &["config", "user.email", "alpha@example.invalid"],
     );
     repository
 }

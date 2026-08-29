@@ -1,7 +1,10 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
+use super::{
+    ContentChannel, CorrespondenceRole, Language, LayoutOwnership, Projection, ReviewMode,
+    ReviewUnit,
+};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -109,7 +112,10 @@ impl Adapter for TypeScriptAdapter {
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "program" {
-            return NodeAnnotation::default();
+            return NodeAnnotation {
+                correspondence: CorrespondenceRole::HardOwner,
+                ..NodeAnnotation::default()
+            };
         }
 
         if matches!(node.kind(), "comment" | "html_comment") {
@@ -133,6 +139,7 @@ impl Adapter for TypeScriptAdapter {
             return NodeAnnotation {
                 review,
                 identity,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -141,6 +148,7 @@ impl Adapter for TypeScriptAdapter {
             let identity = jsx_name(node).map(|name| name.byte_range());
             return NodeAnnotation {
                 identity,
+                correspondence: CorrespondenceRole::LocalOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -153,6 +161,11 @@ impl Adapter for TypeScriptAdapter {
             return NodeAnnotation {
                 review,
                 identity,
+                correspondence: if is_declaration_owner(node.kind()) {
+                    CorrespondenceRole::HardOwner
+                } else {
+                    CorrespondenceRole::Transparent
+                },
                 ..NodeAnnotation::default()
             };
         }
@@ -163,11 +176,32 @@ impl Adapter for TypeScriptAdapter {
                     ReviewMode::Linewise,
                     LayoutOwnership::AdjacentBlankLines,
                 )),
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
 
-        NodeAnnotation::default()
+        let identity = if is_member(node.kind()) {
+            direct_identity(node)
+        } else if matches!(node.kind(), "call_expression" | "new_expression") {
+            call_identity(node)
+        } else if node.kind() == "binary_expression" {
+            node.child_by_field_name("operator")
+        } else {
+            None
+        }
+        .map(|identity| identity.byte_range());
+        NodeAnnotation {
+            identity,
+            correspondence: if is_member(node.kind()) {
+                CorrespondenceRole::HardOwner
+            } else if is_local_container(node.kind()) {
+                CorrespondenceRole::LocalOwner
+            } else {
+                CorrespondenceRole::Transparent
+            },
+            ..NodeAnnotation::default()
+        }
     }
 
     fn gap_channel(&self, context: GapContext<'_, '_>) -> ContentChannel {
@@ -226,6 +260,17 @@ fn descendant_identity<'tree>(root: Node<'tree>) -> Option<Node<'tree>> {
 fn direct_identity(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("name")
         .or_else(|| node.child_by_field_name("property"))
+        .or_else(|| node.child_by_field_name("key"))
+}
+
+fn call_identity(node: Node<'_>) -> Option<Node<'_>> {
+    let function = node
+        .child_by_field_name("function")
+        .or_else(|| node.child_by_field_name("constructor"))?;
+    function
+        .child_by_field_name("property")
+        .or_else(|| function.child_by_field_name("name"))
+        .or_else(|| matches!(function.kind(), "identifier").then_some(function))
 }
 
 fn jsx_name<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
@@ -259,4 +304,20 @@ fn is_declaration(kind: &str) -> bool {
             | "using_declaration"
             | "variable_declaration"
     )
+}
+
+fn is_declaration_owner(kind: &str) -> bool {
+    is_declaration(kind) && !matches!(kind, "ambient_declaration" | "export_statement")
+}
+
+fn is_member(kind: &str) -> bool {
+    matches!(
+        kind,
+        "pair" | "property_signature" | "public_field_definition"
+    )
+}
+
+/// Anonymous structures whose child payload must not choose a sibling occurrence.
+fn is_local_container(kind: &str) -> bool {
+    matches!(kind, "object" | "object_pattern" | "object_type")
 }

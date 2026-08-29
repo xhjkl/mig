@@ -1,7 +1,10 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
+use super::{
+    ContentChannel, CorrespondenceRole, Language, LayoutOwnership, Projection, ReviewMode,
+    ReviewUnit,
+};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -32,7 +35,10 @@ impl Adapter for CssAdapter {
     fn annotate(&self, context: NodeContext<'_, '_>) -> NodeAnnotation {
         let node = context.node;
         if node.kind() == "stylesheet" {
-            return NodeAnnotation::default();
+            return NodeAnnotation {
+                correspondence: CorrespondenceRole::HardOwner,
+                ..NodeAnnotation::default()
+            };
         }
 
         if matches!(node.kind(), "comment" | "js_comment") {
@@ -54,6 +60,7 @@ impl Adapter for CssAdapter {
             return NodeAnnotation {
                 review,
                 identity,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -66,6 +73,7 @@ impl Adapter for CssAdapter {
             return NodeAnnotation {
                 review,
                 identity,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -74,6 +82,7 @@ impl Adapter for CssAdapter {
             let identity = first_named_child(node).map(|child| child.byte_range());
             return NodeAnnotation {
                 identity,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -84,6 +93,7 @@ impl Adapter for CssAdapter {
                     ReviewMode::Linewise,
                     LayoutOwnership::AdjacentBlankLines,
                 )),
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }

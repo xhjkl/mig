@@ -1,7 +1,10 @@
 use super::tree_sitter::{
     self, Adapter, GapContext, HighlightQueries, NodeAnnotation, NodeContext, ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
+use super::{
+    ContentChannel, CorrespondenceRole, Language, LayoutOwnership, Projection, ReviewMode,
+    ReviewUnit,
+};
 use crate::diff::source::Source;
 use ::tree_sitter::{Language as TreeSitterLanguage, Node};
 
@@ -52,6 +55,7 @@ impl Adapter for HtmlAdapter {
         if node.kind() == "document" {
             return NodeAnnotation {
                 review: Some(ReviewUnit::new(ReviewMode::Linewise, LayoutOwnership::None)),
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -62,6 +66,7 @@ impl Adapter for HtmlAdapter {
                 channel: Some(ContentChannel::Opaque),
                 descendant_channel: Some(ContentChannel::Opaque),
                 identity,
+                correspondence: CorrespondenceRole::LocalOwner,
                 extent: Some(node.start_byte()..context.source.len()),
                 prune_children: true,
                 ..NodeAnnotation::default()
@@ -74,12 +79,22 @@ impl Adapter for HtmlAdapter {
                 channel: Some(ContentChannel::Opaque),
                 descendant_channel: Some(ContentChannel::Opaque),
                 identity,
+                correspondence: CorrespondenceRole::LocalOwner,
                 prune_children: true,
                 ..NodeAnnotation::default()
             };
         }
 
-        if is_element(node.kind()) || matches!(node.kind(), "start_tag" | "self_closing_tag") {
+        if is_element(node.kind()) || node.kind() == "self_closing_tag" {
+            let identity = tag_name(node).map(|name| name.byte_range());
+            return NodeAnnotation {
+                identity,
+                correspondence: CorrespondenceRole::LocalOwner,
+                ..NodeAnnotation::default()
+            };
+        }
+
+        if node.kind() == "start_tag" {
             let identity = tag_name(node).map(|name| name.byte_range());
             return NodeAnnotation {
                 identity,

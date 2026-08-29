@@ -2,7 +2,10 @@ use super::tree_sitter::{
     self, Adapter, DecorationHint, GapContext, HighlightQueries, NodeAnnotation, NodeContext,
     ProjectFailure,
 };
-use super::{ContentChannel, Language, LayoutOwnership, Projection, ReviewMode, ReviewUnit};
+use super::{
+    ContentChannel, CorrespondenceRole, Language, LayoutOwnership, Projection, ReviewMode,
+    ReviewUnit,
+};
 use crate::diff::source::Source;
 use ::tree_sitter::Language as TreeSitterLanguage;
 
@@ -35,6 +38,7 @@ impl Adapter for RustAdapter {
         if node.kind() == "source_file" {
             return NodeAnnotation {
                 owns_decorations: true,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -64,6 +68,7 @@ impl Adapter for RustAdapter {
                 review,
                 identity,
                 owns_decorations: true,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -77,6 +82,7 @@ impl Adapter for RustAdapter {
                 review,
                 identity,
                 owns_decorations: true,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
@@ -94,13 +100,28 @@ impl Adapter for RustAdapter {
                 )),
                 decoration,
                 owns_decorations: true,
+                correspondence: CorrespondenceRole::HardOwner,
                 ..NodeAnnotation::default()
             };
         }
 
+        let identity = match node.kind() {
+            "enum_variant" | "field_declaration" => identity_node(node),
+            "call_expression" => call_identity(node),
+            "binary_expression" => node.child_by_field_name("operator"),
+            _ => None,
+        }
+        .map(|identity| identity.byte_range());
+        let owns_decorations = is_nested_decoration_owner(node.kind());
         NodeAnnotation {
+            identity,
             decoration,
-            owns_decorations: is_nested_decoration_owner(node.kind()),
+            owns_decorations,
+            correspondence: if is_semantic_owner(node.kind()) {
+                CorrespondenceRole::HardOwner
+            } else {
+                CorrespondenceRole::Transparent
+            },
             ..NodeAnnotation::default()
         }
     }
@@ -129,6 +150,14 @@ fn identity_node<'tree>(node: ::tree_sitter::Node<'tree>) -> Option<::tree_sitte
     node.child_by_field_name("type")
 }
 
+fn call_identity<'tree>(node: ::tree_sitter::Node<'tree>) -> Option<::tree_sitter::Node<'tree>> {
+    let function = node.child_by_field_name("function")?;
+    function
+        .child_by_field_name("field")
+        .or_else(|| function.child_by_field_name("name"))
+        .or_else(|| matches!(function.kind(), "identifier").then_some(function))
+}
+
 fn is_comment(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment")
 }
@@ -150,6 +179,21 @@ fn doc_comment_decoration(kind: &str, text: &str) -> DecorationHint {
 
 /// Nested semantic boundaries that may receive an outer attribute or documentation comment.
 fn is_nested_decoration_owner(kind: &str) -> bool {
+    is_definition(kind)
+        || matches!(
+            kind,
+            "associated_type"
+                | "enum_variant"
+                | "field_declaration"
+                | "function_signature_item"
+                | "let_declaration"
+                | "macro_invocation"
+                | "match_arm"
+        )
+}
+
+/// Identify semantic owners whose unmatched descendants cannot escape into another owner.
+fn is_semantic_owner(kind: &str) -> bool {
     is_definition(kind)
         || matches!(
             kind,
