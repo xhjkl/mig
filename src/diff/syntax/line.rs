@@ -1,12 +1,12 @@
 use super::{
-    ChildSlot, ContentChannel, Language, LayoutOwnership, Leaf, LeafRole, NodeId, ReviewUnit,
+    ChildSlot, ContentChannel, LayoutOwnership, Leaf, LeafRole, NodeId, ReviewUnit,
     SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree, WrapperBoundary,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
 
 /// Lower source to a degenerate tree whose file root owns one exact leaf per physical line.
-pub(super) fn lower(source: Source<'_>) -> SyntaxTree<'_> {
+pub fn lower(source: Source<'_>) -> SyntaxTree<'_> {
     let root = NodeId::new(0);
     let root_lines = source
         .line_coverage(0..source.as_str().len())
@@ -58,5 +58,5 @@ pub(super) fn lower(source: Source<'_>) -> SyntaxTree<'_> {
         });
     }
 
-    SyntaxTree::from_nodes(source, Language::Lines, root, nodes)
+    SyntaxTree::from_nodes(source, None, root, nodes)
 }

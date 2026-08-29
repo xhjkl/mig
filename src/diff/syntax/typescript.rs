@@ -1,25 +1,24 @@
-use super::lower::{GapContext, HighlightQueries, NodeAnnotation, NodeContext};
+use super::lower::{HighlightQueries, NodeAnnotation};
 use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
 use ::tree_sitter::Node;
 
-pub(super) static TYPESCRIPT_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
+pub static TYPESCRIPT_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
     tree_sitter_javascript::HIGHLIGHT_QUERY,
     tree_sitter_typescript::HIGHLIGHTS_QUERY,
 ]);
-pub(super) static TSX_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
+pub static TSX_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
     tree_sitter_javascript::HIGHLIGHT_QUERY,
     tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
     tree_sitter_typescript::HIGHLIGHTS_QUERY,
 ]);
-pub(super) static JAVASCRIPT_HIGHLIGHTS: HighlightQueries =
+pub static JAVASCRIPT_HIGHLIGHTS: HighlightQueries =
     HighlightQueries::new(&[tree_sitter_javascript::HIGHLIGHT_QUERY]);
-pub(super) static JSX_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
+pub static JSX_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
     tree_sitter_javascript::HIGHLIGHT_QUERY,
     tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
 ]);
 
-pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
-    let node = context.node;
+pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
     if node.kind() == "program" {
         return NodeAnnotation {
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -29,8 +28,8 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if matches!(node.kind(), "comment" | "html_comment") {
-        let review = (context.parent_kind == Some("program"))
-            .then(|| ReviewUnit::linewise(LayoutOwnership::None));
+        let review =
+            (parent_kind == Some("program")).then(|| ReviewUnit::linewise(LayoutOwnership::None));
         return NodeAnnotation {
             review,
             channel: Some(ContentChannel::Comment),
@@ -44,8 +43,8 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         let identity = node
             .child_by_field_name("source")
             .map(|source| source.byte_range());
-        let review = (context.parent_kind == Some("program"))
-            .then(|| ReviewUnit::wiring(LayoutOwnership::None));
+        let review =
+            (parent_kind == Some("program")).then(|| ReviewUnit::wiring(LayoutOwnership::None));
         return NodeAnnotation {
             review,
             identity,
@@ -55,8 +54,11 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    if is_jsx_element(node.kind()) {
-        let identity = jsx_name(node).map(|name| name.byte_range());
+    if matches!(node.kind(), "jsx_element" | "jsx_self_closing_element") {
+        let opening = node.child_by_field_name("open_tag").unwrap_or(node);
+        let identity = opening
+            .child_by_field_name("name")
+            .map(|name| name.byte_range());
         return NodeAnnotation {
             identity,
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -66,17 +68,18 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
 
     if is_declaration(node.kind()) {
         let identity = declaration_identity(node).map(|name| name.byte_range());
-        let review = (context.parent_kind == Some("program"))
+        let review = (parent_kind == Some("program"))
             .then(|| ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines));
+        let owner = is_declaration_owner(node.kind());
         return NodeAnnotation {
             review,
             identity,
-            sibling_matching: if is_declaration_owner(node.kind()) {
+            sibling_matching: if owner {
                 SiblingMatching::LocalIdentity
             } else {
                 SiblingMatching::OrderedSyntax
             },
-            wrapper_boundary: if is_declaration_owner(node.kind()) {
+            wrapper_boundary: if owner {
                 WrapperBoundary::Sealed
             } else {
                 WrapperBoundary::Traversable
@@ -85,7 +88,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    if context.parent_kind == Some("program") && node.is_named() {
+    if parent_kind == Some("program") && node.is_named() {
         return NodeAnnotation {
             review: Some(ReviewUnit::linewise(LayoutOwnership::AdjacentBlankLines)),
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -94,7 +97,8 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    let identity = if is_member(node.kind()) {
+    let member = is_member(node.kind());
+    let identity = if member {
         direct_identity(node)
     } else if matches!(node.kind(), "call_expression" | "new_expression") {
         call_identity(node)
@@ -104,7 +108,6 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         None
     }
     .map(|identity| identity.byte_range());
-    let member = is_member(node.kind());
     NodeAnnotation {
         identity,
         sibling_matching: if member || is_local_container(node.kind()) {
@@ -121,41 +124,25 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 }
 
-pub(super) fn gap_channel(context: GapContext<'_, '_>) -> ContentChannel {
-    if context.is_whitespace()
-        && matches!(
-            context.parent.kind(),
-            "string"
-                | "string_fragment"
-                | "template_literal_type"
-                | "template_string"
-                | "template_type"
-        )
-    {
-        return ContentChannel::Syntax;
-    }
-    context.default_channel()
+pub fn whitespace_is_syntax(parent_kind: &str) -> bool {
+    matches!(
+        parent_kind,
+        "string"
+            | "string_fragment"
+            | "template_literal_type"
+            | "template_string"
+            | "template_type"
+    )
 }
 
 fn declaration_identity<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    let identity = direct_identity(node);
-    if identity.is_some() {
-        return identity;
-    }
-
-    let declaration = node.child_by_field_name("declaration");
-    if let Some(declaration) = declaration {
-        let identity = descendant_identity(declaration);
-        if identity.is_some() {
-            return identity;
-        }
-    }
-
-    let source = node.child_by_field_name("source");
-    if source.is_some() {
-        return source;
-    }
-    descendant_identity(node)
+    direct_identity(node)
+        .or_else(|| {
+            node.child_by_field_name("declaration")
+                .and_then(descendant_identity)
+        })
+        .or_else(|| node.child_by_field_name("source"))
+        .or_else(|| descendant_identity(node))
 }
 
 fn descendant_identity<'tree>(root: Node<'tree>) -> Option<Node<'tree>> {
@@ -187,16 +174,6 @@ fn call_identity(node: Node<'_>) -> Option<Node<'_>> {
         .child_by_field_name("property")
         .or_else(|| function.child_by_field_name("name"))
         .or_else(|| matches!(function.kind(), "identifier").then_some(function))
-}
-
-fn jsx_name<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    let opening = node.child_by_field_name("open_tag");
-    let opening = opening.unwrap_or(node);
-    opening.child_by_field_name("name")
-}
-
-fn is_jsx_element(kind: &str) -> bool {
-    matches!(kind, "jsx_element" | "jsx_self_closing_element")
 }
 
 fn is_declaration(kind: &str) -> bool {

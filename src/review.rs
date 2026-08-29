@@ -1,36 +1,60 @@
-use crate::diff::PresentedFile;
-pub use crate::diff::{MAX_REVISION_LINES, revision_line_count};
+use crate::diff::{MAX_REVISION_LINES, PresentedFile, diff_file};
+use anyhow::Result;
 
 /// Largest source revision Mig will load and expand into review rows.
 pub const MAX_REVISION_BYTES: u64 = 16 * 1024 * 1024;
 
-/// One path in the review ribbon, whether diffable or deliberately deferred.
+/// Turn acquired UTF-8 revisions into one bounded review item.
+pub fn review_source_pair(
+    path: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<Option<ReviewEntry>> {
+    let before_lines = before.map(|source| source.lines().count());
+    let after_lines = after.map(|source| source.lines().count());
+    if before_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
+        || after_lines.is_some_and(|lines| lines > MAX_REVISION_LINES)
+    {
+        return Ok(Some(ReviewEntry::Notice(FileNotice::TooManyLines {
+            path: path.to_owned(),
+            before_lines,
+            after_lines,
+            limit_lines: MAX_REVISION_LINES,
+        })));
+    }
+
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    let diff = diff_file(path, before, after)?;
+    if diff.hunks.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ReviewEntry::Diff(diff)))
+}
+
+/// One changed-path entry in the review ribbon.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReviewItem {
-    Presented(PresentedFile),
+pub enum ReviewEntry {
+    Diff(PresentedFile),
     Notice(FileNotice),
 }
 
-impl ReviewItem {
+impl ReviewEntry {
     pub fn path(&self) -> &str {
         match self {
-            Self::Presented(diff) => &diff.path,
-            Self::Notice(notice) => notice.path(),
+            Self::Diff(diff) => &diff.path,
+            Self::Notice(FileNotice::TooLarge { path, .. })
+            | Self::Notice(FileNotice::TooManyLines { path, .. }) => path,
         }
     }
 
     /// Generated ordering applies only after source was safe to inspect.
     pub fn is_generated(&self) -> bool {
         match self {
-            Self::Presented(diff) => diff.generated,
+            Self::Diff(diff) => diff.generated,
             Self::Notice(_) => false,
         }
-    }
-}
-
-impl From<PresentedFile> for ReviewItem {
-    fn from(diff: PresentedFile) -> Self {
-        Self::Presented(diff)
     }
 }
 
@@ -51,38 +75,25 @@ pub enum FileNotice {
     },
 }
 
-impl FileNotice {
-    pub fn too_large(
-        path: impl Into<String>,
-        before_bytes: Option<u64>,
-        after_bytes: Option<u64>,
-        limit_bytes: u64,
-    ) -> Self {
-        Self::TooLarge {
-            path: path.into(),
-            before_bytes,
-            after_bytes,
-            limit_bytes,
-        }
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn too_many_lines(
-        path: impl Into<String>,
-        before_lines: Option<usize>,
-        after_lines: Option<usize>,
-        limit_lines: usize,
-    ) -> Self {
-        Self::TooManyLines {
-            path: path.into(),
-            before_lines,
-            after_lines,
-            limit_lines,
-        }
-    }
+    #[test]
+    fn source_pair_notice_preserves_an_absent_revision() {
+        let after = "\n".repeat(MAX_REVISION_LINES + 1);
 
-    pub fn path(&self) -> &str {
-        match self {
-            Self::TooLarge { path, .. } | Self::TooManyLines { path, .. } => path,
-        }
+        let review = review_source_pair("alpha.txt", None, Some(&after))
+            .expect("inspect added source")
+            .expect("line-dense source stays visible");
+
+        assert!(matches!(
+            review,
+            ReviewEntry::Notice(FileNotice::TooManyLines {
+                before_lines: None,
+                after_lines: Some(lines),
+                ..
+            }) if lines == MAX_REVISION_LINES + 1
+        ));
     }
 }

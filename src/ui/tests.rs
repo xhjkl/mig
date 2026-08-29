@@ -67,24 +67,25 @@ fn file_navigation_clamps_and_resets_scroll() {
     app.scroll = 4;
 
     handle_key(&mut app, key(KeyCode::Right));
-    assert_eq!(app.current_diff().path, "beta.rs");
+    assert_eq!(app.current_review().path(), "beta.rs");
     assert_eq!(app.scroll, 0);
 
     app.scroll = 3;
     handle_key(&mut app, key(KeyCode::Right));
-    assert_eq!(app.current_diff().path, "beta.rs");
+    assert_eq!(app.current_review().path(), "beta.rs");
     assert_eq!(app.scroll, 3);
 
     handle_key(&mut app, key(KeyCode::Left));
-    assert_eq!(app.current_diff().path, "alpha.rs");
+    assert_eq!(app.current_review().path(), "alpha.rs");
     assert_eq!(app.scroll, 0);
 
     handle_key(&mut app, key(KeyCode::Left));
-    assert_eq!(app.current_diff().path, "alpha.rs");
+    assert_eq!(app.current_review().path(), "alpha.rs");
 }
 
-fn review(path: &str) -> PresentedFile {
-    crate::diff::diff_file(path, "fn alpha() {}\n", "fn beta() {}\n").expect("metasyntactic review")
+fn review(path: &str) -> ReviewEntry {
+    let diff = crate::diff::diff_file(path, "fn alpha() {}\n", "fn beta() {}\n").expect("review");
+    ReviewEntry::Diff(diff)
 }
 
 fn key(code: KeyCode) -> KeyEvent {

@@ -1,25 +1,42 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use std::fs::File;
-use std::io::{Read, Take};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Immutable Git blob identity and inspected size before its body is requested.
 #[derive(Clone, Copy)]
-pub(crate) struct GitBlob {
-    pub(crate) object: ObjectId,
-    pub(crate) bytes: u64,
+pub struct GitBlob {
+    pub object: ObjectId,
+    pub bytes: u64,
+}
+
+impl GitBlob {
+    /// Read the inspected object while preserving its pinned-size invariant.
+    pub fn read(self, repo: &gix::Repository) -> Result<Vec<u8>> {
+        let blob = repo.find_blob(self.object);
+        let mut blob = blob.context("failed to read Git blob")?;
+        if u64::try_from(blob.data.len()).unwrap_or(u64::MAX) != self.bytes {
+            bail!(
+                "Git returned {} bytes for a blob reported as {} bytes",
+                blob.data.len(),
+                self.bytes
+            );
+        }
+
+        Ok(std::mem::take(&mut blob.data))
+    }
 }
 
 /// Open file plus the size observed from its handle before any allocation.
-pub(crate) struct OpenFile {
+pub struct OpenFile {
     file: File,
     path: PathBuf,
     bytes: u64,
 }
 
 impl OpenFile {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path);
         let file = file.with_context(|| format!("failed to open file {}", path.display()))?;
         let metadata = file.metadata();
@@ -33,12 +50,12 @@ impl OpenFile {
         })
     }
 
-    pub(crate) fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     /// Bounded read that catches a file growing after its initial `fstat`.
-    pub(crate) fn read(self, limit: u64) -> Result<BoundedBytes> {
+    pub fn read(self, limit: u64) -> Result<BoundedBytes> {
         if self.bytes > limit {
             return Ok(BoundedBytes::TooLarge(self.bytes));
         }
@@ -57,26 +74,22 @@ impl OpenFile {
             return Ok(BoundedBytes::Contents(source));
         }
 
-        let bytes = final_size(&reader, source.len(), &self.path)?;
+        let metadata = reader.get_ref().metadata();
+        let metadata = metadata
+            .with_context(|| format!("failed to reinspect file {}", self.path.display()))?;
+        let bytes_read = u64::try_from(source.len()).unwrap_or(u64::MAX);
+        let bytes = metadata.len().max(bytes_read);
         Ok(BoundedBytes::TooLarge(bytes))
     }
 }
 
-fn final_size(reader: &Take<File>, bytes_read: usize, path: &Path) -> Result<u64> {
-    let metadata = reader.get_ref().metadata();
-    let metadata =
-        metadata.with_context(|| format!("failed to reinspect file {}", path.display()))?;
-    let bytes_read = u64::try_from(bytes_read).unwrap_or(u64::MAX);
-    Ok(metadata.len().max(bytes_read))
-}
-
-pub(crate) enum BoundedBytes {
+pub enum BoundedBytes {
     Contents(Vec<u8>),
     TooLarge(u64),
 }
 
 /// Decode terminal-review text while leaving binary content outside the review.
-pub(crate) fn decode_text(source: Vec<u8>) -> Option<String> {
+pub fn decode_text(source: Vec<u8>) -> Option<String> {
     if source.contains(&0) {
         return None;
     }

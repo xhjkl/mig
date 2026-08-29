@@ -8,36 +8,25 @@ pub enum LineEnding {
     CrLf,
 }
 
-impl LineEnding {
-    /// Bytes occupied by this terminator in the original source.
-    pub(crate) const fn byte_len(self) -> usize {
-        match self {
-            Self::Missing => 0,
-            Self::Lf => 1,
-            Self::CrLf => 2,
-        }
-    }
-}
-
 /// One physical source line with both content-only and terminator-inclusive geometry.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SourceLine {
-    pub(crate) number: usize,
-    pub(crate) content_bytes: Range<usize>,
-    pub(crate) full_bytes: Range<usize>,
-    pub(crate) ending: LineEnding,
+pub struct SourceLine {
+    pub number: usize,
+    pub content_bytes: Range<usize>,
+    pub full_bytes: Range<usize>,
+    pub ending: LineEnding,
 }
 
 /// Borrowed source text and its exact one-based physical-line index.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Source<'source> {
+pub struct Source<'source> {
     text: &'source str,
     lines: Vec<SourceLine>,
 }
 
 impl<'source> Source<'source> {
     /// Index source once so every frontend shares identical line and terminator geometry.
-    pub(crate) fn new(text: &'source str) -> Self {
+    pub fn new(text: &'source str) -> Self {
         if text.is_empty() {
             return Self {
                 text,
@@ -61,7 +50,7 @@ impl<'source> Source<'source> {
             lines.push(SourceLine {
                 number: lines.len() + 1,
                 content_bytes: start..content_end,
-                full_bytes: start..content_end + ending.byte_len(),
+                full_bytes: start..newline + 1,
                 ending,
             });
             start = newline + 1;
@@ -80,38 +69,38 @@ impl<'source> Source<'source> {
     }
 
     /// Original source, without normalization or allocation.
-    pub(crate) fn as_str(&self) -> &'source str {
+    pub fn as_str(&self) -> &'source str {
         self.text
     }
 
     /// Physical lines; a terminator does not synthesize an extra empty line after itself.
-    pub(crate) fn lines(&self) -> &[SourceLine] {
+    pub fn lines(&self) -> &[SourceLine] {
         &self.lines
     }
 
     /// One-based physical-line lookup.
-    pub(crate) fn line(&self, number: usize) -> Option<&SourceLine> {
+    pub fn line(&self, number: usize) -> Option<&SourceLine> {
         let index = number.checked_sub(1)?;
         self.lines.get(index)
     }
 
     /// Content excluding LF/CRLF, borrowed from the original source.
-    pub(crate) fn text(&self, line: &SourceLine) -> &'source str {
+    pub fn text(&self, line: &SourceLine) -> &'source str {
         &self.text[line.content_bytes.clone()]
     }
 
     /// Content and its original terminator, borrowed from the original source.
-    pub(crate) fn full_text(&self, line: &SourceLine) -> &'source str {
+    pub fn full_text(&self, line: &SourceLine) -> &'source str {
         &self.text[line.full_bytes.clone()]
     }
 
     /// Exact source slice when the supplied byte range lies on UTF-8 boundaries.
-    pub(crate) fn slice(&self, bytes: Range<usize>) -> Option<&'source str> {
+    pub fn slice(&self, bytes: Range<usize>) -> Option<&'source str> {
         self.text.get(bytes)
     }
 
     /// Physical line owning one concrete byte, including either byte of CRLF.
-    pub(crate) fn line_containing_byte(&self, byte: usize) -> Option<&SourceLine> {
+    fn line_containing_byte(&self, byte: usize) -> Option<&SourceLine> {
         if byte >= self.text.len() {
             return None;
         }
@@ -123,7 +112,7 @@ impl<'source> Source<'source> {
     }
 
     /// One-based logical line at a byte position, including the position at EOF.
-    pub(crate) fn position_line(&self, byte: usize) -> Option<usize> {
+    fn position_line(&self, byte: usize) -> Option<usize> {
         if byte > self.text.len() {
             return None;
         }
@@ -140,7 +129,7 @@ impl<'source> Source<'source> {
     /// Empty ranges retain their insertion line as an empty line range. For non-empty
     /// ranges, using the last included byte means an exclusive end at the next line's
     /// start does not accidentally claim that next line.
-    pub(crate) fn line_coverage(&self, bytes: Range<usize>) -> Option<Range<usize>> {
+    pub fn line_coverage(&self, bytes: Range<usize>) -> Option<Range<usize>> {
         if bytes.start > bytes.end || bytes.end > self.text.len() {
             return None;
         }

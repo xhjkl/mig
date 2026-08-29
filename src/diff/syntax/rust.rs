@@ -1,11 +1,11 @@
-use super::lower::{DecorationHint, GapContext, HighlightQueries, NodeAnnotation, NodeContext};
+use super::lower::{DecorationHint, HighlightQueries, NodeAnnotation};
 use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use ::tree_sitter::Node;
 
-pub(super) static HIGHLIGHT_QUERIES: HighlightQueries =
+pub static HIGHLIGHT_QUERIES: HighlightQueries =
     HighlightQueries::new(&[tree_sitter_rust::HIGHLIGHTS_QUERY]);
 
-pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
-    let node = context.node;
+pub fn annotate(node: Node<'_>, parent_kind: Option<&str>, source: &str) -> NodeAnnotation {
     if node.kind() == "source_file" {
         return NodeAnnotation {
             owns_decorations: true,
@@ -15,10 +15,10 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    if is_comment(node.kind()) {
-        let review = (context.parent_kind == Some("source_file"))
+    if matches!(node.kind(), "line_comment" | "block_comment") {
+        let review = (parent_kind == Some("source_file"))
             .then(|| ReviewUnit::linewise(LayoutOwnership::None));
-        let text = &context.source[node.byte_range()];
+        let text = &source[node.byte_range()];
         return NodeAnnotation {
             review,
             channel: Some(ContentChannel::Comment),
@@ -34,8 +34,8 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("name"))
             .map(|identity| identity.byte_range());
-        let review = (context.parent_kind == Some("source_file"))
-            .then(|| ReviewUnit::wiring(LayoutOwnership::None));
+        let review =
+            (parent_kind == Some("source_file")).then(|| ReviewUnit::wiring(LayoutOwnership::None));
         return NodeAnnotation {
             review,
             identity,
@@ -48,7 +48,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
 
     if is_definition(node.kind()) {
         let identity = identity_node(node).map(|identity| identity.byte_range());
-        let review = (context.parent_kind == Some("source_file"))
+        let review = (parent_kind == Some("source_file"))
             .then(|| ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines));
         return NodeAnnotation {
             review,
@@ -65,7 +65,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         "inner_attribute_item" => DecorationHint::EnclosingOwner,
         _ => DecorationHint::None,
     };
-    if context.parent_kind == Some("source_file") && node.is_named() {
+    if parent_kind == Some("source_file") && node.is_named() {
         return NodeAnnotation {
             review: Some(ReviewUnit::linewise(LayoutOwnership::AdjacentBlankLines)),
             decoration,
@@ -83,12 +83,11 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         _ => None,
     }
     .map(|identity| identity.byte_range());
-    let owns_decorations = is_nested_decoration_owner(node.kind());
     let semantic_owner = is_semantic_owner(node.kind());
     NodeAnnotation {
         identity,
         decoration,
-        owns_decorations,
+        owns_decorations: semantic_owner,
         sibling_matching: if semantic_owner {
             SiblingMatching::LocalIdentity
         } else {
@@ -103,16 +102,11 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 }
 
-pub(super) fn gap_channel(context: GapContext<'_, '_>) -> ContentChannel {
-    if context.is_whitespace()
-        && matches!(
-            context.parent.kind(),
-            "char_literal" | "raw_string_literal" | "string_content" | "string_literal"
-        )
-    {
-        return ContentChannel::Syntax;
-    }
-    context.default_channel()
+pub fn whitespace_is_syntax(parent_kind: &str) -> bool {
+    matches!(
+        parent_kind,
+        "char_literal" | "raw_string_literal" | "string_content" | "string_literal"
+    )
 }
 
 fn identity_node<'tree>(node: ::tree_sitter::Node<'tree>) -> Option<::tree_sitter::Node<'tree>> {
@@ -134,10 +128,6 @@ fn call_identity<'tree>(node: ::tree_sitter::Node<'tree>) -> Option<::tree_sitte
         .or_else(|| matches!(function.kind(), "identifier").then_some(function))
 }
 
-fn is_comment(kind: &str) -> bool {
-    matches!(kind, "line_comment" | "block_comment")
-}
-
 fn doc_comment_decoration(kind: &str, text: &str) -> DecorationHint {
     match kind {
         "line_comment" if text.starts_with("//!") => DecorationHint::EnclosingOwner,
@@ -153,22 +143,7 @@ fn doc_comment_decoration(kind: &str, text: &str) -> DecorationHint {
     }
 }
 
-/// Nested semantic boundaries that may receive an outer attribute or documentation comment.
-fn is_nested_decoration_owner(kind: &str) -> bool {
-    is_definition(kind)
-        || matches!(
-            kind,
-            "associated_type"
-                | "enum_variant"
-                | "field_declaration"
-                | "function_signature_item"
-                | "let_declaration"
-                | "macro_invocation"
-                | "match_arm"
-        )
-}
-
-/// Identify semantic owners whose unmatched descendants cannot escape into another owner.
+/// Identify semantic owners that receive decorations and seal their unmatched descendants.
 fn is_semantic_owner(kind: &str) -> bool {
     is_definition(kind)
         || matches!(

@@ -55,7 +55,7 @@ fn commit_review_uses_pinned_trees_and_keeps_generated_files_last() {
 
     let reviews =
         diff_commit(&repository.path().join("nested"), Path::new("HEAD~1")).expect("review commit");
-    let paths = reviews.iter().map(ReviewItem::path).collect::<Vec<_>>();
+    let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
 
     assert_eq!(
         paths,
@@ -82,7 +82,7 @@ fn commit_review_uses_pinned_trees_and_keeps_generated_files_last() {
         .expect("review commit selected by message regex");
     let regex_paths = regex_reviews
         .iter()
-        .map(ReviewItem::path)
+        .map(ReviewEntry::path)
         .collect::<Vec<_>>();
     assert_eq!(regex_paths, paths);
 }
@@ -103,7 +103,7 @@ fn root_commit_and_annotated_tag_are_reviewed_against_the_empty_tree() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [ReviewItem::Presented(diff)] if diff.path == "root.rs" && !diff.hunks.is_empty()
+        [ReviewEntry::Diff(diff)] if diff.path == "root.rs" && !diff.hunks.is_empty()
     ));
 }
 
@@ -130,7 +130,7 @@ fn merge_commit_is_compared_with_its_first_parent() {
     );
 
     let reviews = diff_commit(repository.path(), Path::new("HEAD")).expect("review merge");
-    let paths = reviews.iter().map(ReviewItem::path).collect::<Vec<_>>();
+    let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["side.txt"]);
 }
@@ -150,7 +150,7 @@ fn oversized_commit_blob_stays_visible_without_loading_its_pair() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [ReviewItem::Notice(FileNotice::TooLarge {
+        [ReviewEntry::Notice(FileNotice::TooLarge {
             path,
             before_bytes: Some(1),
             after_bytes: Some(5),
@@ -199,7 +199,7 @@ fn sha256_root_commit_uses_the_repository_empty_tree() {
 
     assert!(matches!(
         reviews.as_slice(),
-        [ReviewItem::Presented(diff)] if diff.path == "root.txt" && !diff.hunks.is_empty()
+        [ReviewEntry::Diff(diff)] if diff.path == "root.txt" && !diff.hunks.is_empty()
     ));
 }
 

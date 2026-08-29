@@ -67,16 +67,16 @@ fn shorthand_field_owns_its_trailing_comma_and_complete_row() {
 fn one_failed_parse_falls_both_revisions_back_to_lines() {
     let pair = syntax_pair(Path::new("alpha.rs"), "fn alpha() {}\n", "fn {\n", false).unwrap();
 
-    assert_eq!(pair.before.language, Language::Lines);
-    assert_eq!(pair.after.language, Language::Lines);
+    assert_eq!(pair.before.grammar, None);
+    assert_eq!(pair.after.grammar, None);
 }
 
 #[test]
 fn generated_source_always_uses_lines() {
     let pair = syntax_pair(Path::new("alpha.rs"), "fn {", "fn alpha() {}", true).unwrap();
 
-    assert_eq!(pair.before.language, Language::Lines);
-    assert_eq!(pair.after.language, Language::Lines);
+    assert_eq!(pair.before.grammar, None);
+    assert_eq!(pair.after.grammar, None);
 }
 
 #[test]
@@ -85,14 +85,14 @@ fn nested_file_units_are_rejected_before_correspondence() {
     let tree = line::lower(Source::new("alpha\nbeta\n"));
     let SyntaxTree {
         source,
-        language,
+        grammar,
         root,
         mut nodes,
         ..
     } = tree;
     nodes[2].parent = Some(NodeId::new(1));
 
-    let _ = SyntaxTree::from_nodes(source, language, root, nodes);
+    let _ = SyntaxTree::from_nodes(source, grammar, root, nodes);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn html_recovery_restores_source_authored_containment() {
     let wrapper = node_with_identity(&pair.after, "div");
     let image = node_with_identity(&pair.after, "img");
 
-    assert_eq!(pair.after.language, Language::Html);
+    assert_eq!(pair.after.grammar, Some(Grammar::Html));
     assert!(pair.after.contains(paragraph, wrapper));
     assert!(pair.after.contains(wrapper, image));
     assert_byte_total(&pair.after);

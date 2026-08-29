@@ -27,8 +27,20 @@ fn large_anchorless_gap_uses_the_bounded_fallback() {
     let matches = ordered_matches(&before, &after);
 
     assert_eq!(matches.len(), 200);
-    assert_eq!(matches.first(), Some(&OrderedMatch::new(0, 0)));
-    assert_eq!(matches.last(), Some(&OrderedMatch::new(199, 199)));
+    assert_eq!(
+        matches.first(),
+        Some(&OrderedMatch {
+            before: 0,
+            after: 0,
+        })
+    );
+    assert_eq!(
+        matches.last(),
+        Some(&OrderedMatch {
+            before: 199,
+            after: 199,
+        })
+    );
 }
 
 #[test]

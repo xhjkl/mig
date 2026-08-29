@@ -1,12 +1,11 @@
 use crate::{
     input::{BoundedBytes, GitBlob, OpenFile, decode_text},
-    review_source_pair,
+    review::{FileNotice, MAX_REVISION_BYTES, ReviewEntry, review_source_pair},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use gix::ObjectId;
 use gix::bstr::{BStr, BString, ByteSlice};
-use mig::review::{FileNotice, MAX_REVISION_BYTES, ReviewItem};
-use std::cmp::Reverse;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,24 +17,20 @@ enum Revision<T> {
     Unsupported,
 }
 
-/// Git provenance retained until the review ribbon is ordered.
+/// Git provenance ordered from least to most review-significant.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GitChange {
-    Dirty,
-    Staged,
     Untracked,
+    Staged,
+    Dirty,
 }
 
-/// How strongly a file rises toward the front of the review ribbon.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RibbonBuoyancy(u8);
-
 /// Presented text reviews with dirty files most buoyant and generated files least.
-pub fn diff_directory(directory: &Path) -> Result<Vec<ReviewItem>> {
+pub fn diff_directory(directory: &Path) -> Result<Vec<ReviewEntry>> {
     diff_directory_with_limit(directory, MAX_REVISION_BYTES)
 }
 
-fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<ReviewItem>> {
+fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> {
     let repo = gix::discover(directory).with_context(|| {
         format!(
             "failed to discover a Git repository from {}",
@@ -77,46 +72,59 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<ReviewI
         {
             reviews.push((
                 change,
-                oversized_review(&path, before_bytes, after_bytes, limit),
+                ReviewEntry::Notice(FileNotice::TooLarge {
+                    path: path.to_string_lossy().into_owned(),
+                    before_bytes,
+                    after_bytes,
+                    limit_bytes: limit,
+                }),
             ));
             continue;
         }
 
         // Read the mutable side first so post-stat growth cannot force a HEAD allocation.
         let after = match after {
-            None => Vec::new(),
+            None => None,
             Some(after) => {
                 let after = after.read(limit)?;
                 match after {
                     BoundedBytes::TooLarge(bytes) => {
                         reviews.push((
                             change,
-                            oversized_review(&path, before_bytes, Some(bytes), limit),
+                            ReviewEntry::Notice(FileNotice::TooLarge {
+                                path: path.to_string_lossy().into_owned(),
+                                before_bytes,
+                                after_bytes: Some(bytes),
+                                limit_bytes: limit,
+                            }),
                         ));
                         continue;
                     }
-                    BoundedBytes::Contents(after) => after,
+                    BoundedBytes::Contents(after) => {
+                        let Some(after) = decode_text(after) else {
+                            continue;
+                        };
+                        Some(after)
+                    }
                 }
             }
         };
-        let mut before_source = Vec::new();
-        if let Some(before) = before {
-            before_source = read_head_blob(&repo, before)?;
-        }
-        let before = before_source;
-        let Some(before) = decode_text(before) else {
-            continue;
+        let before = match before {
+            None => None,
+            Some(before) => {
+                let before = before.read(&repo);
+                let before = before.context("failed to read a pinned HEAD blob")?;
+                let Some(before) = decode_text(before) else {
+                    continue;
+                };
+                Some(before)
+            }
         };
-        let Some(after) = decode_text(after) else {
-            continue;
-        };
-        if before == after {
+        if before.as_deref().unwrap_or_default() == after.as_deref().unwrap_or_default() {
             continue;
         }
         let label = path.to_string_lossy();
-        let before = before_bytes.map(|_| before.as_str());
-        let after = after_bytes.map(|_| after.as_str());
-        let review = review_source_pair(&label, before, after)?;
+        let review = review_source_pair(&label, before.as_deref(), after.as_deref())?;
         let Some(review) = review else {
             continue;
         };
@@ -124,35 +132,18 @@ fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<ReviewI
     }
 
     reviews.sort_by(|(left_change, left), (right_change, right)| {
-        Reverse(ribbon_buoyancy(*left_change, left))
-            .cmp(&Reverse(ribbon_buoyancy(*right_change, right)))
+        left.is_generated()
+            .cmp(&right.is_generated())
+            .then_with(|| {
+                if left.is_generated() {
+                    Ordering::Equal
+                } else {
+                    right_change.cmp(left_change)
+                }
+            })
             .then_with(|| left.path().cmp(right.path()))
     });
     Ok(reviews.into_iter().map(|(_, review)| review).collect())
-}
-
-fn ribbon_buoyancy(change: GitChange, review: &ReviewItem) -> RibbonBuoyancy {
-    if review.is_generated() {
-        return RibbonBuoyancy(0);
-    }
-
-    let buoyancy = match change {
-        GitChange::Dirty => 3,
-        GitChange::Staged => 2,
-        GitChange::Untracked => 1,
-    };
-    RibbonBuoyancy(buoyancy)
-}
-
-fn oversized_review(
-    path: &Path,
-    before_bytes: Option<u64>,
-    after_bytes: Option<u64>,
-    limit: u64,
-) -> ReviewItem {
-    let path = path.to_string_lossy().into_owned();
-    let notice = FileNotice::too_large(path, before_bytes, after_bytes, limit);
-    ReviewItem::Notice(notice)
 }
 
 /// Status candidates from the pinned tree, index, and regular worktree scope.
@@ -185,7 +176,7 @@ fn changed_paths(
         };
         paths
             .entry(path)
-            .and_modify(|existing| *existing = (*existing).min(change))
+            .and_modify(|existing| *existing = (*existing).max(change))
             .or_insert(change);
     }
 
@@ -268,21 +259,6 @@ fn head_revision(
         object,
         bytes: header.size(),
     }))
-}
-
-fn read_head_blob(repo: &gix::Repository, blob: GitBlob) -> Result<Vec<u8>> {
-    let mut contents = repo
-        .find_blob(blob.object)
-        .context("failed to read a pinned HEAD blob")?;
-    if u64::try_from(contents.data.len()).unwrap_or(u64::MAX) != blob.bytes {
-        bail!(
-            "Git returned {} bytes for a blob reported as {} bytes",
-            contents.data.len(),
-            blob.bytes
-        );
-    }
-
-    Ok(std::mem::take(&mut contents.data))
 }
 
 /// Current regular-file handle, absence, or an unsupported filesystem entry.

@@ -1,17 +1,15 @@
 use crate::{
     input::{GitBlob, decode_text},
-    review_source_pair,
+    review::{FileNotice, MAX_REVISION_BYTES, ReviewEntry, review_source_pair},
 };
 use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use gix::bstr::{BStr, ByteSlice};
 use gix::object::tree::diff::ChangeDetached;
-use mig::review::{FileNotice, MAX_REVISION_BYTES, ReviewItem};
-use std::cmp::Ordering;
 use std::path::Path;
 
 /// Reviews introduced by one commit, using its first parent as the baseline.
-pub(crate) fn diff_commit(directory: &Path, commitish: &Path) -> Result<Vec<ReviewItem>> {
+pub fn diff_commit(directory: &Path, commitish: &Path) -> Result<Vec<ReviewEntry>> {
     diff_commit_with_limit(directory, commitish, MAX_REVISION_BYTES)
 }
 
@@ -19,7 +17,7 @@ fn diff_commit_with_limit(
     directory: &Path,
     commitish: &Path,
     limit: u64,
-) -> Result<Vec<ReviewItem>> {
+) -> Result<Vec<ReviewEntry>> {
     let repo = gix::discover(directory);
     let repo = repo.with_context(|| {
         format!(
@@ -92,7 +90,11 @@ fn diff_commit_with_limit(
         reviews.push(review);
     }
 
-    reviews.sort_by(review_order);
+    reviews.sort_by(|left, right| {
+        left.is_generated()
+            .cmp(&right.is_generated())
+            .then_with(|| left.path().cmp(right.path()))
+    });
     Ok(reviews)
 }
 
@@ -195,64 +197,59 @@ fn review_change(
     repo: &gix::Repository,
     change: ChangedBlobs,
     limit: u64,
-) -> Result<Option<ReviewItem>> {
-    let before_bytes = change.before.as_ref().map(|blob| blob.bytes);
-    let after_bytes = change.after.as_ref().map(|blob| blob.bytes);
+) -> Result<Option<ReviewEntry>> {
+    let ChangedBlobs {
+        path,
+        before,
+        after,
+    } = change;
+    let before_bytes = before.as_ref().map(|blob| blob.bytes);
+    let after_bytes = after.as_ref().map(|blob| blob.bytes);
     if before_bytes.is_some_and(|bytes| bytes > limit)
         || after_bytes.is_some_and(|bytes| bytes > limit)
     {
-        let notice = FileNotice::too_large(change.path, before_bytes, after_bytes, limit);
-        return Ok(Some(ReviewItem::Notice(notice)));
+        return Ok(Some(ReviewEntry::Notice(FileNotice::TooLarge {
+            path,
+            before_bytes,
+            after_bytes,
+            limit_bytes: limit,
+        })));
     }
 
-    let mut before = Vec::new();
-    if let Some(blob) = change.before {
-        before = read_blob(repo, blob, &change.path, "previous")?;
-    }
-    let mut after = Vec::new();
-    if let Some(blob) = change.after {
-        after = read_blob(repo, blob, &change.path, "current")?;
-    }
-    let Some(before) = decode_text(before) else {
-        return Ok(None);
+    let before = match before {
+        None => None,
+        Some(blob) => {
+            let source = blob.read(repo);
+            let source =
+                source.with_context(|| format!("failed to read the previous blob for {path}"))?;
+            let Some(source) = decode_text(source) else {
+                return Ok(None);
+            };
+            Some(source)
+        }
     };
-    let Some(after) = decode_text(after) else {
-        return Ok(None);
+    let after = match after {
+        None => None,
+        Some(blob) => {
+            let source = blob.read(repo);
+            let source =
+                source.with_context(|| format!("failed to read the current blob for {path}"))?;
+            let Some(source) = decode_text(source) else {
+                return Ok(None);
+            };
+            Some(source)
+        }
     };
-    if before == after {
+    if before.as_deref().unwrap_or_default() == after.as_deref().unwrap_or_default() {
         return Ok(None);
     }
 
-    let before = before_bytes.map(|_| before.as_str());
-    let after = after_bytes.map(|_| after.as_str());
-    review_source_pair(&change.path, before, after)
-}
-
-/// Blob body whose length must still agree with its previously inspected header.
-fn read_blob(repo: &gix::Repository, revision: GitBlob, path: &str, side: &str) -> Result<Vec<u8>> {
-    let blob = repo.find_blob(revision.object);
-    let mut blob = blob.with_context(|| format!("failed to read the {side} blob for {path}"))?;
-    if u64::try_from(blob.data.len()).unwrap_or(u64::MAX) != revision.bytes {
-        bail!(
-            "Git returned {} bytes for the {side} blob of {path}, reported as {} bytes",
-            blob.data.len(),
-            revision.bytes
-        );
-    }
-
-    Ok(std::mem::take(&mut blob.data))
+    review_source_pair(&path, before.as_deref(), after.as_deref())
 }
 
 /// UI labels are UTF-8, so an undecodable Git path is outside this review.
 fn decode_git_path(path: &BStr) -> Option<String> {
     path.to_str().ok().map(ToOwned::to_owned)
-}
-
-/// Source paths first, inspected generated files last.
-fn review_order(left: &ReviewItem, right: &ReviewItem) -> Ordering {
-    left.is_generated()
-        .cmp(&right.is_generated())
-        .then_with(|| left.path().cmp(right.path()))
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
-use super::parse::{ParsedFile, ParserLanguage, SyntaxFailure, tree_sitter_language};
+use super::parse::{ParsedFile, tree_sitter_language};
 use super::{
-    ChildSlot, ContentChannel, Delimiter, DelimiterKind, GrammarField, GrammarSymbol, Language,
-    Leaf, LeafRole, NodeId, ReviewUnit, SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree,
-    WrapperBoundary, c, css, html, rust, typescript,
+    ChildSlot, ContentChannel, Delimiter, Grammar, GrammarField, GrammarSymbol, Leaf, LeafRole,
+    NodeId, ReviewUnit, SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree, WrapperBoundary, c,
+    css, html, rust, typescript,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -12,38 +12,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
-/// Parser-node view available only while a language lowerer annotates the neutral arena.
-pub(super) struct NodeContext<'tree, 'source> {
-    pub(super) node: Node<'tree>,
-    pub(super) parent_kind: Option<&'static str>,
-    pub(super) source: &'source str,
-}
-
-/// Parser-omitted bytes owned directly by one CST node.
-pub(super) struct GapContext<'tree, 'source> {
-    pub(super) parent: Node<'tree>,
-    pub(super) bytes: Range<usize>,
-    pub(super) source: &'source str,
-}
-
-impl GapContext<'_, '_> {
-    pub(super) fn is_whitespace(&self) -> bool {
-        self.source[self.bytes.clone()]
-            .chars()
-            .all(char::is_whitespace)
-    }
-
-    pub(super) fn default_channel(&self) -> ContentChannel {
-        if self.is_whitespace() {
-            return ContentChannel::Layout;
-        }
-        ContentChannel::Syntax
-    }
-}
-
 /// Frontend instruction resolved to one concrete decoration-owner edge after lowering.
 #[derive(Clone, Copy, Default)]
-pub(super) enum DecorationHint {
+pub enum DecorationHint {
     #[default]
     None,
     /// Decorates the next frontend-declared owner in this sibling scope.
@@ -54,32 +25,32 @@ pub(super) enum DecorationHint {
 
 /// Language decision for one parser node before its parser handle is discarded.
 #[derive(Default)]
-pub(super) struct NodeAnnotation {
-    pub(super) review: Option<ReviewUnit>,
-    pub(super) channel: Option<ContentChannel>,
-    pub(super) descendant_channel: Option<ContentChannel>,
+pub struct NodeAnnotation {
+    pub review: Option<ReviewUnit>,
+    pub channel: Option<ContentChannel>,
+    pub descendant_channel: Option<ContentChannel>,
     /// Language-specific spelling used as a graph identity, independent of review units.
-    pub(super) identity: Option<Range<usize>>,
+    pub identity: Option<Range<usize>>,
     /// Source-language decoration relationship; resolved only after all siblings exist.
-    pub(super) decoration: DecorationHint,
+    pub decoration: DecorationHint,
     /// Whether this semantic boundary may own decorations.
-    pub(super) owns_decorations: bool,
-    pub(super) sibling_matching: SiblingMatching,
-    pub(super) wrapper_boundary: WrapperBoundary,
+    pub owns_decorations: bool,
+    pub sibling_matching: SiblingMatching,
+    pub wrapper_boundary: WrapperBoundary,
     /// Language-owned extent when the grammar stops before the semantic content does.
-    pub(super) extent: Option<Range<usize>>,
+    pub extent: Option<Range<usize>>,
     /// Treat the node's complete byte range as one payload and discard parser children.
-    pub(super) prune_children: bool,
+    pub prune_children: bool,
 }
 
 /// Official query sources and their one process-wide compilation for one grammar.
-pub(super) struct HighlightQueries {
+pub struct HighlightQueries {
     sources: &'static [&'static str],
     compiled: OnceLock<Result<Box<[Query]>, String>>,
 }
 
 impl HighlightQueries {
-    pub(super) const fn new(sources: &'static [&'static str]) -> Self {
+    pub const fn new(sources: &'static [&'static str]) -> Self {
         Self {
             sources,
             compiled: OnceLock::new(),
@@ -89,7 +60,7 @@ impl HighlightQueries {
     fn compiled(
         &'static self,
         language: &TreeSitterLanguage,
-        syntax_language: Language,
+        grammar: Grammar,
     ) -> anyhow::Result<&'static [Query]> {
         let queries = self.compiled.get_or_init(|| {
             self.sources
@@ -97,7 +68,7 @@ impl HighlightQueries {
                 .map(|source| {
                     let query = Query::new(language, source);
                     query.with_context(|| {
-                        format!("invalid official highlight query for {syntax_language:?}")
+                        format!("invalid official highlight query for {grammar:?}")
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
@@ -112,78 +83,60 @@ impl HighlightQueries {
     }
 }
 
-/// Lower parser-owned syntax into Mig's language-neutral source arena.
-pub(super) fn lower<'source>(
-    parsed: ParsedFile<'source>,
-) -> Result<SyntaxTree<'source>, SyntaxFailure> {
+/// Lower parser-owned syntax into the internal language-neutral source arena.
+pub fn lower<'source>(parsed: ParsedFile<'source>) -> anyhow::Result<Option<SyntaxTree<'source>>> {
     let source = parsed.source;
-    let parsed_language = parsed.language;
-    let language = tree_sitter_language(parsed_language);
+    let grammar = parsed.grammar;
+    let language = tree_sitter_language(grammar);
     let root = parsed.tree.root_node();
-    let language_id = syntax_language(parsed_language);
-    let highlight_queries = highlight_queries(parsed_language)
-        .compiled(&language, language_id)
-        .map_err(SyntaxFailure::Setup)?;
+    let highlight_queries = highlight_queries(grammar).compiled(&language, grammar)?;
     let highlights = collect_highlights(highlight_queries, root, source.as_str().as_bytes());
-    let Some(nodes) = lower_nodes(&source, root, parsed_language, &language, &highlights) else {
-        return Err(SyntaxFailure::Fallback);
+    let Some(nodes) = lower_nodes(&source, root, grammar, &language, &highlights) else {
+        return Ok(None);
     };
-    Ok(SyntaxTree::from_nodes(
+    Ok(Some(SyntaxTree::from_nodes(
         source,
-        language_id,
+        Some(grammar),
         NodeId::new(0),
         nodes,
-    ))
+    )))
 }
 
-fn syntax_language(language: ParserLanguage) -> Language {
-    match language {
-        ParserLanguage::C => Language::C,
-        ParserLanguage::Rust => Language::Rust,
-        ParserLanguage::Html => Language::Html,
-        ParserLanguage::Css => Language::Css,
-        ParserLanguage::TypeScript => Language::TypeScript,
-        ParserLanguage::Tsx => Language::Tsx,
-        ParserLanguage::JavaScript => Language::JavaScript,
-        ParserLanguage::Jsx => Language::Jsx,
+fn highlight_queries(grammar: Grammar) -> &'static HighlightQueries {
+    match grammar {
+        Grammar::C => &c::HIGHLIGHT_QUERIES,
+        Grammar::Rust => &rust::HIGHLIGHT_QUERIES,
+        Grammar::Html => &html::HIGHLIGHT_QUERIES,
+        Grammar::Css => &css::HIGHLIGHT_QUERIES,
+        Grammar::TypeScript => &typescript::TYPESCRIPT_HIGHLIGHTS,
+        Grammar::Tsx => &typescript::TSX_HIGHLIGHTS,
+        Grammar::JavaScript => &typescript::JAVASCRIPT_HIGHLIGHTS,
+        Grammar::Jsx => &typescript::JSX_HIGHLIGHTS,
     }
 }
 
-fn highlight_queries(language: ParserLanguage) -> &'static HighlightQueries {
-    match language {
-        ParserLanguage::C => &c::HIGHLIGHT_QUERIES,
-        ParserLanguage::Rust => &rust::HIGHLIGHT_QUERIES,
-        ParserLanguage::Html => &html::HIGHLIGHT_QUERIES,
-        ParserLanguage::Css => &css::HIGHLIGHT_QUERIES,
-        ParserLanguage::TypeScript => &typescript::TYPESCRIPT_HIGHLIGHTS,
-        ParserLanguage::Tsx => &typescript::TSX_HIGHLIGHTS,
-        ParserLanguage::JavaScript => &typescript::JAVASCRIPT_HIGHLIGHTS,
-        ParserLanguage::Jsx => &typescript::JSX_HIGHLIGHTS,
+fn annotate_node(
+    grammar: Grammar,
+    node: Node<'_>,
+    parent_kind: Option<&'static str>,
+    source: &str,
+) -> NodeAnnotation {
+    match grammar {
+        Grammar::C => c::annotate(node, parent_kind),
+        Grammar::Rust => rust::annotate(node, parent_kind, source),
+        Grammar::Html => html::annotate(node, source),
+        Grammar::Css => css::annotate(node, parent_kind, source),
+        Grammar::TypeScript | Grammar::Tsx | Grammar::JavaScript | Grammar::Jsx => {
+            typescript::annotate(node, parent_kind)
+        }
     }
 }
 
-fn annotate_node(language: ParserLanguage, context: NodeContext<'_, '_>) -> NodeAnnotation {
-    match language {
-        ParserLanguage::C => c::annotate(context),
-        ParserLanguage::Rust => rust::annotate(context),
-        ParserLanguage::Html => html::annotate(context),
-        ParserLanguage::Css => css::annotate(context),
-        ParserLanguage::TypeScript
-        | ParserLanguage::Tsx
-        | ParserLanguage::JavaScript
-        | ParserLanguage::Jsx => typescript::annotate(context),
-    }
-}
-
-fn normalize_recovery(
-    language: ParserLanguage,
-    source: &Source<'_>,
-    nodes: &mut [SyntaxNode],
-) -> bool {
-    if matches!(language, ParserLanguage::Html) {
+fn normalize_recovery(grammar: Grammar, source: &Source<'_>, nodes: &mut [SyntaxNode]) -> bool {
+    if grammar == Grammar::Html {
         return html::normalize_recovery(source, nodes);
     }
-    let error = grammar_symbol(language, "ERROR", true);
+    let error = grammar_symbol(grammar, "ERROR", true);
     !nodes.iter().any(|node| {
         node.missing
             || (node.kind == error
@@ -193,52 +146,46 @@ fn normalize_recovery(
     })
 }
 
-fn grammar_symbol(language: ParserLanguage, kind: &str, named: bool) -> SyntaxKind {
-    let language = tree_sitter_language(language);
-    SyntaxKind::Grammar(GrammarSymbol::new(language.id_for_node_kind(kind, named)))
+pub fn grammar_symbol(grammar: Grammar, kind: &str, named: bool) -> SyntaxKind {
+    let language = tree_sitter_language(grammar);
+    SyntaxKind::Grammar(GrammarSymbol(language.id_for_node_kind(kind, named)))
 }
 
-fn gap_channel(language: ParserLanguage, context: GapContext<'_, '_>) -> ContentChannel {
-    match language {
-        ParserLanguage::C => c::gap_channel(context),
-        ParserLanguage::Rust => rust::gap_channel(context),
-        ParserLanguage::Html => html::gap_channel(context),
-        ParserLanguage::Css => css::gap_channel(context),
-        ParserLanguage::TypeScript
-        | ParserLanguage::Tsx
-        | ParserLanguage::JavaScript
-        | ParserLanguage::Jsx => typescript::gap_channel(context),
+fn gap_channel(grammar: Grammar, parent_kind: &str, spelling: &str) -> ContentChannel {
+    if !spelling.chars().all(char::is_whitespace) {
+        return ContentChannel::Syntax;
+    }
+    let syntactic = match grammar {
+        Grammar::C => c::whitespace_is_syntax(parent_kind),
+        Grammar::Rust => rust::whitespace_is_syntax(parent_kind),
+        Grammar::Html => html::whitespace_is_syntax(parent_kind, spelling),
+        Grammar::Css => css::whitespace_is_syntax(parent_kind),
+        Grammar::TypeScript | Grammar::Tsx | Grammar::JavaScript | Grammar::Jsx => {
+            typescript::whitespace_is_syntax(parent_kind)
+        }
+    };
+    if syntactic {
+        ContentChannel::Syntax
+    } else {
+        ContentChannel::Layout
     }
 }
 
 enum Pending<'tree> {
-    Parser(PendingNode<'tree>),
-    Fragment(PendingFragment),
-}
-
-impl Pending<'_> {
-    fn start_byte(&self) -> usize {
-        match self {
-            Self::Parser(pending) => pending.node.start_byte(),
-            Self::Fragment(pending) => pending.bytes.start,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PendingNode<'tree> {
-    node: Node<'tree>,
-    parent: Option<NodeId>,
-    slot: ChildSlot,
-    inherited_channel: Option<ContentChannel>,
-    inherited_classification: Option<LeafClassification>,
-}
-
-struct PendingFragment {
-    bytes: Range<usize>,
-    parent: NodeId,
-    channel: ContentChannel,
-    classification: LeafClassification,
+    Parser {
+        node: Node<'tree>,
+        parent: Option<NodeId>,
+        slot: ChildSlot,
+        inherited_channel: Option<ContentChannel>,
+        inherited_classification: Option<LeafClassification>,
+    },
+    Fragment {
+        bytes: Range<usize>,
+        parent: NodeId,
+        channel: ContentChannel,
+        classification: LeafClassification,
+        delimiter: Option<Delimiter>,
+    },
 }
 
 /// Parser-level leaf meaning kept separate from its terminal palette category.
@@ -251,51 +198,56 @@ struct LeafClassification {
 fn lower_nodes(
     source: &Source<'_>,
     root: Node<'_>,
-    language: ParserLanguage,
-    grammar: &TreeSitterLanguage,
+    grammar: Grammar,
+    tree_sitter: &TreeSitterLanguage,
     highlights: &HashMap<usize, LeafClassification>,
 ) -> Option<Vec<SyntaxNode>> {
     let mut nodes = Vec::<SyntaxNode>::new();
     let mut decoration_hints = Vec::<DecorationHint>::new();
     let mut decoration_owners = Vec::<bool>::new();
-    let mut pending = vec![Pending::Parser(PendingNode {
+    let mut pending = vec![Pending::Parser {
         node: root,
         parent: None,
         slot: ChildSlot::Positional,
         inherited_channel: None,
         inherited_classification: None,
-    })];
+    }];
     let mut consumed_until = 0;
 
     while let Some(pending_item) = pending.pop() {
-        if pending_item.start_byte() < consumed_until {
+        let start_byte = match &pending_item {
+            Pending::Parser { node, .. } => node.start_byte(),
+            Pending::Fragment { bytes, .. } => bytes.start,
+        };
+        if start_byte < consumed_until {
             continue;
         }
 
-        let pending_node = match pending_item {
-            Pending::Fragment(fragment) => {
+        let (node, parent, slot, inherited_channel, inherited_classification) = match pending_item {
+            Pending::Fragment {
+                bytes,
+                parent,
+                channel,
+                classification,
+                delimiter,
+            } => {
                 let id = NodeId::new(nodes.len());
-                nodes[fragment.parent.index()].children.push(id);
+                nodes[parent.index()].children.push(id);
                 let lines = source
-                    .line_coverage(fragment.bytes.clone())
+                    .line_coverage(bytes.clone())
                     .expect("source fragments remain inside source geometry");
-                let spelling = source
-                    .slice(fragment.bytes.clone())
-                    .expect("source fragments remain inside source geometry");
-                let delimiter = delimiter(spelling);
-                let bytes = fragment.bytes;
                 nodes.push(SyntaxNode {
                     kind: SyntaxKind::SourceFragment,
                     slot: ChildSlot::Positional,
                     source_envelope: bytes.clone(),
                     bytes,
                     lines,
-                    parent: Some(fragment.parent),
+                    parent: Some(parent),
                     children: Vec::new(),
                     leaf: Some(Leaf {
-                        role: fragment.classification.role,
-                        syntax: fragment.classification.syntax,
-                        channel: fragment.channel,
+                        role: classification.role,
+                        syntax: classification.syntax,
+                        channel,
                         delimiter,
                     }),
                     identity: None,
@@ -311,31 +263,35 @@ fn lower_nodes(
                 decoration_owners.push(false);
                 continue;
             }
-            Pending::Parser(pending_node) => pending_node,
+            Pending::Parser {
+                node,
+                parent,
+                slot,
+                inherited_channel,
+                inherited_classification,
+            } => (
+                node,
+                parent,
+                slot,
+                inherited_channel,
+                inherited_classification,
+            ),
         };
 
-        let parent_kind = pending_node.node.parent().map(|parent| parent.kind());
-        let context = NodeContext {
-            node: pending_node.node,
-            parent_kind,
-            source: source.as_str(),
-        };
-        let annotation = annotate_node(language, context);
-        let inherited_channel = annotation
-            .descendant_channel
-            .or(pending_node.inherited_channel);
+        let parent_kind = node.parent().map(|parent| parent.kind());
+        let annotation = annotate_node(grammar, node, parent_kind, source.as_str());
+        let child_channel = annotation.descendant_channel.or(inherited_channel);
         let leaf_channel = annotation
             .channel
-            .or(pending_node.inherited_channel)
+            .or(inherited_channel)
             .unwrap_or(ContentChannel::Syntax);
         let inherited_classification = highlights
-            .get(&pending_node.node.id())
+            .get(&node.id())
             .copied()
-            .or(pending_node.inherited_classification);
+            .or(inherited_classification);
 
-        let node = pending_node.node;
         let id = NodeId::new(nodes.len());
-        if let Some(parent) = pending_node.parent {
+        if let Some(parent) = parent {
             nodes[parent.index()].children.push(id);
         }
         let parser_bytes = node.byte_range();
@@ -343,7 +299,7 @@ fn lower_nodes(
         if bytes.end > parser_bytes.end {
             // Plaintext-style constructs absorb every parser sibling through their extent.
             consumed_until = consumed_until.max(bytes.end);
-            let mut ancestor = pending_node.parent;
+            let mut ancestor = parent;
             while let Some(id) = ancestor {
                 let ancestor_node = &mut nodes[id.index()];
                 ancestor_node.bytes.end = ancestor_node.bytes.end.max(bytes.end);
@@ -378,12 +334,12 @@ fn lower_nodes(
         });
         let source_envelope = bytes.clone();
         nodes.push(SyntaxNode {
-            kind: SyntaxKind::Grammar(GrammarSymbol::new(node.kind_id())),
-            slot: pending_node.slot,
+            kind: SyntaxKind::Grammar(GrammarSymbol(node.kind_id())),
+            slot,
             bytes,
             source_envelope,
             lines,
-            parent: pending_node.parent,
+            parent,
             children: Vec::with_capacity(if annotation.prune_children {
                 0
             } else {
@@ -414,37 +370,37 @@ fn lower_nodes(
             if child.start_byte() > cursor {
                 lowered_children.push(fragment_pending(
                     source,
-                    language,
+                    grammar,
                     node,
                     cursor..child.start_byte(),
                     id,
-                    inherited_channel,
+                    child_channel,
                     inherited_classification,
                 ));
             }
-            lowered_children.push(Pending::Parser(PendingNode {
+            lowered_children.push(Pending::Parser {
                 node: child,
                 parent: Some(id),
-                slot: child_slot(grammar, node.field_name_for_child(index as u32)),
-                inherited_channel,
+                slot: child_slot(tree_sitter, node.field_name_for_child(index as u32)),
+                inherited_channel: child_channel,
                 inherited_classification,
-            }));
+            });
             cursor = cursor.max(child.end_byte());
         }
         if cursor < parser_bytes.end {
             lowered_children.push(fragment_pending(
                 source,
-                language,
+                grammar,
                 node,
                 cursor..parser_bytes.end,
                 id,
-                inherited_channel,
+                child_channel,
                 inherited_classification,
             ));
         }
         pending.extend(lowered_children.into_iter().rev());
     }
-    if !normalize_recovery(language, source, &mut nodes) {
+    if !normalize_recovery(grammar, source, &mut nodes) {
         return None;
     }
     resolve_decoration_owners(&mut nodes, &decoration_hints, &decoration_owners);
@@ -507,18 +463,16 @@ fn decoration_transparent(node: &SyntaxNode) -> bool {
 
 /// Anonymous punctuation and spacing delimit syntax without carrying anchor payload.
 fn delimiter(spelling: &str) -> Option<Delimiter> {
-    let kind = match spelling {
-        "," => DelimiterKind::Comma,
-        ";" => DelimiterKind::Semicolon,
+    match spelling {
+        "," | ";" => Some(Delimiter::Trailing(None)),
         _ if spelling
             .chars()
             .all(|character| character.is_whitespace() || character.is_ascii_punctuation()) =>
         {
-            DelimiterKind::Structural
+            Some(Delimiter::Structural)
         }
-        _ => return None,
-    };
-    Some(Delimiter { kind, owner: None })
+        _ => None,
+    }
 }
 
 fn child_slot(grammar: &TreeSitterLanguage, field: Option<&str>) -> ChildSlot {
@@ -528,31 +482,32 @@ fn child_slot(grammar: &TreeSitterLanguage, field: Option<&str>) -> ChildSlot {
     let field = grammar
         .field_id_for_name(field)
         .expect("tree-sitter child fields belong to their grammar");
-    ChildSlot::Field(GrammarField::new(field))
+    ChildSlot::Field(GrammarField(field))
 }
 
 fn fragment_pending<'tree>(
     source: &Source<'_>,
-    language: ParserLanguage,
+    grammar: Grammar,
     parent: Node<'tree>,
     bytes: Range<usize>,
     parent_id: NodeId,
     inherited_channel: Option<ContentChannel>,
     inherited_classification: Option<LeafClassification>,
 ) -> Pending<'tree> {
-    let context = GapContext {
-        parent,
-        bytes: bytes.clone(),
-        source: source.as_str(),
-    };
-    let channel = inherited_channel.unwrap_or_else(|| gap_channel(language, context));
+    let spelling = source
+        .slice(bytes.clone())
+        .expect("source fragments remain inside source geometry");
+    let channel =
+        inherited_channel.unwrap_or_else(|| gap_channel(grammar, parent.kind(), spelling));
     let classification = leaf_classification(parent.kind(), channel, inherited_classification);
-    Pending::Fragment(PendingFragment {
+    let delimiter = delimiter(spelling);
+    Pending::Fragment {
         bytes,
         parent: parent_id,
         channel,
         classification,
-    })
+        delimiter,
+    }
 }
 
 fn collect_highlights(

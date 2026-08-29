@@ -10,18 +10,13 @@ use anyhow::{Result, bail};
 use std::ops::Range;
 use std::path::Path;
 
-pub use presentation::{
-    DiffMark, PresentedFile, ReviewHunk, ReviewRow, SourceRow, SourceSpan, WordDiff,
-};
+pub use presentation::{DiffMark, PresentedFile, ReviewRow, SourceRow, WordDiff};
+#[cfg(test)]
+pub use presentation::{ReviewHunk, SourceSpan};
 pub use source::LineEnding;
 
 /// Largest physical-line arena expanded for one revision.
 pub const MAX_REVISION_LINES: usize = 100_000;
-
-/// Physical lines without allocating the source geometry they will later own.
-pub fn revision_line_count(source: &str) -> usize {
-    source.lines().count()
-}
 
 /// Coarse language syntax category understood by the terminal palette.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,8 +48,8 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<PresentedFile>
             hunks: Vec::new(),
         });
     }
-    let before_lines = revision_line_count(before);
-    let after_lines = revision_line_count(after);
+    let before_lines = before.lines().count();
+    let after_lines = after.lines().count();
     if before_lines > MAX_REVISION_LINES || after_lines > MAX_REVISION_LINES {
         bail!("source exceeds the {MAX_REVISION_LINES}-line per-revision syntax limit");
     }

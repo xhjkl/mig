@@ -3,7 +3,7 @@
 use crate::diff::{
     DiffMark, LineEnding, PresentedFile, ReviewRow, SourceRow, SyntaxClass, WordDiff,
 };
-use crate::review::{FileNotice, ReviewItem};
+use crate::review::{FileNotice, ReviewEntry};
 use anyhow::{Context, Result, ensure};
 use crossterm::{
     cursor::{Hide, Show},
@@ -42,13 +42,6 @@ const SOURCE_TAB_STOP: usize = 4;
 #[derive(Clone, Copy, Debug, Default)]
 struct GutterLayout {
     label_columns: usize,
-}
-
-/// Minimal review facts needed to lay out the file ribbon.
-#[derive(Clone, Copy, Debug)]
-struct RibbonItem<'a> {
-    path: &'a str,
-    generated: bool,
 }
 
 /// Source-row marker whose glyph and foreground must remain one semantic choice.
@@ -144,7 +137,7 @@ fn moved_label(before: Option<usize>, after: usize) -> String {
 }
 
 /// Open one or more presented file reviews or retained input notices.
-pub fn run(reviews: Vec<ReviewItem>) -> Result<()> {
+pub fn run(reviews: Vec<ReviewEntry>) -> Result<()> {
     ensure!(!reviews.is_empty(), "cannot open an empty review");
     let mut session = TerminalSession::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -231,7 +224,7 @@ impl Drop for TerminalSession {
 /// Viewport over one file inside a path-ordered review.
 #[derive(Debug)]
 struct App {
-    reviews: Vec<ReviewItem>,
+    reviews: Vec<ReviewEntry>,
     file_index: usize,
     scroll: usize,
     viewport_rows: usize,
@@ -239,12 +232,8 @@ struct App {
 }
 
 impl App {
-    fn new<T>(reviews: Vec<T>) -> Self
-    where
-        T: Into<ReviewItem>,
-    {
+    fn new(reviews: Vec<ReviewEntry>) -> Self {
         assert!(!reviews.is_empty(), "review needs at least one file");
-        let reviews = reviews.into_iter().map(Into::into).collect();
         Self {
             reviews,
             file_index: 0,
@@ -254,26 +243,8 @@ impl App {
         }
     }
 
-    fn current_review(&self) -> &ReviewItem {
+    fn current_review(&self) -> &ReviewEntry {
         &self.reviews[self.file_index]
-    }
-
-    #[cfg(test)]
-    fn current_diff(&self) -> &PresentedFile {
-        let ReviewItem::Presented(diff) = self.current_review() else {
-            panic!("current review is not a diff");
-        };
-        diff
-    }
-
-    fn ribbon_items(&self) -> Vec<RibbonItem<'_>> {
-        self.reviews
-            .iter()
-            .map(|review| RibbonItem {
-                path: review.path(),
-                generated: review.is_generated(),
-            })
-            .collect()
     }
 
     fn max_scroll(&self) -> usize {
@@ -376,8 +347,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, area);
 
     let gutter = match app.current_review() {
-        ReviewItem::Presented(diff) => GutterLayout::new(diff),
-        ReviewItem::Notice(_) => GutterLayout::default(),
+        ReviewEntry::Diff(diff) => GutterLayout::new(diff),
+        ReviewEntry::Notice(_) => GutterLayout::default(),
     };
     let required_width = gutter.width() + MIN_SOURCE_COLUMNS;
     if usize::from(area.width) < required_width || area.height < MIN_TERMINAL_HEIGHT {
@@ -391,13 +362,19 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         area.width,
         area.height.saturating_sub(HEADER_ROWS),
     );
-    let rows = compose_file_review(app.current_review(), gutter, body.width as usize);
+    let rows = match app.current_review() {
+        ReviewEntry::Diff(diff) => compose_review(diff, gutter, body.width as usize),
+        ReviewEntry::Notice(notice) => compose_notice(notice, body.width as usize),
+    };
     app.total_rows = rows.len();
     app.viewport_rows = body.height as usize;
     app.clamp_scroll();
 
-    let ribbon_items = app.ribbon_items();
-    render_file_ribbon(frame, area, &ribbon_items, app.file_index);
+    let ribbon = file_ribbon(&app.reviews, app.file_index, usize::from(area.width));
+    frame.render_widget(
+        Paragraph::new(ribbon),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
     let visible = rows
         .into_iter()
         .skip(app.scroll)
@@ -406,16 +383,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Paragraph::new(visible), body);
 }
 
-fn render_file_ribbon(frame: &mut Frame<'_>, area: Rect, items: &[RibbonItem<'_>], active: usize) {
-    let line = file_ribbon(items, active, usize::from(area.width));
-    frame.render_widget(
-        Paragraph::new(line),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-}
-
 /// Contiguous ribbon run around the active review, with explicit hidden edges.
-fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'static> {
+fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'static> {
     if items.is_empty() || active >= items.len() || width == 0 {
         return Line::from("");
     }
@@ -466,9 +435,10 @@ fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'s
         spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
     }
 
-    let edge_width = ribbon_edge_width(hidden_left) + ribbon_edge_width(hidden_right);
+    let edge = UnicodeWidthStr::width(RIBBON_OMISSION) + UnicodeWidthStr::width(RIBBON_SEPARATOR);
+    let edge_width = (usize::from(hidden_left) + usize::from(hidden_right)) * edge;
     let item_widths = (start..end)
-        .map(|index| ribbon_item_width(items[index]))
+        .map(|index| ribbon_item_width(&items[index]))
         .collect::<Vec<_>>();
     let separator_width = UnicodeWidthStr::width(RIBBON_SEPARATOR);
     let separators_width = separator_width * item_widths.len().saturating_sub(1);
@@ -485,7 +455,7 @@ fn file_ribbon(items: &[RibbonItem<'_>], active: usize, width: usize) -> Line<'s
             // Only the active-only fallback can overflow: keep its tail and badge visible.
             items_width
         };
-        spans.extend(ribbon_item_spans(items[index], index == active, budget));
+        spans.extend(ribbon_item_spans(&items[index], index == active, budget));
     }
 
     if hidden_right {
@@ -501,9 +471,9 @@ enum RibbonSide {
     Right,
 }
 
-fn ribbon_run_width(items: &[RibbonItem<'_>], start: usize, end: usize) -> usize {
+fn ribbon_run_width(items: &[ReviewEntry], start: usize, end: usize) -> usize {
     let item_width = (start..end)
-        .map(|index| ribbon_item_width(items[index]))
+        .map(|index| ribbon_item_width(&items[index]))
         .sum::<usize>();
     let separators =
         end.saturating_sub(start + 1) + usize::from(start > 0) + usize::from(end < items.len());
@@ -513,17 +483,12 @@ fn ribbon_run_width(items: &[RibbonItem<'_>], start: usize, end: usize) -> usize
         + usize::from(end < items.len()) * UnicodeWidthStr::width(RIBBON_OMISSION)
 }
 
-fn ribbon_edge_width(hidden: bool) -> usize {
-    usize::from(hidden)
-        * (UnicodeWidthStr::width(RIBBON_OMISSION) + UnicodeWidthStr::width(RIBBON_SEPARATOR))
+fn ribbon_item_width(item: &ReviewEntry) -> usize {
+    UnicodeWidthStr::width(item.path())
+        + usize::from(item.is_generated()) * UnicodeWidthStr::width(GENERATED_BADGE)
 }
 
-fn ribbon_item_width(item: RibbonItem<'_>) -> usize {
-    UnicodeWidthStr::width(item.path)
-        + usize::from(item.generated) * UnicodeWidthStr::width(GENERATED_BADGE)
-}
-
-fn ribbon_item_spans(item: RibbonItem<'_>, active: bool, width: usize) -> Vec<Span<'static>> {
+fn ribbon_item_spans(item: &ReviewEntry, active: bool, width: usize) -> Vec<Span<'static>> {
     if width == 0 {
         return Vec::new();
     }
@@ -532,16 +497,20 @@ fn ribbon_item_spans(item: RibbonItem<'_>, active: bool, width: usize) -> Vec<Sp
         .fg(Palette::PATH)
         .add_modifier(Modifier::BOLD);
     let path_style = if active { active_style } else { muted() };
-    let badge = if item.generated { GENERATED_BADGE } else { "" };
+    let badge = if item.is_generated() {
+        GENERATED_BADGE
+    } else {
+        ""
+    };
     let reserved = UnicodeWidthStr::width(badge);
     if reserved > width {
-        let label = format!("{}{badge}", item.path);
+        let label = format!("{}{badge}", item.path());
         let label = clip_text_start(&label, width);
         return vec![Span::styled(label, path_style)];
     }
 
     let mut spans = Vec::new();
-    let path = clip_text_start(item.path, width - reserved);
+    let path = clip_text_start(item.path(), width - reserved);
     if !path.is_empty() {
         spans.push(Span::styled(path, path_style));
     }
@@ -570,12 +539,18 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, required_width: usize) {
         )),
         Line::styled("Resize or press q.", Style::default().fg(Palette::MUTED)),
     ];
-    frame.render_widget(
-        Paragraph::new(message)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
-        centered_rect(area, area.width.saturating_sub(4).min(60), 6),
+    let width = area.width.saturating_sub(4).min(60);
+    let height = 6.min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     );
+    let message = Paragraph::new(message)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(message, popup);
 }
 
 fn compose_review(diff: &PresentedFile, gutter: GutterLayout, width: usize) -> Vec<Line<'static>> {
@@ -628,17 +603,6 @@ fn compose_review(diff: &PresentedFile, gutter: GutterLayout, width: usize) -> V
         }
     }
     rows
-}
-
-fn compose_file_review(
-    review: &ReviewItem,
-    gutter: GutterLayout,
-    width: usize,
-) -> Vec<Line<'static>> {
-    match review {
-        ReviewItem::Presented(diff) => compose_review(diff, gutter, width),
-        ReviewItem::Notice(notice) => compose_notice(notice, width),
-    }
 }
 
 fn compose_notice(notice: &FileNotice, width: usize) -> Vec<Line<'static>> {
@@ -927,7 +891,17 @@ fn change_emphasis_style(mark: DiffMark) -> Style {
 }
 
 fn softened_syntax_style(class: SyntaxClass) -> Style {
-    let foreground = softened_syntax_foreground(class);
+    // Two parts syntax color to one part neutral gray: recessed, but still legible.
+    let foreground = syntax_foreground(class);
+    let foreground = match (foreground, Palette::MUTED) {
+        (Color::Rgb(red, green, blue), Color::Rgb(nr, ng, nb)) => {
+            let blend = |channel: u8, neutral: u8| {
+                ((u16::from(channel) * 2 + u16::from(neutral)) / 3) as u8
+            };
+            Color::Rgb(blend(red, nr), blend(green, ng), blend(blue, nb))
+        }
+        _ => foreground,
+    };
     Style::default().fg(foreground)
 }
 
@@ -1038,37 +1012,12 @@ fn syntax_foreground(class: SyntaxClass) -> Color {
     }
 }
 
-/// Two parts syntax color to one part neutral gray: recessed, but still legible.
-fn softened_syntax_foreground(class: SyntaxClass) -> Color {
-    blend_rgb(syntax_foreground(class), Palette::MUTED)
-}
-
-fn blend_rgb(color: Color, neutral: Color) -> Color {
-    let (Color::Rgb(red, green, blue), Color::Rgb(nr, ng, nb)) = (color, neutral) else {
-        return color;
-    };
-    let blend =
-        |channel: u8, neutral: u8| ((u16::from(channel) * 2 + u16::from(neutral)) / 3) as u8;
-    Color::Rgb(blend(red, nr), blend(green, ng), blend(blue, nb))
-}
-
 fn muted() -> Style {
     Style::default().fg(Palette::MUTED)
 }
 
 fn surrounding_style() -> Style {
     softened_syntax_style(SyntaxClass::Plain)
-}
-
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 /// Restrained foreground palette; the user's terminal owns every background.

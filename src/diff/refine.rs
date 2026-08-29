@@ -1,80 +1,60 @@
-//! Refine unranked source hunks into the ordered facts shown to reviewers.
+//! Refine source hunks into the ordered facts shown to reviewers.
 
 use super::LineCoverage;
 use super::context::{
-    CONTEXT_HALO_RADIUS, breadcrumb_halo_indices, context_gap_fits_halos, context_halo_end,
-    context_halo_start, merge_windows_touch, ranges_overlap, review_selection_ranges,
+    CONTEXT_HALO_RADIUS, breadcrumb_halo_indices, context_gap_fits_halos, context_halo_range,
+    include_range, merge_windows_touch, ranges_overlap, review_selection_ranges,
 };
 use super::syntax::{NodeId, SyntaxPair, SyntaxTree};
 use super::tree_diff::{
-    ChangeNature, RawHunk, RawHunks, SourceChange, SourceFact, SourceFocus, SourceMap, SourceOrder,
+    ChangeNature, RawSourceDiff, SourceChange, SourceFact, SourceHunk, SourceLayout, SourceOrder,
     select_line,
 };
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-/// Compiler-visible handoff from refinement to typed presentation.
-pub(super) struct RefinedHunks(Vec<SourceHunk>);
-
-impl RefinedHunks {
-    pub(super) fn into_hunks(self) -> Vec<SourceHunk> {
-        self.0
-    }
+/// One prioritized source-space hunk with final coverage and semantic changes.
+pub struct RefinedHunk {
+    pub coverage: LineCoverage,
+    pub changes: Vec<SourceChange>,
 }
 
-/// One prioritized source-space hunk with no stale ranking metadata.
-pub(super) struct SourceHunk {
-    pub(super) coverage: LineCoverage,
-    pub(super) facts: Vec<SourceFact>,
-    pub(super) file_boundary: bool,
-}
-
-/// One source-located hunk after refinement assigns placement and review geometry.
-struct PlacedHunk {
+/// One source-located cluster with refinement-owned review geometry.
+struct ReviewCluster {
     nature: ChangeNature,
     groups: Vec<Vec<SourceFact>>,
-    context_focus: SourceFocus,
+    halo_lines: Vec<usize>,
     order: SourceOrder,
     merge_window: Range<usize>,
 }
 
-impl PlacedHunk {
-    fn after_gap(&self) -> usize {
-        self.order.after_gap
-    }
-
-    fn needs_context(&self) -> bool {
-        !self.context_focus.is_empty()
-    }
-
+impl ReviewCluster {
     fn meld(&mut self, mut later: Self) {
         debug_assert!(self.order <= later.order);
         if review_priority(later.nature) > review_priority(self.nature) {
             self.nature = later.nature;
         }
         self.groups.append(&mut later.groups);
-        self.context_focus.merge(later.context_focus);
+        self.halo_lines.append(&mut later.halo_lines);
         self.merge_window.start = self.merge_window.start.min(later.merge_window.start);
         self.merge_window.end = self.merge_window.end.max(later.merge_window.end);
     }
 }
 
 /// Sheaf nearby source changes, apply review priority, and complete context.
-pub(super) fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawHunks) -> RefinedHunks {
-    let RawHunks {
+pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<RefinedHunk> {
+    let RawSourceDiff {
         hunks,
-        source_map,
-        before_lines,
-        after_lines,
+        source_layout,
     } = raw;
     let hunks = hunks
         .into_iter()
-        .flat_map(|hunk| select_raw_hunks(pair, &source_map, hunk))
+        .flat_map(|hunk| split_source_hunk(pair, &source_layout, hunk))
         .collect::<Vec<_>>();
     let mut hunks = hunks
         .into_iter()
-        .map(|hunk| place_hunk(hunk, &source_map))
+        .map(|hunk| place_hunk(hunk, &source_layout))
         .collect::<Vec<_>>();
 
     // Geometry is source-ordered so only neighboring context halos can merge.
@@ -83,37 +63,46 @@ pub(super) fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawHunks) -> RefinedH
     // Review priority applies only after nearby auxiliary facts are attached.
     hunks.sort_by_key(review_order);
     for hunk in &mut hunks {
-        if hunk.needs_context() {
-            complete_context_halos(pair, &source_map, hunk);
-            complete_display_gaps(pair, &source_map, hunk);
+        if !hunk.halo_lines.is_empty() {
+            complete_context_halos(pair, &source_layout, hunk);
+            complete_display_gaps(pair, &source_layout, hunk);
         }
-        order_groups(hunk);
+        hunk.groups.sort_by_key(|group| {
+            group
+                .iter()
+                .map(|fact| (fact.script_order, fact.order))
+                .min()
+                .expect("display group owns a source fact")
+        });
     }
     deduplicate_context_rows(&mut hunks);
 
-    let mut hunks = hunks
+    hunks
         .into_iter()
-        .map(|hunk| SourceHunk {
-            coverage: source_facts_coverage(hunk.groups.iter().flatten()),
-            facts: hunk.groups.into_iter().flatten().collect(),
-            file_boundary: false,
+        .map(|hunk| {
+            let coverage = source_facts_coverage(hunk.groups.iter().flatten());
+            let changes = hunk
+                .groups
+                .into_iter()
+                .flatten()
+                .map(|fact| fact.change)
+                .collect();
+            RefinedHunk { coverage, changes }
         })
-        .collect::<Vec<_>>();
-    append_file_boundary(&mut hunks, before_lines, after_lines);
-    RefinedHunks(hunks)
+        .collect()
 }
 
-/// Split one complete raw source region into local review excerpts.
-fn select_raw_hunks(
+/// Split one complete source hunk into local review regions.
+fn split_source_hunk(
     pair: &SyntaxPair<'_, '_>,
-    source_map: &SourceMap,
-    hunk: RawHunk,
-) -> Vec<RawHunk> {
+    source_layout: &SourceLayout,
+    hunk: SourceHunk,
+) -> Vec<SourceHunk> {
     let signals = hunk
         .facts
         .iter()
         .enumerate()
-        .filter_map(|(index, fact)| fact.has_signal().then_some(index))
+        .filter_map(|(index, fact)| fact.change.has_signal().then_some(index))
         .collect::<Vec<_>>();
     let Some(first) = signals.first().copied() else {
         return Vec::new();
@@ -122,7 +111,7 @@ fn select_raw_hunks(
         .facts
         .iter()
         .enumerate()
-        .filter_map(|(index, fact)| fact.context_line().map(|line| (line, index)))
+        .filter_map(|(index, fact)| fact.change.context_line().map(|line| (line, index)))
         .collect::<HashMap<_, _>>();
 
     let mut clusters = Vec::new();
@@ -141,36 +130,37 @@ fn select_raw_hunks(
 
     clusters
         .into_iter()
-        .map(|cluster| select_raw_hunk(pair, source_map, &hunk, &context_rows, cluster))
+        .map(|cluster| select_review_region(pair, source_layout, &hunk, &context_rows, cluster))
         .collect()
 }
 
-fn select_raw_hunk(
+fn select_review_region(
     pair: &SyntaxPair<'_, '_>,
-    source_map: &SourceMap,
-    hunk: &RawHunk,
+    source_layout: &SourceLayout,
+    hunk: &SourceHunk,
     context_rows: &HashMap<usize, usize>,
     cluster: Range<usize>,
-) -> RawHunk {
-    let start = context_halo_start(&hunk.facts, cluster.start, SourceFact::is_context);
-    let end = context_halo_end(&hunk.facts, cluster.end - 1, SourceFact::is_context);
+) -> SourceHunk {
+    let context_halo = context_halo_range(&hunk.facts, cluster.clone(), |fact| {
+        fact.change.is_context()
+    });
     let mut after_signals = hunk.facts[cluster.clone()]
         .iter()
-        .flat_map(|fact| fact.displayed_after.iter().copied())
+        .flat_map(|fact| fact.change.displayed_after())
         .collect::<HashSet<_>>();
     after_signals.extend(
         hunk.facts[cluster]
             .iter()
-            .flat_map(|fact| coverage_lines(&fact.coverage.before))
-            .filter_map(|line| source_map.current_anchor(line)),
+            .flat_map(|fact| fact.coverage.before.clone().into_iter().flatten())
+            .filter_map(|line| source_layout.current_anchor(line)),
     );
     let mut hierarchy = hunk
         .context_root
         .map(|root| structural_context_lines(&pair.after, root, &after_signals))
         .unwrap_or_default();
     let breadcrumbs = breadcrumb_halo_indices(&hierarchy, |line| context_rows.get(&line).copied());
-    let selected = review_selection_ranges(start..end, breadcrumbs, |index| {
-        hunk.facts[index].is_context()
+    let selected = review_selection_ranges(context_halo, breadcrumbs, |index| {
+        hunk.facts[index].change.is_context()
     });
 
     let mut facts = Vec::new();
@@ -181,7 +171,8 @@ fn select_raw_hunk(
         {
             let coverage = source_facts_coverage(hunk.facts[previous_end..range.start].iter());
             if coverage.before.is_some() || coverage.after.is_some() {
-                facts.push(elision_fact(coverage, hunk.order, hunk_order_rank(hunk)));
+                let script_order = minimum_script_order(&hunk.facts, hunk.order.after_gap);
+                facts.push(elision_fact(coverage, hunk.order, script_order));
             }
         }
         facts.extend_from_slice(&hunk.facts[range.clone()]);
@@ -190,7 +181,7 @@ fn select_raw_hunk(
 
     let shown = facts
         .iter()
-        .flat_map(|fact| fact.displayed_after.iter().copied())
+        .flat_map(|fact| fact.change.displayed_after())
         .collect::<HashSet<_>>();
     hierarchy.retain(|line| !shown.contains(line));
     let mut hierarchy = hierarchy.into_iter().collect::<Vec<_>>();
@@ -201,17 +192,17 @@ fn select_raw_hunk(
             .source
             .line(number)
             .expect("hierarchy line belongs to the current unit");
-        facts.push(context_fact(select_line(source, &[]), source_map));
+        facts.push(context_fact(select_line(source, &[]), source_layout));
     }
 
     let order = facts
         .iter()
-        .filter(|fact| fact.has_signal())
+        .filter(|fact| fact.change.has_signal())
         .map(|fact| fact.order)
         .min()
         .unwrap_or(hunk.order);
 
-    RawHunk {
+    SourceHunk {
         nature: hunk.nature,
         facts,
         order,
@@ -228,68 +219,56 @@ fn source_facts_coverage<'fact>(
         after: None,
     };
     for fact in facts {
-        include_optional_coverage(&mut coverage.before, fact.coverage.before.clone());
-        include_optional_coverage(&mut coverage.after, fact.coverage.after.clone());
+        include_range(&mut coverage.before, fact.coverage.before.clone());
+        include_range(&mut coverage.after, fact.coverage.after.clone());
     }
     coverage
 }
 
-fn coverage_lines(coverage: &Option<Range<usize>>) -> Range<usize> {
-    coverage.clone().unwrap_or(0..0)
-}
-
-fn source_focus(facts: &[SourceFact]) -> SourceFocus {
+fn signal_lines(facts: &[SourceFact]) -> (Vec<usize>, Vec<usize>) {
     let mut before = facts
         .iter()
-        .filter(|fact| fact.has_signal())
-        .flat_map(|fact| coverage_lines(&fact.coverage.before))
+        .filter(|fact| fact.change.has_signal())
+        .flat_map(|fact| fact.coverage.before.clone().into_iter().flatten())
         .collect::<Vec<_>>();
     let mut after = facts
         .iter()
-        .filter(|fact| fact.has_signal())
-        .flat_map(|fact| coverage_lines(&fact.coverage.after))
+        .filter(|fact| fact.change.has_signal())
+        .flat_map(|fact| fact.coverage.after.clone().into_iter().flatten())
         .collect::<Vec<_>>();
     before.sort_unstable();
     before.dedup();
     after.sort_unstable();
     after.dedup();
-    SourceFocus { before, after }
+    (before, after)
 }
 
-fn hunk_order_rank(hunk: &RawHunk) -> usize {
-    hunk.facts
-        .iter()
+fn minimum_script_order<'fact>(
+    facts: impl IntoIterator<Item = &'fact SourceFact>,
+    fallback: usize,
+) -> usize {
+    facts
+        .into_iter()
         .map(|fact| fact.script_order)
         .min()
-        .unwrap_or(hunk.order.after_gap)
+        .unwrap_or(fallback)
 }
 
-fn hunk_script_order(hunk: &PlacedHunk) -> usize {
-    hunk.groups
-        .iter()
-        .flatten()
-        .map(|fact| fact.script_order)
-        .min()
-        .unwrap_or(hunk.order.after_gap)
-}
-
-fn context_fact(line: super::tree_diff::SelectedLine, source_map: &SourceMap) -> SourceFact {
+fn context_fact(line: super::tree_diff::SelectedLine, source_layout: &SourceLayout) -> SourceFact {
     let mut coverage = LineCoverage {
         before: None,
         after: Some(line.number..line.number + 1),
     };
-    if let Some(before) = source_map.aligned_before_line(line.number) {
+    if let Some(before) = source_layout.aligned_before_line(line.number) {
         coverage.before = Some(before..before + 1);
     }
     let order = SourceOrder::current(line.number);
-    let script_order = source_map.script_order(line.number);
-    let displayed_after = vec![line.number];
+    let script_order = source_layout.script_order(line.number);
     SourceFact {
         change: SourceChange::Current(line),
         coverage,
         order,
         script_order,
-        displayed_after,
     }
 }
 
@@ -304,7 +283,6 @@ fn elision_fact(coverage: LineCoverage, fallback: SourceOrder, script_order: usi
         coverage,
         order,
         script_order,
-        displayed_after: Vec::new(),
     }
 }
 
@@ -355,23 +333,49 @@ fn structural_context_lines(
     context
 }
 
-/// Place one raw source fact into current-world review geometry.
-fn place_hunk(hunk: RawHunk, source_map: &SourceMap) -> PlacedHunk {
-    let source_focus = source_focus(&hunk.facts);
-    let anchor_focus = hunk.context_anchor.map(|line| line..line + 1);
-    let focus = anchor_focus
-        .or_else(|| source_map.current_focus(&source_focus))
-        .or_else(|| line_hull(&source_focus.before))
-        .expect("raw hunk owns current or before-side focus");
-    let context_focus = match (receives_context(hunk.nature), hunk.context_anchor) {
-        (false, _) => SourceFocus::default(),
-        (true, Some(line)) => SourceFocus::after_line(line),
-        (true, None) => source_focus,
+/// Resolve one unranked hunk into current-world review geometry.
+fn place_hunk(hunk: SourceHunk, source_layout: &SourceLayout) -> ReviewCluster {
+    let (before_lines, after_lines) = signal_lines(&hunk.facts);
+    let mapped_before = before_lines
+        .iter()
+        .filter_map(|line| source_layout.current_anchor(*line))
+        .collect::<Vec<_>>();
+    let focus = if let Some(line) = hunk.context_anchor {
+        line..line + 1
+    } else {
+        let current_lines = if after_lines.is_empty() {
+            &mapped_before
+        } else {
+            &after_lines
+        };
+        let lines = if current_lines.is_empty() {
+            &before_lines
+        } else {
+            current_lines
+        };
+        let first = *lines
+            .first()
+            .expect("raw hunk owns current or before-side focus");
+        let last = *lines
+            .last()
+            .expect("raw hunk owns current or before-side focus");
+        first..last.saturating_add(1)
     };
-    PlacedHunk {
+    let mut halo_lines = match (receives_context(hunk.nature), hunk.context_anchor) {
+        (false, _) => Vec::new(),
+        (true, Some(line)) => vec![line],
+        (true, None) => {
+            let mut lines = after_lines;
+            lines.extend(mapped_before);
+            lines
+        }
+    };
+    halo_lines.sort_unstable();
+    halo_lines.dedup();
+    ReviewCluster {
         nature: hunk.nature,
         groups: group_facts(hunk.facts),
-        context_focus,
+        halo_lines,
         order: hunk.order,
         merge_window: merge_window(focus, hunk.nature),
     }
@@ -379,12 +383,12 @@ fn place_hunk(hunk: RawHunk, source_map: &SourceMap) -> PlacedHunk {
 
 /// Keep one producer's material interval together while retaining atomic replacements.
 fn group_facts(facts: Vec<SourceFact>) -> Vec<Vec<SourceFact>> {
-    let Some(first) = facts.iter().position(SourceFact::has_signal) else {
+    let Some(first) = facts.iter().position(|fact| fact.change.has_signal()) else {
         return facts.into_iter().map(|fact| vec![fact]).collect();
     };
     let last = facts
         .iter()
-        .rposition(SourceFact::has_signal)
+        .rposition(|fact| fact.change.has_signal())
         .expect("a first signal implies a last signal");
     let mut facts = facts;
     let trailing = facts.split_off(last + 1);
@@ -417,34 +421,8 @@ fn merge_window(focus: Range<usize>, nature: ChangeNature) -> Range<usize> {
     focus.start.saturating_sub(radius).max(1)..focus.end.saturating_add(radius)
 }
 
-fn line_hull(lines: &[usize]) -> Option<Range<usize>> {
-    Some(*lines.first()?..lines.last()?.saturating_add(1))
-}
-
-fn include_optional_coverage(coverage: &mut Option<Range<usize>>, addition: Option<Range<usize>>) {
-    let Some(addition) = addition else {
-        return;
-    };
-    let Some(coverage) = coverage else {
-        *coverage = Some(addition);
-        return;
-    };
-    coverage.start = coverage.start.min(addition.start);
-    coverage.end = coverage.end.max(addition.end);
-}
-
-fn order_groups(hunk: &mut PlacedHunk) {
-    hunk.groups.sort_by_key(|group| {
-        group
-            .iter()
-            .map(|fact| (fact.script_order, fact.order))
-            .min()
-            .expect("display group owns a source fact")
-    });
-}
-
 /// Give each uninterrupted current-world source occurrence one final display owner.
-fn deduplicate_context_rows(hunks: &mut Vec<PlacedHunk>) {
+fn deduplicate_context_rows(hunks: &mut Vec<ReviewCluster>) {
     let mut visible = HashSet::new();
     for hunk in hunks.iter_mut() {
         for group in &mut hunk.groups {
@@ -473,33 +451,27 @@ fn claim_visible_context(fact: &SourceFact, visible: &mut HashSet<usize>) -> boo
         return true;
     }
 
-    let line = fact.context_line();
+    let line = fact.change.context_line();
     let duplicate_context = line.is_some_and(|line| visible.contains(&line));
     if duplicate_context {
         return false;
     }
-    visible.extend(fact.displayed_after.iter().copied());
+    visible.extend(fact.change.displayed_after());
     true
 }
 
 /// Complete each signal's three-line context halo against the whole current file.
 fn complete_context_halos(
     pair: &SyntaxPair<'_, '_>,
-    source_map: &SourceMap,
-    hunk: &mut PlacedHunk,
+    source_layout: &SourceLayout,
+    hunk: &mut ReviewCluster,
 ) {
     let line_count = pair.after.source.lines().len();
     if line_count == 0 {
         return;
     }
 
-    let mut signals = hunk.context_focus.after.clone();
-    signals.extend(
-        hunk.context_focus
-            .before
-            .iter()
-            .filter_map(|line| source_map.current_anchor(*line)),
-    );
+    let mut signals = hunk.halo_lines.clone();
     signals.sort_unstable();
     signals.dedup();
 
@@ -507,7 +479,7 @@ fn complete_context_halos(
         .groups
         .iter()
         .flatten()
-        .flat_map(|fact| fact.displayed_after.iter().copied())
+        .flat_map(|fact| fact.change.displayed_after())
         .collect::<HashSet<_>>();
     for signal in signals {
         let start = signal.saturating_sub(CONTEXT_HALO_RADIUS).max(1);
@@ -522,24 +494,28 @@ fn complete_context_halos(
                 .line(number)
                 .expect("selected current context line exists");
             hunk.groups
-                .push(vec![context_fact(select_line(line, &[]), source_map)]);
+                .push(vec![context_fact(select_line(line, &[]), source_layout)]);
         }
     }
 }
 
 /// Fill or explicitly fold gaps introduced by sparse hierarchy context.
-fn complete_display_gaps(pair: &SyntaxPair<'_, '_>, source_map: &SourceMap, hunk: &mut PlacedHunk) {
+fn complete_display_gaps(
+    pair: &SyntaxPair<'_, '_>,
+    source_layout: &SourceLayout,
+    hunk: &mut ReviewCluster,
+) {
     let mut displayed = hunk
         .groups
         .iter()
         .flatten()
-        .flat_map(|fact| fact.displayed_after.iter().copied())
+        .flat_map(|fact| fact.change.displayed_after())
         .collect::<Vec<_>>();
     displayed.sort_unstable();
     displayed.dedup();
     let before_displayed = displayed
         .iter()
-        .filter_map(|line| source_map.aligned_before_line(*line))
+        .filter_map(|line| source_layout.aligned_before_line(*line))
         .collect::<Vec<_>>();
     trim_elisions_behind_context(&mut hunk.groups, &before_displayed, &displayed);
     let elisions = hunk
@@ -551,7 +527,7 @@ fn complete_display_gaps(pair: &SyntaxPair<'_, '_>, source_map: &SourceMap, hunk
             _ => None,
         })
         .collect::<Vec<_>>();
-    let script_order = hunk_script_order(hunk);
+    let script_order = minimum_script_order(hunk.groups.iter().flatten(), hunk.order.after_gap);
 
     for lines in displayed.windows(2) {
         let omitted = lines[0].saturating_add(1)..lines[1];
@@ -570,7 +546,7 @@ fn complete_display_gaps(pair: &SyntaxPair<'_, '_>, source_map: &SourceMap, hunk
                 .line(number)
                 .expect("one omitted current context line exists");
             hunk.groups
-                .push(vec![context_fact(select_line(source, &[]), source_map)]);
+                .push(vec![context_fact(select_line(source, &[]), source_layout)]);
             continue;
         }
         let coverage = LineCoverage {
@@ -654,24 +630,24 @@ fn range_excluding_lines(range: Range<usize>, excluded: &[usize]) -> Vec<Range<u
     segments
 }
 
-fn coalescing_order(hunk: &PlacedHunk) -> (usize, usize, Reverse<u8>) {
+fn coalescing_order(hunk: &ReviewCluster) -> (usize, usize, Reverse<u8>) {
     (
-        hunk.after_gap(),
+        hunk.order.after_gap,
         hunk.order.tie_break,
         Reverse(review_priority(hunk.nature)),
     )
 }
 
-fn review_order(hunk: &PlacedHunk) -> (Reverse<u8>, usize, usize) {
+fn review_order(hunk: &ReviewCluster) -> (Reverse<u8>, usize, usize) {
     (
         Reverse(review_priority(hunk.nature)),
-        hunk.after_gap(),
+        hunk.order.after_gap,
         hunk.order.tie_break,
     )
 }
 
-fn coalesce_hunks(hunks: Vec<PlacedHunk>) -> Vec<PlacedHunk> {
-    let mut coalesced: Vec<PlacedHunk> = Vec::new();
+fn coalesce_hunks(hunks: Vec<ReviewCluster>) -> Vec<ReviewCluster> {
+    let mut coalesced: Vec<ReviewCluster> = Vec::new();
     for hunk in hunks {
         let Some(previous) = coalesced.last_mut() else {
             coalesced.push(hunk);
@@ -684,38 +660,4 @@ fn coalesce_hunks(hunks: Vec<PlacedHunk>) -> Vec<PlacedHunk> {
         previous.meld(hunk);
     }
     coalesced
-}
-
-fn append_file_boundary(hunks: &mut [SourceHunk], before_lines: usize, after_lines: usize) {
-    let reaches_current = hunks
-        .iter()
-        .any(|hunk| hunk_reaches_after_boundary(hunk, after_lines));
-    let reaches_removed = !reaches_current
-        && hunks.iter().any(|hunk| {
-            hunk.coverage.after.is_none()
-                && hunk
-                    .coverage
-                    .before
-                    .as_ref()
-                    .is_some_and(|coverage| coverage.end == before_lines.saturating_add(1))
-        });
-    if !reaches_current && !reaches_removed {
-        return;
-    }
-    if let Some(last) = hunks.last_mut() {
-        last.file_boundary = true;
-    }
-}
-
-fn hunk_reaches_after_boundary(hunk: &SourceHunk, after_lines: usize) -> bool {
-    let coverage_reaches = hunk
-        .coverage
-        .after
-        .as_ref()
-        .is_some_and(|coverage| coverage.end == after_lines.saturating_add(1));
-    let context_reaches = hunk
-        .facts
-        .last()
-        .is_some_and(|fact| fact.displayed_after.last() == Some(&after_lines));
-    coverage_reaches || context_reaches
 }

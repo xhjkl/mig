@@ -1,12 +1,11 @@
-use super::lower::{GapContext, HighlightQueries, NodeAnnotation, NodeContext};
+use super::lower::{HighlightQueries, NodeAnnotation};
 use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
 use ::tree_sitter::Node;
 
-pub(super) static HIGHLIGHT_QUERIES: HighlightQueries =
+pub static HIGHLIGHT_QUERIES: HighlightQueries =
     HighlightQueries::new(&[tree_sitter_css::HIGHLIGHTS_QUERY]);
 
-pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
-    let node = context.node;
+pub fn annotate(node: Node<'_>, parent_kind: Option<&str>, source: &str) -> NodeAnnotation {
     if node.kind() == "stylesheet" {
         return NodeAnnotation {
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -16,7 +15,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if matches!(node.kind(), "comment" | "js_comment") {
-        let review = (context.parent_kind == Some("stylesheet"))
+        let review = (parent_kind == Some("stylesheet"))
             .then(|| ReviewUnit::linewise(LayoutOwnership::None));
         return NodeAnnotation {
             review,
@@ -28,9 +27,9 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if node.kind() == "import_statement" {
-        let identity = first_named_child(node).map(|source| source.byte_range());
-        let review = (context.parent_kind == Some("stylesheet"))
-            .then(|| ReviewUnit::wiring(LayoutOwnership::None));
+        let identity = node.named_child(0).map(|source| source.byte_range());
+        let review =
+            (parent_kind == Some("stylesheet")).then(|| ReviewUnit::wiring(LayoutOwnership::None));
         return NodeAnnotation {
             review,
             identity,
@@ -41,8 +40,8 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if is_inline_statement(node.kind()) {
-        let identity = statement_identity(node, context.source);
-        let review = (context.parent_kind == Some("stylesheet"))
+        let identity = statement_identity(node, source);
+        let review = (parent_kind == Some("stylesheet"))
             .then(|| ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines));
         return NodeAnnotation {
             review,
@@ -54,7 +53,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if node.kind() == "declaration" {
-        let identity = first_named_child(node).map(|child| child.byte_range());
+        let identity = node.named_child(0).map(|child| child.byte_range());
         return NodeAnnotation {
             identity,
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -63,7 +62,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    if context.parent_kind == Some("stylesheet") && node.is_named() {
+    if parent_kind == Some("stylesheet") && node.is_named() {
         return NodeAnnotation {
             review: Some(ReviewUnit::linewise(LayoutOwnership::AdjacentBlankLines)),
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -75,21 +74,11 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     NodeAnnotation::default()
 }
 
-pub(super) fn gap_channel(context: GapContext<'_, '_>) -> ContentChannel {
-    if context.is_whitespace()
-        && matches!(
-            context.parent.kind(),
-            "descendant_selector" | "string_content" | "string_value"
-        )
-    {
-        return ContentChannel::Syntax;
-    }
-    context.default_channel()
-}
-
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
+pub fn whitespace_is_syntax(parent_kind: &str) -> bool {
+    matches!(
+        parent_kind,
+        "descendant_selector" | "string_content" | "string_value"
+    )
 }
 
 fn is_inline_statement(kind: &str) -> bool {
@@ -106,7 +95,7 @@ fn is_inline_statement(kind: &str) -> bool {
 
 fn statement_identity(node: Node<'_>, source: &str) -> Option<std::ops::Range<usize>> {
     if node.kind() == "rule_set" {
-        return first_named_child(node).map(|child| child.byte_range());
+        return node.named_child(0).map(|child| child.byte_range());
     }
     if node.kind() == "keyframes_statement" {
         return named_child_of_kind(node, "keyframes_name").map(|name| name.byte_range());

@@ -2,7 +2,7 @@
 
 use super::source::LineEnding;
 use super::syntax::{
-    ChildSlot, ComparisonStrategy, ContentChannel, Language, LayoutOwnership, LeafRole, NodeId,
+    ChildSlot, ComparisonStrategy, ContentChannel, LayoutOwnership, LeafRole, NodeId,
     SiblingMatching, SourceRole, SyntaxKind, SyntaxPair, SyntaxTree, node_owns_complete_lines,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,31 +13,31 @@ const MAX_LOCAL_ALIGNMENT_CELLS: usize = 16_384;
 
 /// SyntaxTree-only edit graph consumed without structural or unit rematching.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Correspondence {
+pub struct Correspondence {
     /// Semantic review units not superseded by an exact local line fallback.
-    pub(crate) units: Vec<UnitEdit>,
+    pub units: Vec<UnitEdit>,
     /// Global non-crossing physical-line alignment certified by semantic-scope gaps.
-    pub(crate) line_links: Vec<LineLink>,
+    pub line_links: Vec<LineLink>,
     /// Content-paired physical rows whose concrete terminators differ.
-    pub(crate) line_ending_edits: Vec<LineLink>,
+    pub line_ending_edits: Vec<LineLink>,
     /// Source-exact regions reviewed linewise without discarding neighboring syntax.
-    pub(crate) line_fallbacks: Vec<LineFallback>,
+    pub line_fallbacks: Vec<LineFallback>,
     /// Physical row pairs local to reordered units and therefore non-monotone globally.
-    pub(crate) unit_line_links: Vec<LineLink>,
-    pub(crate) leaf_links: Vec<LeafLink>,
+    unit_line_links: Vec<LineLink>,
+    pub leaf_links: Vec<LeafLink>,
     /// Dense before-node lookup into `leaf_links`.
-    pub(crate) before_leaf: Vec<Option<usize>>,
+    before_leaf: Vec<Option<usize>>,
     /// Dense after-node lookup into `leaf_links`.
-    pub(crate) after_leaf: Vec<Option<usize>>,
+    after_leaf: Vec<Option<usize>>,
     /// Exact named-subtree links, including nested structural evidence.
-    pub(crate) composites: Vec<NodeLink>,
+    pub composites: Vec<NodeLink>,
     /// Complete parser-node correspondence used to keep later selection on node boundaries.
-    pub(crate) scopes: Vec<ScopeLink>,
+    pub scopes: Vec<ScopeLink>,
 }
 
 impl Correspondence {
     /// Exact physical-line links wholly contained by a pair of absolute line ranges.
-    pub(crate) fn line_links_in(
+    pub fn line_links_in(
         &self,
         before: Range<usize>,
         after: Range<usize>,
@@ -55,7 +55,7 @@ impl Correspondence {
     }
 
     /// Terminator edits wholly contained by a pair of absolute line ranges.
-    pub(crate) fn line_ending_edits_in(
+    pub fn line_ending_edits_in(
         &self,
         before: Range<usize>,
         after: Range<usize>,
@@ -73,28 +73,28 @@ impl Correspondence {
     }
 
     /// Leaf links owned by one matched review unit.
-    pub(crate) fn unit_leaf_links(&self, unit: &MatchedUnit) -> &[LeafLink] {
+    pub fn unit_leaf_links(&self, unit: &MatchedUnit) -> &[LeafLink] {
         &self.leaf_links[unit.leaf_links.clone()]
     }
 
     /// Content-paired physical rows owned by one reordered review unit.
-    pub(crate) fn unit_line_links(&self, unit: &MatchedUnit) -> &[LineLink] {
+    pub fn unit_line_links(&self, unit: &MatchedUnit) -> &[LineLink] {
         &self.unit_line_links[unit.line_links.clone()]
     }
 
     /// Exact composite links owned by one matched review unit.
-    pub(crate) fn unit_composites(&self, unit: &MatchedUnit) -> &[NodeLink] {
+    pub fn unit_composites(&self, unit: &MatchedUnit) -> &[NodeLink] {
         &self.composites[unit.composites.clone()]
     }
 
     /// Link terminating at one after-world leaf.
-    pub(crate) fn after_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
+    pub fn after_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
         let link = self.after_leaf.get(node.index()).copied().flatten()?;
         self.leaf_links.get(link)
     }
 
     /// Link originating at one before-world leaf.
-    pub(crate) fn before_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
+    pub fn before_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
         let link = self.before_leaf.get(node.index()).copied().flatten()?;
         self.leaf_links.get(link)
     }
@@ -102,21 +102,21 @@ impl Correspondence {
 
 /// One exact physical-line correspondence, using zero-based source-line indices.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct LineLink {
-    pub(crate) before: usize,
-    pub(crate) after: usize,
+pub struct LineLink {
+    pub before: usize,
+    pub after: usize,
 }
 
 /// Zero-based physical source ranges that require local linewise review.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LineFallback {
-    pub(crate) before: Range<usize>,
-    pub(crate) after: Range<usize>,
+pub struct LineFallback {
+    pub before: Range<usize>,
+    pub after: Range<usize>,
 }
 
 /// One review unit in the merged before/after edit script.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum UnitEdit {
+pub enum UnitEdit {
     Matched(MatchedUnit),
     Removed { before: NodeId },
     Added { after: NodeId },
@@ -124,15 +124,15 @@ pub(crate) enum UnitEdit {
 
 /// One-to-one review-unit correspondence and the facts derived from it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MatchedUnit {
-    pub(crate) before: NodeId,
-    pub(crate) after: NodeId,
+pub struct MatchedUnit {
+    pub before: NodeId,
+    pub after: NodeId,
     /// Symmetric comparison behavior chosen from both frontend classifications.
-    pub(crate) comparison: ComparisonStrategy,
+    pub comparison: ComparisonStrategy,
     /// Symmetric source role chosen from both frontend classifications.
-    pub(crate) role: SourceRole,
-    pub(crate) relation: ContentRelation,
-    pub(crate) placement: Placement,
+    pub role: SourceRole,
+    pub relation: ContentRelation,
+    pub placement: Placement,
     line_links: Range<usize>,
     leaf_links: Range<usize>,
     composites: Range<usize>,
@@ -140,7 +140,7 @@ pub(crate) struct MatchedUnit {
 
 /// Strongest equality shared by one matched unit, from exact spelling to changed syntax.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ContentRelation {
+pub enum ContentRelation {
     SourceEqual,
     FullEqual,
     PayloadEqual,
@@ -148,74 +148,74 @@ pub(crate) enum ContentRelation {
 }
 
 impl ContentRelation {
-    pub(crate) const fn source_equal(self) -> bool {
+    pub const fn source_equal(self) -> bool {
         matches!(self, Self::SourceEqual)
     }
 
-    pub(crate) const fn full_equal(self) -> bool {
+    pub const fn full_equal(self) -> bool {
         matches!(self, Self::SourceEqual | Self::FullEqual)
     }
 
-    pub(crate) const fn payload_equal(self) -> bool {
+    pub const fn payload_equal(self) -> bool {
         !matches!(self, Self::Modified)
     }
 }
 
 /// Relative order inside the frontend-selected movement domain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum Placement {
+pub enum Placement {
     Stable,
     Reordered,
 }
 
 /// One-to-one concrete-leaf correspondence inside a matched review unit.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct LeafLink {
-    pub(crate) before: NodeId,
-    pub(crate) after: NodeId,
-    pub(crate) relation: LeafRelation,
-    pub(crate) placement: Placement,
-    pub(crate) parent: ParentCorrespondence,
+pub struct LeafLink {
+    pub before: NodeId,
+    pub after: NodeId,
+    pub relation: LeafRelation,
+    pub placement: Placement,
+    pub parent: ParentCorrespondence,
     /// Enclosing transparent transition retained for presentation as reflow.
-    pub(crate) wrapper: Option<Reparenting>,
+    pub wrapper: Option<Reparenting>,
 }
 
 /// Whether a leaf retained exact payload or only a compatible structural role.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum LeafRelation {
+pub enum LeafRelation {
     Exact,
     Modified,
 }
 
 /// Exact named subtree, possibly retained beneath a different matched parent.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct NodeLink {
-    pub(crate) before: NodeId,
-    pub(crate) after: NodeId,
-    pub(crate) parent: ParentCorrespondence,
-    pub(crate) wrapper: Option<Reparenting>,
-    pub(crate) placement: Placement,
+pub struct NodeLink {
+    pub before: NodeId,
+    pub after: NodeId,
+    parent: ParentCorrespondence,
+    pub wrapper: Option<Reparenting>,
+    pub placement: Placement,
 }
 
 /// One semantic-container pair that fences all descendant correspondence.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ScopeLink {
-    pub(crate) before: NodeId,
-    pub(crate) after: NodeId,
-    pub(crate) placement: Placement,
-    pub(crate) parent: ParentCorrespondence,
+pub struct ScopeLink {
+    pub before: NodeId,
+    pub after: NodeId,
+    placement: Placement,
+    parent: ParentCorrespondence,
 }
 
 /// Positive proof relating the immediate semantic parents of one syntax link.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ParentCorrespondence {
+pub enum ParentCorrespondence {
     Direct,
     Reparented(Reparenting),
 }
 
 /// Selective parent traversal proven to be a transparent wrap or unwrap.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum Reparenting {
+pub enum Reparenting {
     Wrapped,
     Unwrapped,
 }
@@ -378,7 +378,6 @@ struct UnitRecord<'source> {
     atomic: bool,
     decoration_owner: Option<NodeId>,
     fingerprint: NodeFingerprints,
-    shape: FingerprintId,
     comparison: ComparisonStrategy,
     role: SourceRole,
 }
@@ -390,7 +389,7 @@ struct UnitKey<'source> {
 }
 
 /// Build the complete neutral correspondence graph for one symmetric tree pair.
-pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
+pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
     let mut interner = FingerprintInterner::default();
     let before_fingerprints = fingerprints(&pair.before, &mut interner);
     let after_fingerprints = fingerprints(&pair.after, &mut interner);
@@ -403,8 +402,8 @@ pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         pair.before.root,
         pair.after.root,
     );
-    let stable = stable_unit_matches(&before_match, &after_match, &before_units, &after_units);
-    let physical = if pair.before.language == Language::Lines {
+    let stable = stable_unit_matches(&before_match, &before_units, &after_units);
+    let physical = if pair.before.grammar.is_none() {
         PhysicalLineFacts {
             exact: line_links_from_unit_matches(pair, &before_units, &after_units, &before_match),
             ..PhysicalLineFacts::default()
@@ -413,6 +412,12 @@ pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         physical_line_correspondence(pair)
     };
 
+    let root_scope = ScopeLink {
+        before: pair.before.root,
+        after: pair.after.root,
+        placement: Placement::Stable,
+        parent: ParentCorrespondence::Direct,
+    };
     let graph = Correspondence {
         units: Vec::new(),
         line_links: Vec::new(),
@@ -423,19 +428,13 @@ pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         before_leaf: vec![None; pair.before.nodes.len()],
         after_leaf: vec![None; pair.after.nodes.len()],
         composites: Vec::new(),
-        scopes: Vec::new(),
+        scopes: vec![root_scope],
     };
-    let scopes = vec![ScopeLink {
-        before: pair.before.root,
-        after: pair.after.root,
-        placement: Placement::Stable,
-        parent: ParentCorrespondence::Direct,
-    }];
     let mut before_scope = vec![None; pair.before.nodes.len()];
     let mut after_scope = vec![None; pair.after.nodes.len()];
     before_scope[pair.before.root.index()] = Some(0);
     after_scope[pair.after.root.index()] = Some(0);
-    let builder = CorrespondenceBuilder {
+    let mut builder = CorrespondenceBuilder {
         pair,
         before_units: &before_units,
         after_units: &after_units,
@@ -447,12 +446,13 @@ pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         before_subtree_sizes: &before_subtree_sizes,
         before_scope,
         after_scope,
-        scopes,
         graph,
     };
-    let (mut graph, scopes) = builder.build();
-    let scope_proof = ScopeProof::new(pair, &scopes);
-    if pair.before.language == Language::Lines {
+    let units = builder.unit_script();
+    builder.graph.units = units;
+    let mut graph = builder.graph;
+    let scope_proof = ScopeProof::new(pair, &graph.scopes);
+    if pair.before.grammar.is_none() {
         graph.line_links = physical.exact;
         graph.line_ending_edits = physical.ending_edits;
     } else {
@@ -460,7 +460,7 @@ pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         graph.line_links = scoped.exact;
         graph.line_ending_edits = scoped.ending_edits;
     }
-    if pair.before.language != Language::Lines {
+    if pair.before.grammar.is_some() {
         let fallbacks = local_line_fallbacks(pair, &graph, physical.missing_terminators);
         let suppressed = graph
             .units
@@ -485,10 +485,9 @@ pub(crate) fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         graph.line_fallbacks = fallbacks;
     }
     debug_assert!(
-        scope_correspondence_is_valid(pair, &graph, &scopes, &scope_proof),
+        scope_correspondence_is_valid(pair, &graph, &graph.scopes, &scope_proof),
         "correspondence escaped a semantic-container fence"
     );
-    graph.scopes = scopes;
     graph
 }
 
@@ -832,10 +831,10 @@ fn physical_line_correspondence_in(
     let mut facts = PhysicalLineFacts::default();
     let mut before_start = before_bounds.start;
     let mut after_start = after_bounds.start;
-    for anchor in anchors.into_iter().chain(std::iter::once(OrderedMatch::new(
-        before_text.len(),
-        after_text.len(),
-    ))) {
+    for anchor in anchors.into_iter().chain(std::iter::once(OrderedMatch {
+        before: before_text.len(),
+        after: after_text.len(),
+    })) {
         let before_anchor = before_bounds.start + anchor.before;
         let after_anchor = after_bounds.start + anchor.after;
         let before_gap = &before.source.lines()[before_start..before_anchor];
@@ -1741,6 +1740,10 @@ fn unit_records<'source>(
     tree.review_units()
         .map(|(id, node)| {
             let fingerprint = fingerprints[id.index()];
+            let review = node
+                .review
+                .as_ref()
+                .expect("review node owns review metadata");
             UnitRecord {
                 id,
                 kind: node.kind,
@@ -1754,17 +1757,8 @@ fn unit_records<'source>(
                 atomic: node.leaf.is_some(),
                 decoration_owner: node.decoration_owner,
                 fingerprint,
-                shape: fingerprint.shape,
-                comparison: node
-                    .review
-                    .as_ref()
-                    .expect("review node owns review metadata")
-                    .comparison,
-                role: node
-                    .review
-                    .as_ref()
-                    .expect("review node owns review metadata")
-                    .role,
+                comparison: review.comparison,
+                role: review.role,
             }
         })
         .collect()
@@ -1875,11 +1869,11 @@ fn pair_decorated_units(
             .collect::<Vec<_>>();
         let before_shapes = remaining_before
             .iter()
-            .map(|index| (before[*index].kind, before[*index].shape))
+            .map(|index| (before[*index].kind, before[*index].fingerprint.shape))
             .collect::<Vec<_>>();
         let after_shapes = remaining_after
             .iter()
-            .map(|index| (after[*index].kind, after[*index].shape))
+            .map(|index| (after[*index].kind, after[*index].fingerprint.shape))
             .collect::<Vec<_>>();
         for edge in ordered_matches(&before_shapes, &after_shapes) {
             link_unit_indices(
@@ -2122,7 +2116,7 @@ fn reciprocal_unique_matches(
             let (after, similarity) = best?;
             (similarity > minimum_similarity
                 && after_best[after].map(|(candidate, _)| candidate) == Some(before))
-            .then(|| OrderedMatch::new(before, after))
+            .then_some(OrderedMatch { before, after })
         })
         .collect()
 }
@@ -2159,7 +2153,6 @@ fn link_unit_indices(
 
 fn stable_unit_matches(
     before_match: &[Option<usize>],
-    _after_match: &[Option<usize>],
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
 ) -> Vec<bool> {
@@ -2308,16 +2301,10 @@ struct CorrespondenceBuilder<'input, 'before, 'after> {
     before_subtree_sizes: &'input [usize],
     before_scope: Vec<Option<usize>>,
     after_scope: Vec<Option<usize>>,
-    scopes: Vec<ScopeLink>,
     graph: Correspondence,
 }
 
 impl CorrespondenceBuilder<'_, '_, '_> {
-    fn build(mut self) -> (Correspondence, Vec<ScopeLink>) {
-        self.graph.units = self.unit_script();
-        (self.graph, self.scopes)
-    }
-
     fn unit_script(&mut self) -> Vec<UnitEdit> {
         let script_anchors =
             ordered_script_anchors(self.before_match, self.before_units, self.stable);
@@ -2495,13 +2482,18 @@ struct LeafShape {
     missing: bool,
 }
 
+/// One before-keyed context pair and its complete correspondence evidence.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ContextLink {
+    after: NodeId,
+    placement: Placement,
+    reparenting: Option<Reparenting>,
+}
+
 /// Actual same-context composite pairing used to judge parent changes.
 struct ContextLinks {
-    before: HashMap<NodeId, NodeId>,
-    after: HashMap<NodeId, NodeId>,
-    placement: HashMap<NodeId, Placement>,
-    /// Before-side contexts retained through a proven transparent wrapper transition.
-    reparenting: HashMap<NodeId, Reparenting>,
+    before: HashMap<NodeId, ContextLink>,
+    after_to_before: HashMap<NodeId, NodeId>,
 }
 
 /// Parent correspondence inside one matched review unit.
@@ -2527,7 +2519,10 @@ impl UnitContext<'_, '_, '_> {
         else {
             return before_node.parent.is_none() && after_node.parent.is_none();
         };
-        self.parents.before.get(&before_parent).copied() == Some(after_parent)
+        self.parents
+            .before
+            .get(&before_parent)
+            .is_some_and(|link| link.after == after_parent)
     }
 
     fn desired_after_parent(&self, before: NodeId) -> Option<ParentSlot> {
@@ -2538,8 +2533,7 @@ impl UnitContext<'_, '_, '_> {
         self.parents
             .before
             .get(&parent)
-            .copied()
-            .map(ParentSlot::Node)
+            .map(|link| ParentSlot::Node(link.after))
     }
 
     fn after_parent(&self, after: NodeId) -> Option<ParentSlot> {
@@ -2567,8 +2561,7 @@ impl UnitContext<'_, '_, '_> {
         self.parents
             .before
             .get(&owner)
-            .copied()
-            .map(DelimiterOwnerKey::Composite)
+            .map(|link| DelimiterOwnerKey::Composite(link.after))
             .unwrap_or(DelimiterOwnerKey::UnmatchedBefore)
     }
 
@@ -2595,12 +2588,15 @@ impl UnitContext<'_, '_, '_> {
             return Some(ParentCorrespondence::Direct);
         }
         self.parents
-            .reparenting
+            .before
             .get(&before)
-            .copied()
+            .and_then(|link| link.reparenting)
             .or_else(|| {
                 let parent = self.pair.before.node(before).parent?;
-                self.parents.reparenting.get(&parent).copied()
+                self.parents
+                    .before
+                    .get(&parent)
+                    .and_then(|link| link.reparenting)
             })
             .or_else(|| unique_containment_reparenting(self.pair, self.parents, before, after))
             .map(ParentCorrespondence::Reparented)
@@ -2608,12 +2604,15 @@ impl UnitContext<'_, '_, '_> {
 
     fn enclosing_wrapper(&self, before: NodeId, after: NodeId) -> Option<Reparenting> {
         self.parents
-            .reparenting
+            .before
             .get(&before)
-            .copied()
+            .and_then(|link| link.reparenting)
             .or_else(|| {
                 let parent = self.pair.before.node(before).parent?;
-                self.parents.reparenting.get(&parent).copied()
+                self.parents
+                    .before
+                    .get(&parent)
+                    .and_then(|link| link.reparenting)
             })
             .or_else(|| unique_containment_reparenting(self.pair, self.parents, before, after))
     }
@@ -2623,16 +2622,12 @@ impl UnitContext<'_, '_, '_> {
         if owner == self.before_unit {
             return Some(self.after_unit);
         }
-        self.parents.before.get(&owner).copied()
-    }
-
-    fn after_decoration_owner(&self, after: NodeId) -> Option<NodeId> {
-        self.pair.after.node(after).decoration_owner
+        self.parents.before.get(&owner).map(|link| link.after)
     }
 
     fn decoration_placement(&self, before: NodeId) -> Option<Placement> {
         let owner = self.pair.before.node(before).decoration_owner?;
-        self.parents.placement.get(&owner).copied()
+        self.parents.before.get(&owner).map(|link| link.placement)
     }
 }
 
@@ -2737,36 +2732,32 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         let mut scopes = parents
             .before
             .iter()
-            .filter_map(|(before, after)| {
+            .filter_map(|(before, link)| {
                 if *before != before_unit && !pair.before.node(*before).is_scope_boundary() {
                     return None;
                 }
-                if exact_cover.contains_key(before) || exact_cover_after.contains_key(after) {
+                if exact_cover.contains_key(before) || exact_cover_after.contains_key(&link.after) {
                     return None;
                 }
-                let wrapper = unique_containment_reparenting(pair, &parents, *before, *after);
+                let wrapper = unique_containment_reparenting(pair, &parents, *before, link.after);
                 let parent = wrapper
                     .map(ParentCorrespondence::Reparented)
                     .unwrap_or(ParentCorrespondence::Direct);
                 Some(ScopeLink {
                     before: *before,
-                    after: *after,
-                    placement: parents
-                        .placement
-                        .get(before)
-                        .copied()
-                        .expect("a linked scope owns placement"),
+                    after: link.after,
+                    placement: link.placement,
                     parent,
                 })
             })
             .collect::<Vec<_>>();
         scopes.sort_unstable_by_key(|link| link.before);
-        let scope_start = self.scopes.len();
+        let scope_start = self.graph.scopes.len();
         for scope in scopes {
             if self.push_scope_link(scope) {
                 continue;
             }
-            for link in self.scopes.drain(scope_start..) {
+            for link in self.graph.scopes.drain(scope_start..) {
                 self.before_scope[link.before.index()] = None;
                 self.after_scope[link.after.index()] = None;
             }
@@ -3010,10 +3001,11 @@ fn exact_composite_matches(
     let mut before_match = vec![None; before.len()];
     let mut after_match = vec![None; after.len()];
     for (before_index, before_id) in before.iter().copied().enumerate() {
-        let Some(after_id) = context.parents.before.get(&before_id) else {
+        let Some(link) = context.parents.before.get(&before_id) else {
             continue;
         };
-        let Some(after_index) = after_indices.get(after_id).copied() else {
+        let after_id = link.after;
+        let Some(after_index) = after_indices.get(&after_id).copied() else {
             continue;
         };
         if before_fingerprints[before_id.index()].full != after_fingerprints[after_id.index()].full
@@ -3028,7 +3020,7 @@ fn exact_composite_matches(
     before_match
         .into_iter()
         .enumerate()
-        .filter_map(|(before, after)| after.map(|after| OrderedMatch::new(before, after)))
+        .filter_map(|(before, after)| after.map(|after| OrderedMatch { before, after }))
         .collect()
 }
 
@@ -3065,7 +3057,7 @@ fn exact_leaf_matches(
                 trailing_delimiter_owner: context
                     .after_trailing_delimiter_owner(after_id, &after_keys),
                 decorated: context.pair.after.node(after_id).decoration_owner.is_some(),
-                decoration_owner: context.after_decoration_owner(after_id),
+                decoration_owner: context.pair.after.node(after_id).decoration_owner,
             })
             .or_default()
             .push_back(after_index);
@@ -3216,7 +3208,7 @@ fn exact_leaf_matches(
     before_match
         .into_iter()
         .enumerate()
-        .filter_map(|(before, after)| after.map(|after| OrderedMatch::new(before, after)))
+        .filter_map(|(before, after)| after.map(|after| OrderedMatch { before, after }))
         .collect()
 }
 
@@ -3230,7 +3222,7 @@ fn decorated_leaf_matches(
 ) -> Vec<OrderedMatch> {
     let mut after_groups = HashMap::<(NodeId, ParentSlot, LeafShape), VecDeque<usize>>::new();
     for (index, id) in after.iter().copied().enumerate() {
-        let Some(owner) = context.after_decoration_owner(id) else {
+        let Some(owner) = context.pair.after.node(id).decoration_owner else {
             continue;
         };
         let Some(parent) = context.after_parent(id) else {
@@ -3252,7 +3244,7 @@ fn decorated_leaf_matches(
             let after = after_groups
                 .get_mut(&(owner, parent, before_shapes[before]))?
                 .pop_front()?;
-            Some(OrderedMatch::new(before, after))
+            Some(OrderedMatch { before, after })
         })
         .collect()
 }
@@ -3286,9 +3278,7 @@ fn contextual_links(
 ) -> ContextLinks {
     let mut links = ContextLinks {
         before: HashMap::new(),
-        after: HashMap::new(),
-        placement: HashMap::new(),
-        reparenting: HashMap::new(),
+        after_to_before: HashMap::new(),
     };
     if !link_context(before_unit, after_unit, unit_placement, None, &mut links) {
         return links;
@@ -3310,7 +3300,10 @@ fn contextual_links(
             allow_renames,
         );
         let placements = contextual_match_placements(pair, &before_children, &pairs, links);
-        let inherited_reparenting = links.reparenting.get(&before_parent).copied();
+        let inherited_reparenting = links
+            .before
+            .get(&before_parent)
+            .and_then(|link| link.reparenting);
         let mut linked = false;
         for (edge, placement) in pairs.into_iter().zip(placements) {
             let before = before_children[edge.before];
@@ -3378,10 +3371,10 @@ fn retain_valid_context_links(
         let invalid = links
             .before
             .iter()
-            .filter_map(|(before, after)| {
-                (!context.parents_are_linked(*before, *after)
-                    && unique_containment_reparenting(pair, links, *before, *after).is_none())
-                .then_some((*before, *after))
+            .filter_map(|(before, link)| {
+                (!context.parents_are_linked(*before, link.after)
+                    && unique_containment_reparenting(pair, links, *before, link.after).is_none())
+                .then_some((*before, link.after))
             })
             .collect::<Vec<_>>();
         if invalid.is_empty() {
@@ -3389,19 +3382,19 @@ fn retain_valid_context_links(
         }
         for (before, after) in invalid {
             links.before.remove(&before);
-            links.after.remove(&after);
-            links.placement.remove(&before);
-            links.reparenting.remove(&before);
+            links.after_to_before.remove(&after);
         }
     }
 
     let mut retained = links
         .before
         .iter()
-        .map(|(before, after)| (*before, *after))
+        .map(|(before, link)| (*before, link.after))
         .collect::<Vec<_>>();
     retained.sort_unstable_by_key(|(before, _)| *before);
-    links.reparenting.clear();
+    for link in links.before.values_mut() {
+        link.reparenting = None;
+    }
     // Rebuilding in preorder; descendants inherit only a surviving parent's fresh proof.
     for (before, after) in retained {
         let context = UnitContext {
@@ -3414,13 +3407,15 @@ fn retain_valid_context_links(
             pair.before
                 .node(before)
                 .parent
-                .and_then(|parent| links.reparenting.get(&parent).copied())
+                .and_then(|parent| links.before.get(&parent).and_then(|link| link.reparenting))
         } else {
             unique_containment_reparenting(pair, links, before, after)
         };
-        if let Some(reparenting) = reparenting {
-            links.reparenting.insert(before, reparenting);
-        }
+        links
+            .before
+            .get_mut(&before)
+            .expect("retained context remains linked")
+            .reparenting = reparenting;
     }
 }
 
@@ -3451,7 +3446,8 @@ fn confident_reparented_context_matches(
     let after = descendant_composites(&pair.after, after_unit)
         .into_iter()
         .filter(|id| {
-            !links.after.contains_key(id) && pair.after.node(*id).decoration_owner.is_none()
+            !links.after_to_before.contains_key(id)
+                && pair.after.node(*id).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     if before.is_empty() || after.is_empty() {
@@ -3503,10 +3499,16 @@ fn confident_reparented_context_matches(
                 let right = after_group[right];
                 let left_node = pair.before.node(before[left]);
                 let right_node = pair.after.node(after[right]);
-                let parents_already_linked = left_node
-                    .parent
-                    .zip(right_node.parent)
-                    .is_some_and(|(left, right)| links.before.get(&left).copied() == Some(right));
+                let parents_already_linked =
+                    left_node
+                        .parent
+                        .zip(right_node.parent)
+                        .is_some_and(|(left, right)| {
+                            links
+                                .before
+                                .get(&left)
+                                .is_some_and(|link| link.after == right)
+                        });
                 if parents_already_linked
                     || unique_containment_reparenting(pair, links, before[left], after[right])
                         .is_none()
@@ -3521,7 +3523,10 @@ fn confident_reparented_context_matches(
                 shared_fingerprint_count(&before_payload[left], &after_payload[right])
             })
             .into_iter()
-            .map(|edge| OrderedMatch::new(before_group[edge.before], after_group[edge.after])),
+            .map(|edge| OrderedMatch {
+                before: before_group[edge.before],
+                after: after_group[edge.after],
+            }),
         );
     }
     candidates.sort_unstable_by_key(|edge| edge.before);
@@ -3563,8 +3568,8 @@ fn unique_containment_reparenting(
         pair,
         before,
         after,
-        |candidate| links.before.get(&candidate).copied(),
-        |candidate| links.after.get(&candidate).copied(),
+        |candidate| links.before.get(&candidate).map(|link| link.after),
+        |candidate| links.after_to_before.get(&candidate).copied(),
     )
 }
 
@@ -3741,7 +3746,7 @@ fn contextual_child_matches(
         .collect::<Vec<_>>();
     let after_reserved = after
         .iter()
-        .map(|id| context.after.contains_key(id))
+        .map(|id| context.after_to_before.contains_key(id))
         .collect::<Vec<_>>();
     let mut before_exact_targets = HashMap::<FingerprintId, Vec<NodeId>>::new();
     for (index, id) in before.iter().copied().enumerate() {
@@ -3796,7 +3801,7 @@ fn contextual_child_matches(
                 && unique_contained_descendant_matches(
                     &pair.after,
                     outer,
-                    &|candidate| context.after.contains_key(&candidate),
+                    &|candidate| context.after_to_before.contains_key(&candidate),
                     |inner| {
                         before_exact_targets
                             .get(&after_fingerprints[inner.index()].full)
@@ -3962,7 +3967,7 @@ fn contextual_child_matches(
                 && !pair
                     .after
                     .descendants(after[edge.after])
-                    .any(|id| context.after.contains_key(&id))
+                    .any(|id| context.after_to_before.contains_key(&id))
         }) {
             before_match[edge.before] = Some(edge.after);
             after_match[edge.after] = Some(edge.before);
@@ -4130,7 +4135,7 @@ fn contextual_child_matches(
     before_match
         .into_iter()
         .enumerate()
-        .filter_map(|(before, after)| after.map(|after| OrderedMatch::new(before, after)))
+        .filter_map(|(before, after)| after.map(|after| OrderedMatch { before, after }))
         .collect()
 }
 
@@ -4193,14 +4198,14 @@ fn decoration_matches(
     let mut owner_pairs = Vec::new();
     for before_owner in before_by_owner.keys() {
         for after_owner in [
-            context.before.get(before_owner),
-            provisional_owners.get(before_owner),
+            context.before.get(before_owner).map(|link| link.after),
+            provisional_owners.get(before_owner).copied(),
         ]
         .into_iter()
         .flatten()
         {
-            if after_by_owner.contains_key(after_owner) {
-                owner_pairs.push((*before_owner, *after_owner));
+            if after_by_owner.contains_key(&after_owner) {
+                owner_pairs.push((*before_owner, after_owner));
             }
         }
     }
@@ -4228,10 +4233,10 @@ fn decoration_matches(
         for edge in exact {
             before_claimed[edge.before] = true;
             after_claimed[edge.after] = true;
-            matches.push(OrderedMatch::new(
-                before_group[edge.before],
-                after_group[edge.after],
-            ));
+            matches.push(OrderedMatch {
+                before: before_group[edge.before],
+                after: after_group[edge.after],
+            });
         }
 
         let before_remaining = (0..before_group.len())
@@ -4265,10 +4270,10 @@ fn decoration_matches(
             let after_index = after_remaining[edge.after];
             before_claimed[before_index] = true;
             after_claimed[after_index] = true;
-            matches.push(OrderedMatch::new(
-                before_group[before_index],
-                after_group[after_index],
-            ));
+            matches.push(OrderedMatch {
+                before: before_group[before_index],
+                after: after_group[after_index],
+            });
         }
 
         let before_remaining = (0..before_group.len())
@@ -4286,10 +4291,10 @@ fn decoration_matches(
             .map(|index| context_shape(&pair.after, after.nodes[after_group[*index]]))
             .collect::<Vec<_>>();
         for edge in ordered_matches(&before_context, &after_context) {
-            matches.push(OrderedMatch::new(
-                before_group[before_remaining[edge.before]],
-                after_group[after_remaining[edge.after]],
-            ));
+            matches.push(OrderedMatch {
+                before: before_group[before_remaining[edge.before]],
+                after: after_group[after_remaining[edge.after]],
+            });
         }
     }
     matches.sort_by_key(|edge| edge.before);
@@ -4378,7 +4383,10 @@ fn confident_renamed_context_matches(
         .collect::<Vec<_>>();
     ordered_matches(&before_shapes, &after_shapes)
         .into_iter()
-        .map(|edge| OrderedMatch::new(before_candidates[edge.before], after_candidates[edge.after]))
+        .map(|edge| OrderedMatch {
+            before: before_candidates[edge.before],
+            after: after_candidates[edge.after],
+        })
         .collect()
 }
 
@@ -4523,7 +4531,11 @@ fn contextual_match_placements(
     let semantic_edges = semantic.iter().map(|(_, edge)| *edge).collect::<Vec<_>>();
     let semantic_placements = match_placements(&semantic_edges);
     let mut placements = vec![None; matches.len()];
-    let mut owner_placements = links.placement.clone();
+    let mut owner_placements = links
+        .before
+        .iter()
+        .map(|(before, link)| (*before, link.placement))
+        .collect::<HashMap<_, _>>();
     for ((match_index, edge), placement) in semantic.into_iter().zip(semantic_placements) {
         placements[match_index] = Some(placement);
         owner_placements.insert(before[edge.before], placement);
@@ -4554,22 +4566,19 @@ fn link_context(
     reparenting: Option<Reparenting>,
     links: &mut ContextLinks,
 ) -> bool {
-    let existing_after = links.before.get(&before).copied();
-    let existing_before = links.after.get(&after).copied();
-    if existing_after.is_some() || existing_before.is_some() {
-        let accepted = existing_after == Some(after)
-            && existing_before == Some(before)
-            && links.placement.get(&before) == Some(&placement)
-            && links.reparenting.get(&before).copied() == reparenting;
-        return accepted;
+    let link = ContextLink {
+        after,
+        placement,
+        reparenting,
+    };
+    let existing_link = links.before.get(&before).copied();
+    let existing_before = links.after_to_before.get(&after).copied();
+    if existing_link.is_some() || existing_before.is_some() {
+        return existing_link == Some(link) && existing_before == Some(before);
     }
 
-    links.before.insert(before, after);
-    links.after.insert(after, before);
-    links.placement.insert(before, placement);
-    if let Some(reparenting) = reparenting {
-        links.reparenting.insert(before, reparenting);
-    }
+    links.before.insert(before, link);
+    links.after_to_before.insert(after, before);
     true
 }
 
@@ -4719,13 +4728,13 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         if before.is_some() || after.is_some() {
             return before == after
                 && before
-                    .and_then(|index| self.scopes.get(index))
+                    .and_then(|index| self.graph.scopes.get(index))
                     .is_some_and(|existing| existing == &link);
         }
-        let index = self.scopes.len();
+        let index = self.graph.scopes.len();
         self.before_scope[link.before.index()] = Some(index);
         self.after_scope[link.after.index()] = Some(index);
-        self.scopes.push(link);
+        self.graph.scopes.push(link);
         true
     }
 }
@@ -4745,15 +4754,9 @@ fn leaf_shape(tree: &SyntaxTree<'_>, id: NodeId) -> LeafShape {
 
 /// One equality-preserving edge in an ordered before/after correspondence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct OrderedMatch {
-    pub(crate) before: usize,
-    pub(crate) after: usize,
-}
-
-impl OrderedMatch {
-    fn new(before: usize, after: usize) -> Self {
-        Self { before, after }
-    }
+struct OrderedMatch {
+    before: usize,
+    after: usize,
 }
 
 /// Match equal values without crossing edges or allowing either occurrence to be reused.
@@ -4762,7 +4765,7 @@ impl OrderedMatch {
 /// subsequence partitions the remaining work into local gaps, where bounded LCS preserves
 /// repeated occurrences. An unusually large anchorless gap uses linear-memory greedy
 /// alignment so adversarial inputs cannot allocate a quadratic table.
-pub(crate) fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
+fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut before_positions = HashMap::<&T, Vec<usize>>::new();
     for (index, value) in before.iter().enumerate() {
         before_positions.entry(value).or_default().push(index);
@@ -4782,7 +4785,10 @@ pub(crate) fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<Or
             let [after] = after_positions.get(value)?.as_slice() else {
                 return None;
             };
-            Some(OrderedMatch::new(*before, *after))
+            Some(OrderedMatch {
+                before: *before,
+                after: *after,
+            })
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|edge| edge.before);
@@ -4797,19 +4803,18 @@ pub(crate) fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<Or
     let mut matches = Vec::new();
     let mut before_start = 0;
     let mut after_start = 0;
-    for anchor in anchors.chain(std::iter::once(OrderedMatch::new(
-        before.len(),
-        after.len(),
-    ))) {
+    for anchor in anchors.chain(std::iter::once(OrderedMatch {
+        before: before.len(),
+        after: after.len(),
+    })) {
         let gap = align_gap(
             &before[before_start..anchor.before],
             &after[after_start..anchor.after],
         );
-        matches.extend(
-            gap.into_iter().map(|edge| {
-                OrderedMatch::new(before_start + edge.before, after_start + edge.after)
-            }),
-        );
+        matches.extend(gap.into_iter().map(|edge| OrderedMatch {
+            before: before_start + edge.before,
+            after: after_start + edge.after,
+        }));
 
         if anchor.before < before.len() && anchor.after < after.len() {
             matches.push(anchor);
@@ -4839,7 +4844,10 @@ fn locality_first_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<Ordere
                 let value = &before[index];
                 before_seen.entry(value).or_insert(index);
                 if let Some(after) = after_seen.get(value).copied() {
-                    candidates.push(OrderedMatch::new(index, after));
+                    candidates.push(OrderedMatch {
+                        before: index,
+                        after,
+                    });
                 }
             }
             if let Some(index) = after_start
@@ -4849,7 +4857,10 @@ fn locality_first_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<Ordere
                 let value = &after[index];
                 after_seen.entry(value).or_insert(index);
                 if let Some(before) = before_seen.get(value).copied() {
-                    candidates.push(OrderedMatch::new(before, index));
+                    candidates.push(OrderedMatch {
+                        before,
+                        after: index,
+                    });
                 }
             }
             found = candidates.into_iter().min_by_key(|edge| {
@@ -4885,7 +4896,7 @@ fn unordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatc
         .enumerate()
         .filter_map(|(before, value)| {
             let after = after_positions.get_mut(value)?.pop_front()?;
-            Some(OrderedMatch::new(before, after))
+            Some(OrderedMatch { before, after })
         })
         .collect()
 }
@@ -4966,7 +4977,7 @@ fn greedy_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> 
         let Some(after) = positions.pop_front() else {
             continue;
         };
-        matches.push(OrderedMatch::new(before, after));
+        matches.push(OrderedMatch { before, after });
         after_floor = after + 1;
     }
     matches
@@ -5018,7 +5029,10 @@ fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
                 .drift
                 .saturating_add(before_index.abs_diff(after_index));
             if paired == scores[before_index * width + after_index] {
-                matches.push(OrderedMatch::new(before_index, after_index));
+                matches.push(OrderedMatch {
+                    before: before_index,
+                    after: after_index,
+                });
                 before_index += 1;
                 after_index += 1;
                 continue;

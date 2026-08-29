@@ -1,7 +1,7 @@
 //! Translate source-coordinate review facts into public, styled review rows.
 
 use super::context::ranges_overlap;
-use super::refine::RefinedHunks;
+use super::refine::RefinedHunk;
 use super::syntax::SyntaxTree;
 use super::tree_diff::{
     CompactChange, LineEndingChange, SelectedLine, SourceChange, changed_sequence_ranges,
@@ -186,21 +186,40 @@ fn word_diff(before: &SyntaxTree<'_>, after: &SyntaxTree<'_>, change: CompactCha
 }
 
 /// Materialize all refined source facts at the public presentation boundary.
-pub(super) fn present_hunks(
+pub fn present_hunks(
     before: &SyntaxTree<'_>,
     after: &SyntaxTree<'_>,
-    hunks: RefinedHunks,
+    hunks: Vec<RefinedHunk>,
 ) -> Vec<ReviewHunk> {
+    let before_lines = before.source.lines().len();
+    let after_lines = after.source.lines().len();
+    let show_file_boundary = hunks.iter().any(|hunk| {
+        hunk.coverage
+            .after
+            .as_ref()
+            .is_some_and(|coverage| coverage.end == after_lines.saturating_add(1))
+            || hunk
+                .changes
+                .last()
+                .is_some_and(|change| change.displayed_after().last() == Some(after_lines))
+            || hunk.coverage.after.is_none()
+                && hunk
+                    .coverage
+                    .before
+                    .as_ref()
+                    .is_some_and(|coverage| coverage.end == before_lines.saturating_add(1))
+    });
+    let last_hunk = hunks.len().saturating_sub(1);
     hunks
-        .into_hunks()
         .into_iter()
-        .map(|hunk| {
+        .enumerate()
+        .map(|(index, hunk)| {
             let mut rows = hunk
-                .facts
+                .changes
                 .into_iter()
-                .flat_map(|fact| present_change(before, after, fact.change))
+                .flat_map(|change| present_change(before, after, change))
                 .collect::<Vec<_>>();
-            if hunk.file_boundary {
+            if show_file_boundary && index == last_hunk {
                 rows.push(ReviewRow::FileBoundary);
             }
             ReviewHunk {

@@ -3,7 +3,7 @@
 //! This storey owns source-complete change facts. It does not assign review priority,
 //! context halos, breadcrumbs, or presentation order.
 
-use super::context::ranges_overlap;
+use super::context::{include_range, ranges_overlap};
 use super::correspondence::{
     Correspondence, LeafRelation, LineLink, MatchedUnit, NodeLink, ParentCorrespondence, Placement,
     UnitEdit,
@@ -19,7 +19,7 @@ use std::ops::Range;
 
 /// Semantic nature of one source change before review priority is assigned.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum ChangeNature {
+pub enum ChangeNature {
     Reflow,
     Wiring,
     Move,
@@ -35,18 +35,14 @@ enum RevisionSide {
 
 /// One numbered source line plus the changed byte intervals it owns.
 #[derive(Clone, Debug)]
-pub(super) struct SelectedLine {
-    pub(super) number: usize,
-    pub(super) highlights: Vec<Range<usize>>,
+pub struct SelectedLine {
+    pub number: usize,
+    pub highlights: Vec<Range<usize>>,
 }
 
 impl SelectedLine {
-    pub(super) fn has_changes(&self) -> bool {
+    pub fn has_changes(&self) -> bool {
         !self.highlights.is_empty()
-    }
-
-    fn clear_changes(&mut self) {
-        self.highlights.clear();
     }
 }
 
@@ -71,7 +67,7 @@ enum RowEvent {
 /// Both revisions of a replacement remain in the same value until presentation,
 /// so ordering, coalescing, and context selection cannot separate their meanings.
 #[derive(Clone, Debug)]
-pub(super) enum SourceChange {
+pub enum SourceChange {
     Current(SelectedLine),
     Reflow(SelectedLine),
     Replace {
@@ -88,66 +84,69 @@ pub(super) enum SourceChange {
     Elision(LineCoverage),
 }
 
-/// A source-located change whose placement is fixed before refinement.
-#[derive(Clone, Debug)]
-pub(super) struct SourceFact {
-    pub(super) change: SourceChange,
-    pub(super) coverage: LineCoverage,
-    pub(super) order: SourceOrder,
-    pub(super) script_order: usize,
-    /// Current-world lines physically emitted by this fact.
-    pub(super) displayed_after: Vec<usize>,
-}
-
-impl SourceFact {
-    pub(super) fn is_context(&self) -> bool {
-        matches!(&self.change, SourceChange::Current(line) if !line.has_changes())
+impl SourceChange {
+    pub fn is_context(&self) -> bool {
+        matches!(self, Self::Current(line) if !line.has_changes())
     }
 
-    pub(super) fn has_signal(&self) -> bool {
-        !self.is_context() && !matches!(self.change, SourceChange::Elision(_))
+    pub fn has_signal(&self) -> bool {
+        !self.is_context() && !matches!(self, Self::Elision(_))
     }
 
-    pub(super) fn context_line(&self) -> Option<usize> {
-        match &self.change {
-            SourceChange::Current(line) if !line.has_changes() => Some(line.number),
+    pub fn context_line(&self) -> Option<usize> {
+        match self {
+            Self::Current(line) if !line.has_changes() => Some(line.number),
             _ => None,
         }
     }
+
+    /// Current-world source rows physically emitted by this change.
+    pub fn displayed_after(&self) -> impl Iterator<Item = usize> + '_ {
+        let (lines, one) = match self {
+            Self::Current(line) | Self::Reflow(line) => (&[][..], Some(line.number)),
+            Self::Replace { after, .. } => (after.as_slice(), None),
+            Self::Moved { after, .. } => (&[][..], Some(after.number)),
+            Self::Compact(change) => (&[][..], change.after_line),
+            Self::LineEnding(_) | Self::Elision(_) => (&[][..], None),
+        };
+        lines.iter().map(|line| line.number).chain(one)
+    }
+}
+
+/// A source-located change whose placement is fixed before refinement.
+#[derive(Clone, Debug)]
+pub struct SourceFact {
+    pub change: SourceChange,
+    pub coverage: LineCoverage,
+    pub order: SourceOrder,
+    pub script_order: usize,
 }
 
 /// One compact replacement retained solely as source coordinates until presentation.
 #[derive(Clone, Debug)]
-pub(super) struct CompactChange {
-    pub(super) before_line: Option<usize>,
-    pub(super) after_line: Option<usize>,
-    pub(super) before_bytes: Option<Range<usize>>,
-    pub(super) after_bytes: Option<Range<usize>>,
+pub struct CompactChange {
+    pub before_line: Option<usize>,
+    pub after_line: Option<usize>,
+    pub before_bytes: Option<Range<usize>>,
+    pub after_bytes: Option<Range<usize>>,
 }
 
 /// One concrete line terminator and the source row that owns it.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct LineEndingEndpoint {
-    pub(super) line: usize,
-    pub(super) ending: LineEnding,
+pub struct LineEndingEndpoint {
+    pub line: usize,
+    pub ending: LineEnding,
 }
 
 /// Before/after provenance for one changed line terminator.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct LineEndingChange {
-    pub(super) before: Option<LineEndingEndpoint>,
-    pub(super) after: Option<LineEndingEndpoint>,
-}
-
-fn ending_endpoint(line: &SourceLine) -> LineEndingEndpoint {
-    LineEndingEndpoint {
-        line: line.number,
-        ending: line.ending,
-    }
+pub struct LineEndingChange {
+    pub before: Option<LineEndingEndpoint>,
+    pub after: Option<LineEndingEndpoint>,
 }
 
 /// Select changed byte intervals on one source line without allocating its text.
-pub(super) fn select_line(line: &SourceLine, changed: &[Range<usize>]) -> SelectedLine {
+pub fn select_line(line: &SourceLine, changed: &[Range<usize>]) -> SelectedLine {
     let bytes = line.content_bytes.clone();
     let mut highlights = Vec::<Range<usize>>::new();
     for range in changed {
@@ -173,133 +172,19 @@ pub(super) fn select_line(line: &SourceLine, changed: &[Range<usize>]) -> Select
     }
 }
 
-fn select_lines(
-    syntax: &SyntaxTree<'_>,
-    lines: Range<usize>,
-    changed: &[Range<usize>],
-) -> Vec<SelectedLine> {
-    lines
-        .filter_map(|number| syntax.source.line(number))
-        .map(|line| select_line(line, changed))
-        .collect()
-}
-
-/// Transient producer rows that share one syntax context root.
-struct FormedExcerpt {
-    rows: Vec<RowEvent>,
-    context_root: Option<NodeId>,
-}
-
-/// One classified producer fragment in its native before/after source coordinates.
-struct FormedHunk {
+/// One producer fragment in its native before/after source coordinates.
+struct DraftFragment {
     nature: ChangeNature,
     rows: Vec<RowEvent>,
-    order_hint: Option<SourceOrder>,
+    /// Semantic current-world anchor for a before-only fragment.
+    context_anchor_order: Option<SourceOrder>,
     context_root: Option<NodeId>,
 }
 
-impl FormedHunk {
-    fn new(nature: ChangeNature, excerpt: FormedExcerpt) -> Self {
-        Self {
-            nature,
-            rows: excerpt.rows,
-            order_hint: None,
-            context_root: excerpt.context_root,
-        }
-    }
-
-    /// Semantic-unit placement for a before-only fragment with no current source rows.
-    fn at_order(mut self, order: SourceOrder) -> Self {
-        self.order_hint = Some(order);
-        self
-    }
-
-    fn edit(excerpt: FormedExcerpt) -> Self {
-        Self::new(ChangeNature::Edit, excerpt)
-    }
-
-    /// Low-signal source wiring selected explicitly by the language frontend.
-    fn wiring(excerpt: FormedExcerpt) -> Self {
-        Self::new(ChangeNature::Wiring, excerpt)
-    }
-
-    fn moved(excerpt: FormedExcerpt) -> Self {
-        Self::new(ChangeNature::Move, excerpt)
-    }
-
-    fn reflow(excerpt: FormedExcerpt) -> Self {
-        Self::new(ChangeNature::Reflow, excerpt)
-    }
-}
-
-/// Physical signal lines retained before context halos or breadcrumbs expand selection.
-#[derive(Clone, Default)]
-pub(super) struct SourceFocus {
-    pub(super) before: Vec<usize>,
-    pub(super) after: Vec<usize>,
-}
-
-impl SourceFocus {
-    pub(super) fn after_line(line: usize) -> Self {
-        Self {
-            before: Vec::new(),
-            after: vec![line],
-        }
-    }
-
-    fn from_rows<'row>(rows: impl IntoIterator<Item = &'row RowEvent>) -> Self {
-        let mut focus = Self::default();
-        for row in rows {
-            match row {
-                RowEvent::Current(line) if line.has_changes() => focus.after.push(line.number),
-                RowEvent::Reflow(line) => focus.after.push(line.number),
-                RowEvent::Removed(line) => focus.before.push(line.number),
-                RowEvent::Added(line) => focus.after.push(line.number),
-                RowEvent::Moved { before, after } => {
-                    focus.before.extend(*before);
-                    focus.after.push(after.number);
-                }
-                RowEvent::Compact(word) => {
-                    focus.before.extend(word.before_line);
-                    focus.after.extend(word.after_line);
-                }
-                RowEvent::LineEnding(change) => {
-                    focus
-                        .before
-                        .extend(change.before.map(|endpoint| endpoint.line));
-                    focus
-                        .after
-                        .extend(change.after.map(|endpoint| endpoint.line));
-                }
-                RowEvent::Current(_) | RowEvent::Elision(_) => {}
-            }
-        }
-        focus.normalize();
-        focus
-    }
-
-    pub(super) fn merge(&mut self, mut other: Self) {
-        self.before.append(&mut other.before);
-        self.after.append(&mut other.after);
-    }
-
-    fn normalize(&mut self) {
-        self.before.sort_unstable();
-        self.before.dedup();
-        self.after.sort_unstable();
-        self.after.dedup();
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.before.is_empty() && self.after.is_empty()
-    }
-}
-
-/// Owned physical-line map shared by raw facts and context refinement.
-pub(super) struct SourceMap {
+/// Physical alignment and review order shared by source formation and refinement.
+pub struct SourceLayout {
     before_order: Vec<SourceOrder>,
     after_to_before: Vec<Option<usize>>,
-    after_lines: usize,
     after_script_order: Vec<usize>,
 }
 
@@ -361,7 +246,7 @@ impl SourceSequence {
         }
     }
 
-    fn group_rank(&self, group: &[RowEvent], source_map: &SourceMap) -> usize {
+    fn group_rank(&self, group: &[RowEvent], source_layout: &SourceLayout) -> usize {
         let mut owners = group.iter().flat_map(|row| {
             let after = row_after_source_line(row)
                 .and_then(|line| self.after_owner.get(line).copied().flatten());
@@ -383,7 +268,7 @@ impl SourceSequence {
                 group
                     .iter()
                     .filter_map(row_before_source_line)
-                    .filter_map(|line| source_map.current_anchor(line))
+                    .filter_map(|line| source_layout.current_anchor(line))
                     .min()
             })
             .unwrap_or(1);
@@ -411,15 +296,15 @@ impl SourceSequence {
 
 /// Current-world gap plus ordering inside that gap.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct SourceOrder {
+pub struct SourceOrder {
     /// Number of current-world lines preceding this source fact.
-    pub(super) after_gap: usize,
+    pub after_gap: usize,
     /// Old source line for a deletion, or `usize::MAX` for current-world source.
-    pub(super) tie_break: usize,
+    pub tie_break: usize,
 }
 
 impl SourceOrder {
-    pub(super) fn current(line: usize) -> Self {
+    pub fn current(line: usize) -> Self {
         Self {
             after_gap: line.saturating_sub(1),
             tie_break: usize::MAX,
@@ -434,25 +319,23 @@ impl SourceOrder {
     }
 }
 
-/// One unranked source hunk with fixed source placement.
-pub(super) struct RawHunk {
-    pub(super) nature: ChangeNature,
-    pub(super) facts: Vec<SourceFact>,
-    pub(super) order: SourceOrder,
+/// One atomic hunk with fixed source placement.
+pub struct SourceHunk {
+    pub nature: ChangeNature,
+    pub facts: Vec<SourceFact>,
+    pub order: SourceOrder,
     /// Explicit current-world context anchor for a before-only producer.
-    pub(super) context_anchor: Option<usize>,
-    pub(super) context_root: Option<NodeId>,
+    pub context_anchor: Option<usize>,
+    pub context_root: Option<NodeId>,
 }
 
 /// Compiler-visible handoff from tree differencing to review refinement.
-pub(super) struct RawHunks {
-    pub(super) hunks: Vec<RawHunk>,
-    pub(super) source_map: SourceMap,
-    pub(super) before_lines: usize,
-    pub(super) after_lines: usize,
+pub struct RawSourceDiff {
+    pub hunks: Vec<SourceHunk>,
+    pub source_layout: SourceLayout,
 }
 
-impl SourceMap {
+impl SourceLayout {
     fn new(graph: &Correspondence, before_lines: usize, after_lines: usize) -> Self {
         let mut before_to_after = vec![None; before_lines + 1];
         let mut after_to_before = vec![None; after_lines + 1];
@@ -484,7 +367,6 @@ impl SourceMap {
         Self {
             before_order,
             after_to_before,
-            after_lines,
             after_script_order: (0..=after_lines)
                 .map(|line| line.saturating_sub(1))
                 .collect(),
@@ -492,66 +374,28 @@ impl SourceMap {
     }
 
     /// Unmatched old lines occupy an explicit gap; exact lines share current order.
-    pub(super) fn before_order(&self, line: usize) -> SourceOrder {
+    pub fn before_order(&self, line: usize) -> SourceOrder {
         self.before_order
             .get(line)
             .copied()
             .unwrap_or_else(|| SourceOrder::deletion(0, line))
     }
 
-    pub(super) fn current_anchor(&self, before_line: usize) -> Option<usize> {
-        if self.after_lines == 0 {
+    pub fn current_anchor(&self, before_line: usize) -> Option<usize> {
+        let after_lines = self.after_to_before.len().saturating_sub(1);
+        if after_lines == 0 {
             return None;
         }
         let gap = self.before_order(before_line).after_gap;
         let line = gap.saturating_add(1);
-        Some(line.clamp(1, self.after_lines))
+        Some(line.clamp(1, after_lines))
     }
 
-    pub(super) fn aligned_before_line(&self, after_line: usize) -> Option<usize> {
+    pub fn aligned_before_line(&self, after_line: usize) -> Option<usize> {
         self.after_to_before.get(after_line).copied().flatten()
     }
 
-    pub(super) fn focus_order(&self, focus: &SourceFocus) -> SourceOrder {
-        focus
-            .after
-            .iter()
-            .map(|line| SourceOrder::current(*line))
-            .min()
-            .or_else(|| {
-                focus
-                    .before
-                    .iter()
-                    .map(|line| self.before_order(*line))
-                    .min()
-            })
-            .expect("classified change owns at least one signal line")
-    }
-
-    pub(super) fn current_focus(&self, focus: &SourceFocus) -> Option<Range<usize>> {
-        let lines = if focus.after.is_empty() {
-            focus
-                .before
-                .iter()
-                .filter_map(|line| self.current_anchor(*line))
-                .collect::<Vec<_>>()
-        } else {
-            focus.after.to_vec()
-        };
-        let start = lines.iter().copied().min()?;
-        let end = lines.iter().copied().max()?.saturating_add(1);
-        Some(start..end)
-    }
-
-    fn order_focus(&self, order: SourceOrder) -> Option<Range<usize>> {
-        if self.after_lines == 0 {
-            return None;
-        }
-        let line = order.after_gap.saturating_add(1).clamp(1, self.after_lines);
-        Some(line..line + 1)
-    }
-
-    pub(super) fn script_order(&self, after_line: usize) -> usize {
+    pub fn script_order(&self, after_line: usize) -> usize {
         self.after_script_order
             .get(after_line)
             .copied()
@@ -559,7 +403,7 @@ impl SourceMap {
     }
 
     fn apply_sequence(&mut self, sequence: &SourceSequence) {
-        for line in 1..=self.after_lines {
+        for line in 1..self.after_script_order.len() {
             self.after_script_order[line] = sequence
                 .after_owner
                 .get(line)
@@ -572,18 +416,16 @@ impl SourceMap {
 }
 
 /// Form unranked source hunks from one neutral syntax correspondence graph.
-pub(super) fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> RawHunks {
-    let mut source_map = SourceMap::new(
+pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> RawSourceDiff {
+    let mut source_layout = SourceLayout::new(
         correspondence,
         pair.before.source.lines().len(),
         pair.after.source.lines().len(),
     );
     if pair.before.source.as_str() == pair.after.source.as_str() {
-        return RawHunks {
+        return RawSourceDiff {
             hunks: Vec::new(),
-            source_map,
-            before_lines: pair.before.source.lines().len(),
-            after_lines: pair.after.source.lines().len(),
+            source_layout,
         };
     }
 
@@ -597,14 +439,34 @@ pub(super) fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Corresponden
                     && review.role == SourceRole::Content
             })
         });
-    let anchor_facts = AnchorFacts::new(pair);
+    let anchor_facts = AnchorFacts {
+        before: syntax_anchor_facts(&pair.before),
+        after: syntax_anchor_facts(&pair.after),
+    };
     // A one-sided file has no competing revision geometry or structural edit order.
     // Treating its syntax units as independently buoyant can lift separators ahead of
     // the declarations they separate, so retain the file as one physical line region.
     let one_sided = pair.before.source.lines().is_empty() || pair.after.source.lines().is_empty();
     let source_ordered = only_ordinary_linewise || one_sided;
     let mut changes = if source_ordered {
-        edit_fragments(form_whole_file_lines(pair, correspondence, &anchor_facts))
+        let before = (!pair.before.source.lines().is_empty())
+            .then(|| 1..pair.before.source.lines().len() + 1);
+        let after =
+            (!pair.after.source.lines().is_empty()).then(|| 1..pair.after.source.lines().len() + 1);
+        form_line_region(
+            pair,
+            correspondence,
+            LineCoverage { before, after },
+            &correspondence.composites,
+            None,
+            LineAnchors {
+                basis: AnchorBasis::Physical,
+                facts: &anchor_facts,
+            },
+            ChangeNature::Edit,
+        )
+        .into_iter()
+        .collect()
     } else {
         form_units(pair, correspondence, &anchor_facts)
     };
@@ -614,45 +476,47 @@ pub(super) fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Corresponden
     normalize_containment(&mut changes, pair, correspondence);
     let sequence = (!source_ordered).then(|| SourceSequence::new(pair, correspondence));
     if let Some(sequence) = &sequence {
-        source_map.apply_sequence(sequence);
+        source_layout.apply_sequence(sequence);
     }
     let hunks = changes
         .into_iter()
-        .map(|hunk| finalize_hunk(hunk, &source_map, sequence.as_ref()))
+        .map(|hunk| form_source_hunk(hunk, &source_layout, sequence.as_ref()))
         .collect();
-    RawHunks {
+    RawSourceDiff {
         hunks,
-        source_map,
-        before_lines: pair.before.source.lines().len(),
-        after_lines: pair.after.source.lines().len(),
+        source_layout,
     }
 }
 
 /// Freeze transient producer rows into atomic, source-located facts.
-fn finalize_hunk(
-    hunk: FormedHunk,
-    source_map: &SourceMap,
+fn form_source_hunk(
+    hunk: DraftFragment,
+    source_layout: &SourceLayout,
     sequence: Option<&SourceSequence>,
-) -> RawHunk {
-    let focus = SourceFocus::from_rows(&hunk.rows);
+) -> SourceHunk {
     let order = hunk
-        .order_hint
-        .unwrap_or_else(|| source_map.focus_order(&focus));
-    let context_anchor = hunk
-        .order_hint
-        .and_then(|order| source_map.order_focus(order))
-        .map(|focus| focus.start);
+        .context_anchor_order
+        .or_else(|| event_rows_order(&hunk.rows, source_layout))
+        .expect("draft hunk owns at least one source row");
+    let after_lines = source_layout.after_to_before.len().saturating_sub(1);
+    let context_anchor = hunk.context_anchor_order.and_then(|order| {
+        (after_lines > 0).then(|| order.after_gap.saturating_add(1).clamp(1, after_lines))
+    });
     let facts = atomic_event_groups(hunk.rows)
         .into_iter()
         .map(|events| {
             let script_order = sequence
-                .map(|sequence| sequence.group_rank(&events, source_map))
-                .unwrap_or_else(|| event_group_order(&events, source_map, order).after_gap);
-            source_fact(events, source_map, order, script_order)
+                .map(|sequence| sequence.group_rank(&events, source_layout))
+                .unwrap_or_else(|| {
+                    event_rows_order(&events, source_layout)
+                        .unwrap_or(order)
+                        .after_gap
+                });
+            source_fact(events, source_layout, order, script_order)
         })
         .collect::<Vec<_>>();
 
-    RawHunk {
+    SourceHunk {
         nature: hunk.nature,
         facts,
         order,
@@ -686,16 +550,12 @@ fn atomic_event_groups(rows: Vec<RowEvent>) -> Vec<Vec<RowEvent>> {
 
 fn source_fact(
     events: Vec<RowEvent>,
-    source_map: &SourceMap,
+    source_layout: &SourceLayout,
     fallback_order: SourceOrder,
     script_order: usize,
 ) -> SourceFact {
-    let coverage = event_group_coverage(&events, source_map);
-    let order = event_group_order(&events, source_map, fallback_order);
-    let displayed_after = events
-        .iter()
-        .filter_map(row_displayed_after_source_line)
-        .collect();
+    let coverage = event_group_coverage(&events, source_layout);
+    let order = event_rows_order(&events, source_layout).unwrap_or(fallback_order);
     let change = if events
         .first()
         .is_some_and(|row| matches!(row, RowEvent::Removed(_) | RowEvent::Added(_)))
@@ -739,41 +599,36 @@ fn source_fact(
         coverage,
         order,
         script_order,
-        displayed_after,
     }
 }
 
-fn event_group_coverage(events: &[RowEvent], source_map: &SourceMap) -> LineCoverage {
+fn event_group_coverage(events: &[RowEvent], source_layout: &SourceLayout) -> LineCoverage {
     let mut coverage = LineCoverage {
         before: None,
         after: None,
     };
     for event in events {
         if let RowEvent::Elision(elision) = event {
-            include_coverage(&mut coverage.before, elision.before.clone());
-            include_coverage(&mut coverage.after, elision.after.clone());
+            include_range(&mut coverage.before, elision.before.clone());
+            include_range(&mut coverage.after, elision.after.clone());
             continue;
         }
         if let RowEvent::Current(line) | RowEvent::Reflow(line) = event
-            && let Some(before) = source_map.aligned_before_line(line.number)
+            && let Some(before) = source_layout.aligned_before_line(line.number)
         {
-            include_source_line(&mut coverage.before, before);
+            include_range(&mut coverage.before, Some(before..before + 1));
         }
         if let Some(before) = row_before_source_line(event) {
-            include_source_line(&mut coverage.before, before);
+            include_range(&mut coverage.before, Some(before..before + 1));
         }
         if let Some(after) = row_after_source_line(event) {
-            include_source_line(&mut coverage.after, after);
+            include_range(&mut coverage.after, Some(after..after + 1));
         }
     }
     coverage
 }
 
-fn event_group_order(
-    events: &[RowEvent],
-    source_map: &SourceMap,
-    fallback: SourceOrder,
-) -> SourceOrder {
+fn event_rows_order(events: &[RowEvent], source_layout: &SourceLayout) -> Option<SourceOrder> {
     events
         .iter()
         .filter_map(row_after_source_line)
@@ -783,26 +638,9 @@ fn event_group_order(
             events
                 .iter()
                 .filter_map(row_before_source_line)
-                .map(|line| source_map.before_order(line))
+                .map(|line| source_layout.before_order(line))
                 .min()
         })
-        .unwrap_or(fallback)
-}
-
-fn include_coverage(coverage: &mut Option<Range<usize>>, addition: Option<Range<usize>>) {
-    let Some(addition) = addition else {
-        return;
-    };
-    let Some(coverage) = coverage else {
-        *coverage = Some(addition);
-        return;
-    };
-    coverage.start = coverage.start.min(addition.start);
-    coverage.end = coverage.end.max(addition.end);
-}
-
-fn include_source_line(coverage: &mut Option<Range<usize>>, line: usize) {
-    include_coverage(coverage, Some(line..line + 1));
 }
 
 /// Present exact physical correspondence once, in the current revision.
@@ -811,7 +649,10 @@ fn include_source_line(coverage: &mut Option<Range<usize>>, line: usize) {
 /// were a removal and addition. The physical-line graph is the language-neutral authority for
 /// those rows: old ghosts disappear and one current owner remains as context. Explicit
 /// structural movement already uses `Moved` rows and remains outside this normalization.
-fn normalize_stable_revision_rows(changes: &mut Vec<FormedHunk>, correspondence: &Correspondence) {
+fn normalize_stable_revision_rows(
+    changes: &mut Vec<DraftFragment>,
+    correspondence: &Correspondence,
+) {
     let mut changed_before = HashSet::new();
     let mut changed_after = HashSet::new();
     let mut current_owners = HashSet::new();
@@ -887,7 +728,7 @@ fn normalize_stable_revision_rows(changes: &mut Vec<FormedHunk>, correspondence:
                         if !current_owners.insert(line.number) {
                             return Vec::new();
                         }
-                        line.clear_changes();
+                        line.highlights.clear();
                         vec![RowEvent::Current(line)]
                     }
                     row => vec![row],
@@ -904,7 +745,7 @@ fn normalize_stable_revision_rows(changes: &mut Vec<FormedHunk>, correspondence:
 /// into one. Exact leaf correspondence remains the authority: retained ranges stay context while
 /// only the one-sided shell carries the change.
 fn normalize_containment(
-    changes: &mut Vec<FormedHunk>,
+    changes: &mut Vec<DraftFragment>,
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
 ) {
@@ -1176,22 +1017,27 @@ fn row_has_signal(row: &RowEvent) -> bool {
     }
 }
 
-fn edit_fragments(excerpts: Vec<FormedExcerpt>) -> Vec<FormedHunk> {
-    excerpts.into_iter().map(FormedHunk::edit).collect()
-}
-
-fn formed_excerpts(rows: Vec<RowEvent>, context_root: Option<NodeId>) -> Vec<FormedExcerpt> {
+fn draft_fragment(
+    nature: ChangeNature,
+    rows: Vec<RowEvent>,
+    context_root: Option<NodeId>,
+) -> Option<DraftFragment> {
     if !rows.iter().any(row_has_signal) {
-        return Vec::new();
+        return None;
     }
-    vec![FormedExcerpt { rows, context_root }]
+    Some(DraftFragment {
+        nature,
+        rows,
+        context_anchor_order: None,
+        context_root,
+    })
 }
 
 fn form_units(
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
     anchor_facts: &AnchorFacts,
-) -> Vec<FormedHunk> {
+) -> Vec<DraftFragment> {
     let mut fragments = Vec::new();
     let mut preceding_after_lines = 0;
 
@@ -1210,26 +1056,17 @@ fn form_units(
                     .review
                     .as_ref()
                     .expect("review edit owns a review unit");
-                match review.role {
-                    SourceRole::Wiring => fragments.push(
-                        FormedHunk::wiring(form_one_sided_lines(
-                            &pair.before,
-                            node.lines.clone(),
-                            RevisionSide::Before,
-                        ))
-                        .at_order(order),
-                    ),
-                    SourceRole::Content => {
-                        fragments.push(
-                            FormedHunk::edit(form_one_sided_lines(
-                                &pair.before,
-                                node.lines.clone(),
-                                RevisionSide::Before,
-                            ))
-                            .at_order(order),
-                        );
-                    }
-                }
+                let nature = match review.role {
+                    SourceRole::Wiring => ChangeNature::Wiring,
+                    SourceRole::Content => ChangeNature::Edit,
+                };
+                fragments.push(form_one_sided_lines(
+                    &pair.before,
+                    node.lines.clone(),
+                    RevisionSide::Before,
+                    nature,
+                    Some(order),
+                ));
             }
             UnitEdit::Added { after } => {
                 let node = pair.after.node(*after);
@@ -1237,20 +1074,17 @@ fn form_units(
                     .review
                     .as_ref()
                     .expect("review edit owns a review unit");
-                match review.role {
-                    SourceRole::Wiring => fragments.push(FormedHunk::wiring(form_one_sided_lines(
-                        &pair.after,
-                        node.lines.clone(),
-                        RevisionSide::After,
-                    ))),
-                    SourceRole::Content => {
-                        fragments.extend(edit_fragments(vec![form_one_sided_lines(
-                            &pair.after,
-                            node.lines.clone(),
-                            RevisionSide::After,
-                        )]))
-                    }
-                }
+                let nature = match review.role {
+                    SourceRole::Wiring => ChangeNature::Wiring,
+                    SourceRole::Content => ChangeNature::Edit,
+                };
+                fragments.push(form_one_sided_lines(
+                    &pair.after,
+                    node.lines.clone(),
+                    RevisionSide::After,
+                    nature,
+                    None,
+                ));
                 preceding_after_lines = preceding_after_lines.max(node.lines.end.saturating_sub(1));
             }
         }
@@ -1259,19 +1093,23 @@ fn form_units(
         let excerpts = form_line_region(
             pair,
             correspondence,
-            one_based_line_range(&fallback.before),
-            one_based_line_range(&fallback.after),
+            LineCoverage {
+                before: (!fallback.before.is_empty())
+                    .then(|| fallback.before.start + 1..fallback.before.end + 1),
+                after: (!fallback.after.is_empty())
+                    .then(|| fallback.after.start + 1..fallback.after.end + 1),
+            },
             &[],
             None,
-            LineAnchors::new(AnchorBasis::Physical, anchor_facts),
+            LineAnchors {
+                basis: AnchorBasis::Physical,
+                facts: anchor_facts,
+            },
+            ChangeNature::Edit,
         );
-        fragments.extend(edit_fragments(excerpts));
+        fragments.extend(excerpts);
     }
     fragments
-}
-
-fn one_based_line_range(lines: &Range<usize>) -> Option<Range<usize>> {
-    (!lines.is_empty()).then(|| lines.start + 1..lines.end + 1)
 }
 
 fn form_matched_unit(
@@ -1279,11 +1117,11 @@ fn form_matched_unit(
     correspondence: &Correspondence,
     anchor_facts: &AnchorFacts,
     unit: &MatchedUnit,
-    fragments: &mut Vec<FormedHunk>,
+    fragments: &mut Vec<DraftFragment>,
 ) {
     let after_node = pair.after.node(unit.after);
     if unit.placement == Placement::Reordered && unit.relation.full_equal() {
-        fragments.push(FormedHunk::moved(form_move(pair, correspondence, unit)));
+        fragments.extend(form_move(pair, correspondence, unit));
         return;
     }
     if unit.relation.source_equal() {
@@ -1297,51 +1135,69 @@ fn form_matched_unit(
             let excerpts = form_line_region(
                 pair,
                 correspondence,
-                Some(before.lines.clone()),
-                Some(after_node.lines.clone()),
+                LineCoverage {
+                    before: Some(before.lines.clone()),
+                    after: Some(after_node.lines.clone()),
+                },
                 composites,
                 Some(unit.after),
-                LineAnchors::new(structural_anchor_basis(pair, unit), anchor_facts),
+                LineAnchors {
+                    basis: structural_anchor_basis(pair, unit),
+                    facts: anchor_facts,
+                },
+                ChangeNature::Wiring,
             );
-            fragments.extend(excerpts.into_iter().map(FormedHunk::wiring));
+            fragments.extend(excerpts);
             return;
         }
-        let excerpt = form_wiring(pair, Some(unit.before), Some(unit.after));
-        fragments.push(FormedHunk::wiring(excerpt));
+        fragments.push(DraftFragment {
+            nature: ChangeNature::Wiring,
+            rows: vec![RowEvent::Compact(CompactChange {
+                before_line: Some(before.lines.start),
+                after_line: Some(after_node.lines.start),
+                before_bytes: Some(before.bytes.clone()),
+                after_bytes: Some(after_node.bytes.clone()),
+            })],
+            context_anchor_order: None,
+            context_root: None,
+        });
         return;
     }
 
     match unit.comparison {
         ComparisonStrategy::Linewise => {
             let composites = correspondence.unit_composites(unit);
-            fragments.extend(edit_fragments(form_line_region(
+            fragments.extend(form_line_region(
                 pair,
                 correspondence,
-                Some(pair.before.node(unit.before).lines.clone()),
-                Some(after_node.lines.clone()),
+                LineCoverage {
+                    before: Some(pair.before.node(unit.before).lines.clone()),
+                    after: Some(after_node.lines.clone()),
+                },
                 composites,
                 Some(unit.after),
-                LineAnchors::new(AnchorBasis::Physical, anchor_facts),
-            )));
+                LineAnchors {
+                    basis: AnchorBasis::Physical,
+                    facts: anchor_facts,
+                },
+                ChangeNature::Edit,
+            ));
         }
         ComparisonStrategy::Structural => {
             if unit.relation.full_equal() {
-                fragments.extend(
-                    form_reflow(pair, correspondence, unit)
-                        .into_iter()
-                        .map(FormedHunk::reflow),
-                );
+                fragments.extend(form_reflow(pair, correspondence, unit));
                 return;
             }
 
             let dependents = retained_decorations(pair, correspondence, unit);
             let comments = comment_edits(pair, correspondence, unit, &dependents);
             if unit.relation.payload_equal() {
-                fragments.extend(
-                    form_reflow_with_comments(pair, correspondence, unit, comments)
-                        .into_iter()
-                        .map(FormedHunk::edit),
-                );
+                fragments.extend(form_reflow_with_comments(
+                    pair,
+                    correspondence,
+                    unit,
+                    comments,
+                ));
                 return;
             }
             // Root units own the complete edit order; nested units share it with sibling edits.
@@ -1354,27 +1210,29 @@ fn form_matched_unit(
                 let excerpts = form_line_region(
                     pair,
                     correspondence,
-                    Some(pair.before.node(unit.before).lines.clone()),
-                    Some(after_node.lines.clone()),
+                    LineCoverage {
+                        before: Some(pair.before.node(unit.before).lines.clone()),
+                        after: Some(after_node.lines.clone()),
+                    },
                     correspondence.unit_composites(unit),
                     Some(unit.after),
-                    LineAnchors::new(structural_anchor_basis(pair, unit), anchor_facts),
+                    LineAnchors {
+                        basis: structural_anchor_basis(pair, unit),
+                        facts: anchor_facts,
+                    },
+                    ChangeNature::Edit,
                 );
-                fragments.extend(edit_fragments(excerpts));
+                fragments.extend(excerpts);
                 return;
             }
-            fragments.extend(
-                form_payload(
-                    pair,
-                    correspondence,
-                    anchor_facts,
-                    unit,
-                    &dependents,
-                    comments,
-                )
-                .into_iter()
-                .map(FormedHunk::edit),
-            );
+            fragments.extend(form_payload(
+                pair,
+                correspondence,
+                anchor_facts,
+                unit,
+                &dependents,
+                comments,
+            ));
         }
     }
 }
@@ -1422,9 +1280,11 @@ fn form_one_sided_lines(
     tree: &SyntaxTree<'_>,
     lines: Range<usize>,
     side: RevisionSide,
-) -> FormedExcerpt {
+    nature: ChangeNature,
+    context_anchor_order: Option<SourceOrder>,
+) -> DraftFragment {
     let mut rows = Vec::new();
-    for source in collect_source_lines(tree, lines) {
+    for source in lines.filter_map(|number| tree.source.line(number)) {
         let ending = source.ending;
         let line = select_line(source, std::slice::from_ref(&source.content_bytes));
         let row = if side == RevisionSide::Before {
@@ -1444,28 +1304,10 @@ fn form_one_sided_lines(
             }));
         }
     }
-    FormedExcerpt {
+    DraftFragment {
+        nature,
         rows,
-        context_root: None,
-    }
-}
-
-fn form_wiring(
-    pair: &SyntaxPair<'_, '_>,
-    before: Option<NodeId>,
-    after: Option<NodeId>,
-) -> FormedExcerpt {
-    let before_node = before.map(|node| pair.before.node(node));
-    let after_node = after.map(|node| pair.after.node(node));
-    let compact = CompactChange {
-        before_line: before_node.map(|node| node.lines.start),
-        after_line: after_node.map(|node| node.lines.start),
-        before_bytes: before_node.map(|node| node.bytes.clone()),
-        after_bytes: after_node.map(|node| node.bytes.clone()),
-    };
-
-    FormedExcerpt {
-        rows: vec![RowEvent::Compact(compact)],
+        context_anchor_order,
         context_root: None,
     }
 }
@@ -1474,16 +1316,16 @@ fn form_move(
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
     unit: &MatchedUnit,
-) -> FormedExcerpt {
+) -> Option<DraftFragment> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
-    let mut lines = select_lines(&pair.after, after.lines.clone(), &[]);
-    let Some(first) = lines.first().cloned() else {
-        return FormedExcerpt {
-            rows: Vec::new(),
-            context_root: None,
-        };
-    };
+    let mut lines = after
+        .lines
+        .clone()
+        .filter_map(|number| pair.after.source.line(number))
+        .map(|line| select_line(line, &[]))
+        .collect::<Vec<_>>();
+    let first = lines.first().cloned()?;
     if let Some(rows) = moved_rows_with_line_endings(
         pair,
         before.lines.clone(),
@@ -1491,19 +1333,17 @@ fn form_move(
         correspondence.unit_line_links(unit),
         &lines,
     ) {
-        return FormedExcerpt {
-            rows,
-            context_root: None,
-        };
+        return draft_fragment(ChangeNature::Move, rows, None);
     }
     if lines.len() == 1 {
-        return FormedExcerpt {
-            rows: vec![RowEvent::Moved {
+        return draft_fragment(
+            ChangeNature::Move,
+            vec![RowEvent::Moved {
                 before: Some(before.lines.start),
                 after: first,
             }],
-            context_root: None,
-        };
+            None,
+        );
     }
 
     let last = lines.pop().expect("a multi-line move has a final line");
@@ -1526,10 +1366,7 @@ fn form_move(
         before: None,
         after: last,
     });
-    FormedExcerpt {
-        rows,
-        context_root: None,
-    }
+    draft_fragment(ChangeNature::Move, rows, None)
 }
 
 /// A move remains the primary fact, but concrete terminator edits inside it cannot disappear.
@@ -1620,7 +1457,7 @@ fn moved_rows_with_line_endings(
             after: None,
         }));
     }
-    append_moved_line_ending(&mut rows, endings[0]);
+    rows.extend(endings[0].map(RowEvent::LineEnding));
     if lines.len() == 1 {
         return Some(rows);
     }
@@ -1632,7 +1469,7 @@ fn moved_rows_with_line_endings(
         let selected = show_only_middle == Some(offset) || endings[offset].is_some();
         if selected {
             rows.push(RowEvent::Current(lines[offset].clone()));
-            append_moved_line_ending(&mut rows, endings[offset]);
+            rows.extend(endings[offset].map(RowEvent::LineEnding));
             offset += 1;
             continue;
         }
@@ -1651,22 +1488,15 @@ fn moved_rows_with_line_endings(
         before: None,
         after: lines[last].clone(),
     });
-    append_moved_line_ending(&mut rows, endings[last]);
+    rows.extend(endings[last].map(RowEvent::LineEnding));
     Some(rows)
-}
-
-fn append_moved_line_ending(rows: &mut Vec<RowEvent>, ending: Option<LineEndingChange>) {
-    let Some(ending) = ending else {
-        return;
-    };
-    rows.push(RowEvent::LineEnding(ending));
 }
 
 fn form_reflow(
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
     unit: &MatchedUnit,
-) -> Vec<FormedExcerpt> {
+) -> Option<DraftFragment> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
     let before_lines = line_indices(Some(before.lines.clone()), pair.before.source.lines().len());
@@ -1675,8 +1505,11 @@ fn form_reflow(
         .line_links_in(before_lines, after_lines)
         .map(|link| link.after + 1)
         .collect::<HashSet<_>>();
-    let rows = select_lines(&pair.after, after.lines.clone(), &[])
-        .into_iter()
+    let rows = after
+        .lines
+        .clone()
+        .filter_map(|number| pair.after.source.line(number))
+        .map(|line| select_line(line, &[]))
         .map(|line| {
             if exact_after.contains(&line.number) {
                 RowEvent::Current(line)
@@ -1685,7 +1518,7 @@ fn form_reflow(
             }
         })
         .collect::<Vec<_>>();
-    formed_excerpts(rows, Some(unit.after))
+    draft_fragment(ChangeNature::Reflow, rows, Some(unit.after))
 }
 
 fn form_reflow_with_comments(
@@ -1693,7 +1526,7 @@ fn form_reflow_with_comments(
     correspondence: &Correspondence,
     unit: &MatchedUnit,
     mut edits: Vec<LineEdit>,
-) -> Vec<FormedExcerpt> {
+) -> Option<DraftFragment> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
     let changed_lines = edits
@@ -1715,7 +1548,12 @@ fn form_reflow_with_comments(
     edits.sort_by_key(line_edit_order);
     let mut edits = edits.into_iter().peekable();
     let mut rows = Vec::new();
-    for line in select_lines(&pair.after, after.lines.clone(), &[]) {
+    for line in after
+        .lines
+        .clone()
+        .filter_map(|number| pair.after.source.line(number))
+        .map(|line| select_line(line, &[]))
+    {
         while edits
             .peek()
             .is_some_and(|edit| line_edit_order(edit) < line.number)
@@ -1736,7 +1574,7 @@ fn form_reflow_with_comments(
         append_line_edit_rows(&mut rows, edit);
     }
 
-    formed_excerpts(rows, Some(unit.after))
+    draft_fragment(ChangeNature::Edit, rows, Some(unit.after))
 }
 
 fn comment_lines(tree: &SyntaxTree<'_>, unit: NodeId) -> HashSet<usize> {
@@ -1756,18 +1594,24 @@ fn form_payload(
     unit: &MatchedUnit,
     dependents: &RetainedDecorations,
     mut edits: Vec<LineEdit>,
-) -> Vec<FormedExcerpt> {
+) -> Option<DraftFragment> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
     if payload_requires_node_snap(pair, correspondence, unit) {
         return form_line_region(
             pair,
             correspondence,
-            Some(before.lines.clone()),
-            Some(after.lines.clone()),
+            LineCoverage {
+                before: Some(before.lines.clone()),
+                after: Some(after.lines.clone()),
+            },
             correspondence.unit_composites(unit),
             Some(unit.after),
-            LineAnchors::new(structural_anchor_basis(pair, unit), anchor_facts),
+            LineAnchors {
+                basis: structural_anchor_basis(pair, unit),
+                facts: anchor_facts,
+            },
+            ChangeNature::Edit,
         );
     }
     edits.extend(modified_payload_edits(pair, correspondence, unit));
@@ -1819,8 +1663,10 @@ fn form_payload(
         .iter()
         .filter_map(|edit| edit.before.as_ref().map(|line| line.number))
         .collect::<HashSet<_>>();
-    let partial_removal = collect_source_lines(&pair.before, before.lines.clone())
-        .into_iter()
+    let partial_removal = before
+        .lines
+        .clone()
+        .filter_map(|number| pair.before.source.line(number))
         .filter(|line| !claimed_before.contains(&line.number))
         .map(|line| select_line(line, &before_marked))
         .any(|line| line.has_changes() && !line_is_fully_highlighted(&pair.before, &line));
@@ -1828,11 +1674,17 @@ fn form_payload(
         return form_line_region(
             pair,
             correspondence,
-            Some(before.lines.clone()),
-            Some(after.lines.clone()),
+            LineCoverage {
+                before: Some(before.lines.clone()),
+                after: Some(after.lines.clone()),
+            },
             correspondence.unit_composites(unit),
             Some(unit.after),
-            LineAnchors::new(structural_anchor_basis(pair, unit), anchor_facts),
+            LineAnchors {
+                basis: structural_anchor_basis(pair, unit),
+                facts: anchor_facts,
+            },
+            ChangeNature::Edit,
         );
     }
     edits.extend(fully_marked_line_edits(
@@ -1847,18 +1699,29 @@ fn form_payload(
         return form_line_region(
             pair,
             correspondence,
-            Some(before.lines.clone()),
-            Some(after.lines.clone()),
+            LineCoverage {
+                before: Some(before.lines.clone()),
+                after: Some(after.lines.clone()),
+            },
             correspondence.unit_composites(unit),
             Some(unit.after),
-            LineAnchors::new(structural_anchor_basis(pair, unit), anchor_facts),
+            LineAnchors {
+                basis: structural_anchor_basis(pair, unit),
+                facts: anchor_facts,
+            },
+            ChangeNature::Edit,
         );
     }
     let changed_lines = edits
         .iter()
         .filter_map(|edit| edit.after.as_ref().map(|line| line.number))
         .collect::<HashSet<_>>();
-    let lines = select_lines(&pair.after, after.lines.clone(), &after_marked);
+    let lines = after
+        .lines
+        .clone()
+        .filter_map(|number| pair.after.source.line(number))
+        .map(|line| select_line(line, &after_marked))
+        .collect::<Vec<_>>();
     edits.sort_by_key(line_edit_order);
     let mut edits = edits.into_iter().peekable();
     let mut rows = Vec::new();
@@ -1878,7 +1741,7 @@ fn form_payload(
         append_line_edit_rows(&mut rows, edit);
     }
 
-    formed_excerpts(rows, Some(unit.after))
+    draft_fragment(ChangeNature::Edit, rows, Some(unit.after))
 }
 
 fn leaf_is_meaningful_payload(tree: &SyntaxTree<'_>, id: NodeId) -> bool {
@@ -2250,7 +2113,7 @@ fn fully_marked_line_edits(
     after_marked: &[Range<usize>],
 ) -> Vec<LineEdit> {
     let mut edits = Vec::new();
-    for line in collect_source_lines(&pair.before, before_lines) {
+    for line in before_lines.filter_map(|number| pair.before.source.line(number)) {
         let display = select_line(line, before_marked);
         if line_is_fully_highlighted(&pair.before, &display) {
             edits.push(changed_line_edit(
@@ -2261,7 +2124,7 @@ fn fully_marked_line_edits(
             ));
         }
     }
-    for line in collect_source_lines(&pair.after, after_lines) {
+    for line in after_lines.filter_map(|number| pair.after.source.line(number)) {
         let display = select_line(line, after_marked);
         if line_is_fully_highlighted(&pair.after, &display) {
             edits.push(changed_line_edit(
@@ -2332,11 +2195,15 @@ fn append_changed_line_edits(
     after_lines: Option<Range<usize>>,
 ) {
     let before_lines = before_lines
-        .map(|lines| collect_source_lines(before, lines))
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter_map(|number| before.source.line(number))
+        .collect::<Vec<_>>();
     let after_lines = after_lines
-        .map(|lines| collect_source_lines(after, lines))
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter_map(|number| after.source.line(number))
+        .collect::<Vec<_>>();
     let paired = before_lines.len().min(after_lines.len());
     for index in 0..paired {
         edits.push(changed_line_edit(
@@ -2463,10 +2330,7 @@ fn changed_byte_ranges(
     )
 }
 
-pub(super) fn changed_sequence_ranges<T: Eq>(
-    before: &[T],
-    after: &[T],
-) -> (Range<usize>, Range<usize>) {
+pub fn changed_sequence_ranges<T: Eq>(before: &[T], after: &[T]) -> (Range<usize>, Range<usize>) {
     let prefix = before
         .iter()
         .zip(after)
@@ -2504,8 +2368,14 @@ fn visible_line_ending_change(
     before: Option<&SourceLine>,
     after: Option<&SourceLine>,
 ) -> Option<LineEndingChange> {
-    let before = before.map(ending_endpoint);
-    let after = after.map(ending_endpoint);
+    let before = before.map(|line| LineEndingEndpoint {
+        line: line.number,
+        ending: line.ending,
+    });
+    let after = after.map(|line| LineEndingEndpoint {
+        line: line.number,
+        ending: line.ending,
+    });
     let ending_changed =
         before.map(|endpoint| endpoint.ending) != after.map(|endpoint| endpoint.ending);
     let visible_missing = before.is_some_and(|endpoint| endpoint.ending == LineEnding::Missing)
@@ -2536,26 +2406,6 @@ fn descendant_leaves<'tree>(
     std::iter::once(root)
         .chain(tree.descendants(root))
         .filter(|id| tree.node(*id).leaf.is_some())
-}
-
-fn form_whole_file_lines(
-    pair: &SyntaxPair<'_, '_>,
-    correspondence: &Correspondence,
-    anchor_facts: &AnchorFacts,
-) -> Vec<FormedExcerpt> {
-    let before =
-        (!pair.before.source.lines().is_empty()).then(|| 1..pair.before.source.lines().len() + 1);
-    let after =
-        (!pair.after.source.lines().is_empty()).then(|| 1..pair.after.source.lines().len() + 1);
-    form_line_region(
-        pair,
-        correspondence,
-        before,
-        after,
-        &correspondence.composites,
-        None,
-        LineAnchors::new(AnchorBasis::Physical, anchor_facts),
-    )
 }
 
 /// Monotone physical-line fact retained before rows are selected or abbreviated.
@@ -2590,15 +2440,6 @@ struct RetainedRegion {
 struct AnchorFacts {
     before: Vec<NodeAnchorFacts>,
     after: Vec<NodeAnchorFacts>,
-}
-
-impl AnchorFacts {
-    fn new(pair: &SyntaxPair<'_, '_>) -> Self {
-        Self {
-            before: syntax_anchor_facts(&pair.before),
-            after: syntax_anchor_facts(&pair.after),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2660,12 +2501,6 @@ struct LineAnchors<'facts> {
     facts: &'facts AnchorFacts,
 }
 
-impl<'facts> LineAnchors<'facts> {
-    fn new(basis: AnchorBasis, facts: &'facts AnchorFacts) -> Self {
-        Self { basis, facts }
-    }
-}
-
 /// Shared outer rows frame a definition only while its source identity survives.
 fn structural_anchor_basis(pair: &SyntaxPair<'_, '_>, unit: &MatchedUnit) -> AnchorBasis {
     let same_owner = match (
@@ -2681,17 +2516,21 @@ fn structural_anchor_basis(pair: &SyntaxPair<'_, '_>, unit: &MatchedUnit) -> Anc
 fn form_line_region(
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
-    before_lines: Option<Range<usize>>,
-    after_lines: Option<Range<usize>>,
+    coverage: LineCoverage,
     composites: &[NodeLink],
     after_root: Option<NodeId>,
     anchors: LineAnchors<'_>,
-) -> Vec<FormedExcerpt> {
-    let before = line_indices(before_lines, pair.before.source.lines().len());
-    let after = line_indices(after_lines, pair.after.source.lines().len());
+    nature: ChangeNature,
+) -> Option<DraftFragment> {
+    let before = line_indices(coverage.before, pair.before.source.lines().len());
+    let after = line_indices(coverage.after, pair.after.source.lines().len());
     let retained = retained_regions(pair, anchors.facts, composites, &before, &after);
     let facts = line_facts(correspondence, before, after, retained, anchors.basis);
-    form_line_facts(pair, &facts, after_root)
+    let mut rows = Vec::new();
+    for fact in &facts {
+        append_line_fact_rows(&mut rows, pair, fact);
+    }
+    draft_fragment(nature, rows, after_root)
 }
 
 fn line_indices(lines: Option<Range<usize>>, line_count: usize) -> Range<usize> {
@@ -3066,18 +2905,6 @@ fn physical_line_checkpoints(
     checkpoints
 }
 
-fn form_line_facts(
-    pair: &SyntaxPair<'_, '_>,
-    facts: &[LineFact],
-    after_root: Option<NodeId>,
-) -> Vec<FormedExcerpt> {
-    let mut rows = Vec::new();
-    for fact in facts {
-        append_line_fact_rows(&mut rows, pair, fact);
-    }
-    formed_excerpts(rows, after_root)
-}
-
 fn append_line_fact_rows(rows: &mut Vec<RowEvent>, pair: &SyntaxPair<'_, '_>, fact: &LineFact) {
     match fact {
         LineFact::Context { after } => {
@@ -3134,7 +2961,10 @@ fn append_line_change_rows(
         )));
         if line.ending == LineEnding::Missing {
             rows.push(RowEvent::LineEnding(LineEndingChange {
-                before: Some(ending_endpoint(line)),
+                before: Some(LineEndingEndpoint {
+                    line: line.number,
+                    ending: line.ending,
+                }),
                 after: None,
             }));
         }
@@ -3148,7 +2978,10 @@ fn append_line_change_rows(
         if line.ending == LineEnding::Missing {
             rows.push(RowEvent::LineEnding(LineEndingChange {
                 before: None,
-                after: Some(ending_endpoint(line)),
+                after: Some(LineEndingEndpoint {
+                    line: line.number,
+                    ending: line.ending,
+                }),
             }));
         }
     }
@@ -3169,15 +3002,6 @@ fn append_retained_region_rows(
         };
         rows.push(row);
     }
-}
-
-fn collect_source_lines<'tree>(
-    tree: &'tree SyntaxTree<'_>,
-    lines: Range<usize>,
-) -> Vec<&'tree SourceLine> {
-    lines
-        .filter_map(|number| tree.source.line(number))
-        .collect()
 }
 
 fn row_after_source_line(row: &RowEvent) -> Option<usize> {

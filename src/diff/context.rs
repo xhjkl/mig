@@ -4,51 +4,44 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 /// Physical lines retained on either side of an ordinary signal.
-pub(super) const CONTEXT_HALO_RADIUS: usize = 3;
+pub const CONTEXT_HALO_RADIUS: usize = 3;
 
 /// Whether two three-line halos touch or would hide only one physical row.
-pub(super) fn context_gap_fits_halos(context_rows: usize) -> bool {
+pub fn context_gap_fits_halos(context_rows: usize) -> bool {
     context_rows <= CONTEXT_HALO_RADIUS * 2 + 1
 }
 
-/// First retained item after walking through at most one leading context halo.
-pub(super) fn context_halo_start<T>(
+/// Expand one non-empty signal range through adjacent context on both sides.
+pub fn context_halo_range<T>(
     items: &[T],
-    signal: usize,
+    signal: Range<usize>,
     is_context: impl Fn(&T) -> bool,
-) -> usize {
-    let mut index = signal;
+) -> Range<usize> {
+    debug_assert!(!signal.is_empty() && signal.end <= items.len());
+    let mut start = signal.start;
     let mut retained = 0;
-    while index > 0 && retained < CONTEXT_HALO_RADIUS {
-        if !is_context(&items[index - 1]) {
+    while start > 0 && retained < CONTEXT_HALO_RADIUS {
+        if !is_context(&items[start - 1]) {
             break;
         }
-        index -= 1;
+        start -= 1;
         retained += 1;
     }
-    index
-}
 
-/// Exclusive retained end after walking through at most one trailing context halo.
-pub(super) fn context_halo_end<T>(
-    items: &[T],
-    signal: usize,
-    is_context: impl Fn(&T) -> bool,
-) -> usize {
-    let mut index = signal + 1;
+    let mut end = signal.end;
     let mut retained = 0;
-    while index < items.len() && retained < CONTEXT_HALO_RADIUS {
-        if !is_context(&items[index]) {
+    while end < items.len() && retained < CONTEXT_HALO_RADIUS {
+        if !is_context(&items[end]) {
             break;
         }
-        index += 1;
+        end += 1;
         retained += 1;
     }
-    index
+    start..end
 }
 
 /// Contiguous unchanged rows around each display-only hierarchy step.
-pub(super) fn breadcrumb_halo_indices(
+pub fn breadcrumb_halo_indices(
     breadcrumbs: &HashSet<usize>,
     mut context_index: impl FnMut(usize) -> Option<usize>,
 ) -> Vec<usize> {
@@ -84,7 +77,7 @@ pub(super) fn breadcrumb_halo_indices(
 }
 
 /// Merge signal and breadcrumb context halos without widening hunk merge focus.
-pub(super) fn review_selection_ranges(
+pub fn review_selection_ranges(
     context_halo: Range<usize>,
     breadcrumbs: impl IntoIterator<Item = usize>,
     is_context: impl Fn(usize) -> bool,
@@ -111,12 +104,25 @@ pub(super) fn review_selection_ranges(
 }
 
 /// Whether two pre-expanded merge windows touch or would hide only one row.
-pub(super) fn merge_windows_touch(left: &Range<usize>, right: &Range<usize>) -> bool {
+pub fn merge_windows_touch(left: &Range<usize>, right: &Range<usize>) -> bool {
     right.start.saturating_sub(left.end) <= 1
 }
 
+/// Union optional source geometry while preserving absence.
+pub fn include_range(range: &mut Option<Range<usize>>, addition: Option<Range<usize>>) {
+    let Some(addition) = addition else {
+        return;
+    };
+    let Some(range) = range else {
+        *range = Some(addition);
+        return;
+    };
+    range.start = range.start.min(addition.start);
+    range.end = range.end.max(addition.end);
+}
+
 /// Whether two half-open source ranges share at least one coordinate.
-pub(super) fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+pub fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
 

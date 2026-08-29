@@ -1,13 +1,13 @@
-use super::lower::{GapContext, HighlightQueries, NodeAnnotation, NodeContext};
+use super::lower::{HighlightQueries, NodeAnnotation, grammar_symbol};
 use super::{
-    ContentChannel, GrammarSymbol, LayoutOwnership, LeafRole, NodeId, ReviewUnit, SiblingMatching,
-    SyntaxKind, SyntaxNode, WrapperBoundary,
+    ContentChannel, Grammar, LayoutOwnership, LeafRole, NodeId, ReviewUnit, SiblingMatching,
+    SyntaxNode, WrapperBoundary,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
 use ::tree_sitter::Node;
 
-pub(super) static HIGHLIGHT_QUERIES: HighlightQueries =
+pub static HIGHLIGHT_QUERIES: HighlightQueries =
     HighlightQueries::new(&[tree_sitter_html::HIGHLIGHTS_QUERY]);
 const OPAQUE_ELEMENTS: &[&str] = &[
     "iframe",
@@ -57,12 +57,7 @@ const PARAGRAPH_CLOSING_ELEMENTS: &[&str] = &[
     "ul",
 ];
 
-pub(super) fn normalize_recovery(source: &Source<'_>, nodes: &mut [SyntaxNode]) -> bool {
-    normalize_source_authored_paragraph_end_tags(source, nodes)
-}
-
-pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
-    let node = context.node;
+pub fn annotate(node: Node<'_>, source: &str) -> NodeAnnotation {
     if node.kind() == "document" {
         return NodeAnnotation {
             review: Some(ReviewUnit::structural(LayoutOwnership::None)),
@@ -72,32 +67,23 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    if is_plaintext_element(node, context.source) {
-        let identity = tag_name(node).map(|name| name.byte_range());
+    if let Some((name, absorbs_rest)) = opaque_element(node, source) {
+        let identity = name.map(|name| name.byte_range());
         return NodeAnnotation {
             channel: Some(ContentChannel::Opaque),
             descendant_channel: Some(ContentChannel::Opaque),
             identity,
             sibling_matching: SiblingMatching::LocalIdentity,
-            extent: Some(node.start_byte()..context.source.len()),
+            extent: absorbs_rest.then(|| node.start_byte()..source.len()),
             prune_children: true,
             ..NodeAnnotation::default()
         };
     }
 
-    if is_opaque_element(node, context.source) {
-        let identity = tag_name(node).map(|name| name.byte_range());
-        return NodeAnnotation {
-            channel: Some(ContentChannel::Opaque),
-            descendant_channel: Some(ContentChannel::Opaque),
-            identity,
-            sibling_matching: SiblingMatching::LocalIdentity,
-            prune_children: true,
-            ..NodeAnnotation::default()
-        };
-    }
-
-    if is_element(node.kind()) || node.kind() == "self_closing_tag" {
+    if matches!(
+        node.kind(),
+        "element" | "script_element" | "style_element" | "self_closing_tag"
+    ) {
         let identity = tag_name(node).map(|name| name.byte_range());
         return NodeAnnotation {
             identity,
@@ -115,7 +101,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if node.kind() == "text" {
-        let text = &context.source[node.byte_range()];
+        let text = &source[node.byte_range()];
         if text.chars().all(char::is_whitespace) && (text.contains('\n') || text.contains('\r')) {
             return NodeAnnotation {
                 channel: Some(ContentChannel::Layout),
@@ -136,30 +122,14 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     NodeAnnotation::default()
 }
 
-pub(super) fn gap_channel(context: GapContext<'_, '_>) -> ContentChannel {
-    if context.is_whitespace()
-        && matches!(context.parent.kind(), "document" | "element")
-        && !context.source[context.bytes.clone()].contains(['\n', '\r'])
-    {
-        // Same-line whitespace between elements contributes to rendered text.
-        return ContentChannel::Syntax;
-    }
-    if context.is_whitespace()
-        && matches!(
-            context.parent.kind(),
-            "attribute_value" | "quoted_attribute_value"
-        )
-    {
-        return ContentChannel::Syntax;
-    }
-    context.default_channel()
+pub fn whitespace_is_syntax(parent_kind: &str, spelling: &str) -> bool {
+    // Same-line whitespace between elements contributes to rendered text.
+    matches!(parent_kind, "document" | "element") && !spelling.contains(['\n', '\r'])
+        || matches!(parent_kind, "attribute_value" | "quoted_attribute_value")
 }
 
 /// Restore explicit paragraph closes displaced by a paragraph-closing block element.
-fn normalize_source_authored_paragraph_end_tags(
-    source: &Source<'_>,
-    nodes: &mut [SyntaxNode],
-) -> bool {
+pub fn normalize_recovery(source: &Source<'_>, nodes: &mut [SyntaxNode]) -> bool {
     if nodes.iter().any(|node| node.missing) {
         return false;
     }
@@ -167,11 +137,11 @@ fn normalize_source_authored_paragraph_end_tags(
         .iter()
         .enumerate()
         .filter(|(_, node)| {
-            (node.kind == grammar_kind("ERROR", true)
-                && node
-                    .parent
-                    .is_none_or(|parent| nodes[parent.index()].kind != grammar_kind("ERROR", true)))
-                || node.kind == grammar_kind("erroneous_end_tag", true)
+            (node.kind == grammar_symbol(Grammar::Html, "ERROR", true)
+                && node.parent.is_none_or(|parent| {
+                    nodes[parent.index()].kind != grammar_symbol(Grammar::Html, "ERROR", true)
+                }))
+                || node.kind == grammar_symbol(Grammar::Html, "erroneous_end_tag", true)
         })
         .map(|(index, _)| NodeId::new(index))
         .collect::<Vec<_>>();
@@ -205,17 +175,19 @@ fn canonicalize_recovered_paragraph_end_tag(
             .unwrap_or_default()
     };
     let name_kind = match nodes[error.index()].kind {
-        kind if kind == grammar_kind("ERROR", true) => grammar_kind("ERROR", true),
-        kind if kind == grammar_kind("erroneous_end_tag", true) => {
-            grammar_kind("erroneous_end_tag_name", true)
+        kind if kind == grammar_symbol(Grammar::Html, "ERROR", true) => {
+            grammar_symbol(Grammar::Html, "ERROR", true)
+        }
+        kind if kind == grammar_symbol(Grammar::Html, "erroneous_end_tag", true) => {
+            grammar_symbol(Grammar::Html, "erroneous_end_tag_name", true)
         }
         _ => return false,
     };
-    if nodes[open.index()].kind != grammar_kind("</", false)
+    if nodes[open.index()].kind != grammar_symbol(Grammar::Html, "</", false)
         || spelling(*open) != "</"
         || nodes[name.index()].kind != name_kind
         || !spelling(*name).eq_ignore_ascii_case("p")
-        || nodes[close.index()].kind != grammar_kind(">", false)
+        || nodes[close.index()].kind != grammar_symbol(Grammar::Html, ">", false)
         || spelling(*close) != ">"
         || nodes[open.index()].bytes.start != nodes[error.index()].bytes.start
         || nodes[open.index()].bytes.end != nodes[name.index()].bytes.start
@@ -227,10 +199,10 @@ fn canonicalize_recovered_paragraph_end_tag(
     let Some(name_leaf) = nodes[name.index()].leaf.as_mut() else {
         return false;
     };
-    nodes[error.index()].kind = grammar_kind("end_tag", true);
+    nodes[error.index()].kind = grammar_symbol(Grammar::Html, "end_tag", true);
     name_leaf.role = LeafRole::Identifier;
     name_leaf.syntax = SyntaxClass::Identifier;
-    nodes[name.index()].kind = grammar_kind("tag_name", true);
+    nodes[name.index()].kind = grammar_symbol(Grammar::Html, "tag_name", true);
     true
 }
 
@@ -306,7 +278,7 @@ fn restore_source_authored_paragraph(
 
 fn is_unclosed_paragraph(source: &Source<'_>, nodes: &[SyntaxNode], candidate: NodeId) -> bool {
     let node = &nodes[candidate.index()];
-    if node.kind != grammar_kind("element", true)
+    if node.kind != grammar_symbol(Grammar::Html, "element", true)
         || node
             .identity
             .as_ref()
@@ -318,7 +290,7 @@ fn is_unclosed_paragraph(source: &Source<'_>, nodes: &[SyntaxNode], candidate: N
     !node
         .children
         .iter()
-        .any(|child| nodes[child.index()].kind == grammar_kind("end_tag", true))
+        .any(|child| nodes[child.index()].kind == grammar_symbol(Grammar::Html, "end_tag", true))
 }
 
 fn is_layout(nodes: &[SyntaxNode], node: NodeId) -> bool {
@@ -333,7 +305,7 @@ fn is_paragraph_closing_element(
     candidate: NodeId,
 ) -> bool {
     let node = &nodes[candidate.index()];
-    node.kind == grammar_kind("element", true)
+    node.kind == grammar_symbol(Grammar::Html, "element", true)
         && node
             .identity
             .as_ref()
@@ -345,58 +317,35 @@ fn is_paragraph_closing_element(
             })
 }
 
-fn grammar_kind(kind: &str, named: bool) -> SyntaxKind {
-    let language: ::tree_sitter::Language = tree_sitter_html::LANGUAGE.into();
-    SyntaxKind::Grammar(GrammarSymbol::new(language.id_for_node_kind(kind, named)))
-}
-
-fn is_element(kind: &str) -> bool {
-    matches!(kind, "element" | "script_element" | "style_element")
-}
-
-fn is_opaque_element(node: Node<'_>, source: &str) -> bool {
+fn opaque_element<'tree>(node: Node<'tree>, source: &str) -> Option<(Option<Node<'tree>>, bool)> {
+    let name = tag_name(node);
     if matches!(node.kind(), "script_element" | "style_element") {
-        return true;
+        return Some((name, false));
     }
     if node.kind() != "element" {
-        return false;
+        return None;
     }
 
-    let name = tag_name(node);
-    let Some(name) = name else {
-        return false;
-    };
-    let name = &source[name.byte_range()];
-    OPAQUE_ELEMENTS
+    let name = name?;
+    let spelling = &source[name.byte_range()];
+    let opaque = OPAQUE_ELEMENTS
         .iter()
-        .any(|opaque| name.eq_ignore_ascii_case(opaque))
-}
-
-fn is_plaintext_element(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "element" {
-        return false;
+        .any(|opaque| spelling.eq_ignore_ascii_case(opaque));
+    if !opaque {
+        return None;
     }
-    let name = tag_name(node);
-    let Some(name) = name else {
-        return false;
-    };
-    source[name.byte_range()].eq_ignore_ascii_case("plaintext")
+    Some((Some(name), spelling.eq_ignore_ascii_case("plaintext")))
 }
 
 fn tag_name(node: Node<'_>) -> Option<Node<'_>> {
-    if matches!(node.kind(), "start_tag" | "self_closing_tag") {
-        return named_child_of_kind(node, "tag_name");
-    }
-
-    let mut cursor = node.walk();
-    let tag = node
-        .named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "start_tag" | "self_closing_tag"))?;
-    named_child_of_kind(tag, "tag_name")
-}
-
-fn named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
+    let tag = if matches!(node.kind(), "start_tag" | "self_closing_tag") {
+        node
+    } else {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| matches!(child.kind(), "start_tag" | "self_closing_tag"))?
+    };
+    let mut cursor = tag.walk();
+    tag.named_children(&mut cursor)
+        .find(|child| child.kind() == "tag_name")
 }

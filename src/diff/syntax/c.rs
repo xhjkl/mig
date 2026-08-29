@@ -1,12 +1,11 @@
-use super::lower::{GapContext, HighlightQueries, NodeAnnotation, NodeContext};
+use super::lower::{HighlightQueries, NodeAnnotation};
 use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
 use ::tree_sitter::Node;
 
-pub(super) static HIGHLIGHT_QUERIES: HighlightQueries =
+pub static HIGHLIGHT_QUERIES: HighlightQueries =
     HighlightQueries::new(&[tree_sitter_c::HIGHLIGHT_QUERY]);
 
-pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
-    let node = context.node;
+pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
     if node.kind() == "translation_unit" {
         return NodeAnnotation {
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -16,7 +15,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if node.kind() == "comment" {
-        let review = (context.parent_kind == Some("translation_unit"))
+        let review = (parent_kind == Some("translation_unit"))
             .then(|| ReviewUnit::linewise(LayoutOwnership::None));
         return NodeAnnotation {
             review,
@@ -28,8 +27,13 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if is_preprocessor(node.kind()) {
-        let review = (context.parent_kind == Some("translation_unit"))
-            .then(|| preprocessor_review(node.kind()));
+        let review = (parent_kind == Some("translation_unit")).then(|| {
+            if matches!(node.kind(), "preproc_if" | "preproc_ifdef") {
+                ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines)
+            } else {
+                ReviewUnit::wiring(LayoutOwnership::AdjacentBlankLines)
+            }
+        });
         return NodeAnnotation {
             review,
             identity: preprocessor_identity(node).map(|identity| identity.byte_range()),
@@ -40,7 +44,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 
     if is_definition(node.kind()) {
-        let review = (context.parent_kind == Some("translation_unit"))
+        let review = (parent_kind == Some("translation_unit"))
             .then(|| ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines));
         return NodeAnnotation {
             review,
@@ -51,7 +55,7 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
         };
     }
 
-    if context.parent_kind == Some("translation_unit") && node.is_named() {
+    if parent_kind == Some("translation_unit") && node.is_named() {
         return NodeAnnotation {
             review: Some(ReviewUnit::linewise(LayoutOwnership::AdjacentBlankLines)),
             sibling_matching: SiblingMatching::LocalIdentity,
@@ -88,16 +92,11 @@ pub(super) fn annotate(context: NodeContext<'_, '_>) -> NodeAnnotation {
     }
 }
 
-pub(super) fn gap_channel(context: GapContext<'_, '_>) -> ContentChannel {
-    if context.is_whitespace()
-        && matches!(
-            context.parent.kind(),
-            "char_literal" | "string_literal" | "system_lib_string"
-        )
-    {
-        return ContentChannel::Syntax;
-    }
-    context.default_channel()
+pub fn whitespace_is_syntax(parent_kind: &str) -> bool {
+    matches!(
+        parent_kind,
+        "char_literal" | "string_literal" | "system_lib_string"
+    )
 }
 
 fn is_definition(kind: &str) -> bool {
@@ -133,14 +132,6 @@ fn is_preprocessor(kind: &str) -> bool {
             | "preproc_ifdef"
             | "preproc_include"
     )
-}
-
-fn preprocessor_review(kind: &str) -> ReviewUnit {
-    if matches!(kind, "preproc_if" | "preproc_ifdef") {
-        ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines)
-    } else {
-        ReviewUnit::wiring(LayoutOwnership::AdjacentBlankLines)
-    }
 }
 
 fn preprocessor_identity<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
