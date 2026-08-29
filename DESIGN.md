@@ -1,38 +1,54 @@
 # Design
 
-Mig answers one question: which structural unit or source region changed, and
-what context makes that change understandable? It is a staged review engine,
-not a terminal renderer interpreting raw diff text.
+Mig presents source changes as focused structural hunks with the context needed
+to review them. Its staged pipeline carries each change from source text to
+typed terminal rows.
 
 ```text
 worktree, commit, or explicit file pair
                     │
                     ▼
-        bounded revisions or notices
+             bounded source text
                     │
                     ▼
-         neutral source projections
+       parse concrete syntax or exact lines
                     │
                     ▼
-          correspondence graph
+       lower to internal neutral syntax trees
                     │
                     ▼
-          review planner → FileDiff
+       correspond trees → form raw hunks
                     │
                     ▼
-         FileReview → terminal UI
+       refine priority, order, and context
+                    │
+                    ▼
+        present typed rows → terminal UI
 ```
 
-Acquisition yields bounded text pairs or retained size and line notices;
-Git-backed modes omit unsupported and non-text entries. Worktree review compares
-a pinned `HEAD` tree directly with regular files on disk, so index state affects
-review order rather than content. Commit review uses the selected commit's first
-parent, or the empty tree for a root commit, keeping every later stage strictly
-two-revision. Explicit pairs are independent of Git. Rename detection stays off
-so path-only renames remain visible as a deletion and addition.
+Every review starts with a before/after text pair: worktree mode reads pinned
+`HEAD` and disk, commit mode reads the first parent—or an empty tree for a root
+commit—and the selected commit, and file-pair mode reads the two paths directly.
+Binary or unsupported Git entries are skipped; oversized files remain visible
+as size or line-count notices.
 
-Frontends turn both revisions into parser-independent projections. The
-correspondence engine links those projections without creating display rows.
-The planner chooses rows, marks, ordering, context, elision, and coverage.
-`FileDiff` is that semantic boundary; `FileReview` adds retained notices. The UI
-only lays out, styles, clips, and navigates the already ordered review.
+`syntax::parse` binds concrete parser trees to exact sources; `syntax::lower`
+discards parser handles and produces typed, language-neutral arenas with
+provenance, parentage, identity, and delimiter ownership. If either parse is
+unsafe, both revisions become exact `Line` leaves in the same pipeline; syntax
+coloring remains presentation metadata.
+
+Correspondence pairs flat file-level units and recursively matches descendants
+only beneath paired parents; lowering rejects nested unit promotion. Unique
+payloads may cross transparent wrappers at any depth, sealed owners prevent
+tunneling, and owner-local anchors partition line fallback before changes snap
+to source-complete syntax owners.
+
+`tree_diff::RawHunks` carries owned coordinates and atomic before/after
+replacements, including source-located line endings. `refine::RefinedHunks`
+assigns priority and order, then adds breadcrumbs, halos, and elisions; opaque
+phase types prevent premature presentation.
+
+`presentation` alone slices source text into styled, typed rows. The terminal UI
+only lays out, clips, styles, and navigates those rows; tests stop at presentation
+facts and terminal rendering is checked visually.
