@@ -671,7 +671,10 @@ fn normalize_stable_revision_rows(
                 context_owners.insert(line.number);
             }
             _ => {
-                let after = row_displayed_after_source_line(row);
+                let after = match row {
+                    RowEvent::LineEnding(_) | RowEvent::Elision(_) => None,
+                    row => row_after_source_line(row),
+                };
                 current_owners.extend(after);
                 material_current_owners.extend(after);
             }
@@ -2418,11 +2421,6 @@ enum LineFact {
         before: Range<usize>,
         after: Range<usize>,
     },
-    /// A physically paired row kept atomic so its concrete terminator stays visible.
-    TerminatorEdit {
-        before: usize,
-        after: usize,
-    },
     Reflow {
         after: Range<usize>,
         unchanged_after: HashSet<usize>,
@@ -2807,7 +2805,10 @@ fn line_facts(
                 after_start = after + 1;
             }
             LineCheckpoint::TerminatorEdit { before, after } => {
-                facts.push(LineFact::TerminatorEdit { before, after });
+                facts.push(LineFact::Edit {
+                    before: before..before + 1,
+                    after: after..after + 1,
+                });
                 before_start = before + 1;
                 after_start = after + 1;
             }
@@ -2916,9 +2917,6 @@ fn append_line_fact_rows(rows: &mut Vec<RowEvent>, pair: &SyntaxPair<'_, '_>, fa
         LineFact::Edit { before, after } => {
             append_line_change_rows(rows, pair, before.clone(), after.clone());
         }
-        LineFact::TerminatorEdit { before, after } => {
-            append_line_change_rows(rows, pair, *before..*before + 1, *after..*after + 1);
-        }
         LineFact::Reflow {
             after,
             unchanged_after,
@@ -3014,13 +3012,6 @@ fn row_after_source_line(row: &RowEvent) -> Option<usize> {
         RowEvent::Elision(coverage) => coverage.after.as_ref().map(|range| range.start),
         RowEvent::Removed(_) => None,
     }
-}
-
-fn row_displayed_after_source_line(row: &RowEvent) -> Option<usize> {
-    if matches!(row, RowEvent::LineEnding(_) | RowEvent::Elision(_)) {
-        return None;
-    }
-    row_after_source_line(row)
 }
 
 fn row_before_source_line(row: &RowEvent) -> Option<usize> {

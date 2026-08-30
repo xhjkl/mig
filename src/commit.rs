@@ -1,6 +1,6 @@
 use crate::{
     input::{GitBlob, decode_text},
-    review::{FileNotice, MAX_REVISION_BYTES, ReviewEntry, review_source_pair},
+    review::{FileNotice, ReviewEntry, review_source_pair},
 };
 use anyhow::{Context, Result, bail};
 use gix::ObjectId;
@@ -8,16 +8,8 @@ use gix::bstr::{BStr, ByteSlice};
 use gix::object::tree::diff::ChangeDetached;
 use std::path::Path;
 
-/// Reviews introduced by one commit, using its first parent as the baseline.
-pub fn diff_commit(directory: &Path, commitish: &Path) -> Result<Vec<ReviewEntry>> {
-    diff_commit_with_limit(directory, commitish, MAX_REVISION_BYTES)
-}
-
-fn diff_commit_with_limit(
-    directory: &Path,
-    commitish: &Path,
-    limit: u64,
-) -> Result<Vec<ReviewEntry>> {
+/// Produce bounded reviews introduced by one commit, using its first parent as the baseline.
+pub fn diff_commit(directory: &Path, commitish: &Path, limit: u64) -> Result<Vec<ReviewEntry>> {
     let repo = gix::discover(directory);
     let repo = repo.with_context(|| {
         format!(
@@ -79,10 +71,6 @@ fn diff_commit_with_limit(
     let mut reviews = Vec::new();
 
     for change in changes {
-        let change = changed_blobs(&repo, change)?;
-        let Some(change) = change else {
-            continue;
-        };
         let review = review_change(&repo, change, limit)?;
         let Some(review) = review else {
             continue;
@@ -98,111 +86,61 @@ fn diff_commit_with_limit(
     Ok(reviews)
 }
 
-/// One UTF-8 path and the committed blobs that differ there.
-struct ChangedBlobs {
-    path: String,
-    before: Option<GitBlob>,
-    after: Option<GitBlob>,
-}
-
-fn changed_blobs(repo: &gix::Repository, change: ChangeDetached) -> Result<Option<ChangedBlobs>> {
-    match change {
+/// Normalize one detached tree change and route its bounded blobs through review.
+fn review_change(
+    repo: &gix::Repository,
+    change: ChangeDetached,
+    limit: u64,
+) -> Result<Option<ReviewEntry>> {
+    let (location, before_id, after_id) = match change {
         ChangeDetached::Rewrite { .. } => {
             bail!("Git reported a rewrite while rename detection was disabled")
         }
-        ChangeDetached::Addition { entry_mode, .. } if !entry_mode.is_blob() => Ok(None),
-        ChangeDetached::Deletion { entry_mode, .. } if !entry_mode.is_blob() => Ok(None),
+        ChangeDetached::Addition { entry_mode, .. } if !entry_mode.is_blob() => return Ok(None),
+        ChangeDetached::Deletion { entry_mode, .. } if !entry_mode.is_blob() => return Ok(None),
         ChangeDetached::Modification {
             previous_entry_mode,
             entry_mode,
             ..
-        } if !previous_entry_mode.is_blob() || !entry_mode.is_blob() => Ok(None),
+        } if !previous_entry_mode.is_blob() || !entry_mode.is_blob() => return Ok(None),
         ChangeDetached::Addition {
             location,
             entry_mode: _,
             id,
             ..
-        } => {
-            let path = decode_git_path(location.as_bstr());
-            let Some(path) = path else {
-                return Ok(None);
-            };
-            let after = inspect_blob(repo, id, &path, "current")?;
-            Ok(Some(ChangedBlobs {
-                path,
-                before: None,
-                after: Some(after),
-            }))
-        }
+        } => (location, None, Some(id)),
         ChangeDetached::Deletion {
             location,
             entry_mode: _,
             id,
             ..
-        } => {
-            let path = decode_git_path(location.as_bstr());
-            let Some(path) = path else {
-                return Ok(None);
-            };
-            let before = inspect_blob(repo, id, &path, "previous")?;
-            Ok(Some(ChangedBlobs {
-                path,
-                before: Some(before),
-                after: None,
-            }))
-        }
+        } => (location, Some(id), None),
         ChangeDetached::Modification {
             location,
             previous_entry_mode: _,
             previous_id,
             entry_mode: _,
             id,
-        } => {
-            let path = decode_git_path(location.as_bstr());
-            let Some(path) = path else {
-                return Ok(None);
-            };
-            let before = inspect_blob(repo, previous_id, &path, "previous")?;
-            let after = inspect_blob(repo, id, &path, "current")?;
-            Ok(Some(ChangedBlobs {
-                path,
-                before: Some(before),
-                after: Some(after),
-            }))
+        } => (location, Some(previous_id), Some(id)),
+    };
+    let path = decode_git_path(location.as_bstr());
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let before = match before_id {
+        None => None,
+        Some(object) => {
+            let before = inspect_blob(repo, object, &path, "previous")?;
+            Some(before)
         }
-    }
-}
-
-/// Header-only size check before either side of a pair is allocated.
-fn inspect_blob(
-    repo: &gix::Repository,
-    object: ObjectId,
-    path: &str,
-    side: &str,
-) -> Result<GitBlob> {
-    let header = repo.find_header(object);
-    let header = header.with_context(|| format!("failed to inspect the {side} blob for {path}"))?;
-    if header.kind() != gix::objs::Kind::Blob {
-        bail!("the {side} object for {path} is not a blob");
-    }
-
-    Ok(GitBlob {
-        object,
-        bytes: header.size(),
-    })
-}
-
-/// Route a bounded committed pair through the same review boundary as worktree input.
-fn review_change(
-    repo: &gix::Repository,
-    change: ChangedBlobs,
-    limit: u64,
-) -> Result<Option<ReviewEntry>> {
-    let ChangedBlobs {
-        path,
-        before,
-        after,
-    } = change;
+    };
+    let after = match after_id {
+        None => None,
+        Some(object) => {
+            let after = inspect_blob(repo, object, &path, "current")?;
+            Some(after)
+        }
+    };
     let before_bytes = before.as_ref().map(|blob| blob.bytes);
     let after_bytes = after.as_ref().map(|blob| blob.bytes);
     if before_bytes.is_some_and(|bytes| bytes > limit)
@@ -245,6 +183,25 @@ fn review_change(
     }
 
     review_source_pair(&path, before.as_deref(), after.as_deref())
+}
+
+/// Header-only size check before either side of a pair is allocated.
+fn inspect_blob(
+    repo: &gix::Repository,
+    object: ObjectId,
+    path: &str,
+    side: &str,
+) -> Result<GitBlob> {
+    let header = repo.find_header(object);
+    let header = header.with_context(|| format!("failed to inspect the {side} blob for {path}"))?;
+    if header.kind() != gix::objs::Kind::Blob {
+        bail!("the {side} object for {path} is not a blob");
+    }
+
+    Ok(GitBlob {
+        object,
+        bytes: header.size(),
+    })
 }
 
 /// UI labels are UTF-8, so an undecodable Git path is outside this review.

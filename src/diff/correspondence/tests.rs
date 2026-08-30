@@ -188,7 +188,13 @@ fn unequal_physical_gaps_do_not_invent_line_ending_pairs() {
     )
     .expect("line syntax");
 
-    assert!(physical_line_correspondence(&pair).ending_edits.is_empty());
+    let physical = physical_line_correspondence_in(
+        &pair,
+        0..pair.before.source.lines().len(),
+        0..pair.after.source.lines().len(),
+    );
+
+    assert!(physical.ending_edits.is_empty());
 }
 
 fn pairs(matches: Vec<OrderedMatch>) -> Vec<(usize, usize)> {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::review::MAX_REVISION_BYTES;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -51,7 +52,7 @@ fn real_git_scan_covers_the_net_recursive_worktree() {
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "--quiet", "-m", "baseline"]);
 
-    let clean = diff_directory(repository.path()).expect("clean scan");
+    let clean = diff_directory(repository.path(), MAX_REVISION_BYTES).expect("clean scan");
     assert!(clean.is_empty());
 
     write(
@@ -109,7 +110,7 @@ fn real_git_scan_covers_the_net_recursive_worktree() {
             .expect("create untracked symlink");
     }
 
-    let diffs = diff_directory(repository.path()).expect("changed scan");
+    let diffs = diff_directory(repository.path(), MAX_REVISION_BYTES).expect("changed scan");
     let paths = diffs.iter().map(ReviewEntry::path).collect::<Vec<_>>();
     assert_eq!(
         paths,
@@ -133,7 +134,8 @@ fn real_git_scan_covers_the_net_recursive_worktree() {
     assert!(diffs[..7].iter().all(|review| !review.is_generated()));
     assert!(diffs[7..].iter().all(ReviewEntry::is_generated));
 
-    let nested = diff_directory(&repository.path().join("nested")).expect("nested scan");
+    let nested =
+        diff_directory(&repository.path().join("nested"), MAX_REVISION_BYTES).expect("nested scan");
     let nested_paths = nested.iter().map(ReviewEntry::path).collect::<Vec<_>>();
     assert_eq!(
         nested_paths,
@@ -172,7 +174,7 @@ fn review_compares_pinned_head_directly_to_the_worktree() {
     write(repository.path(), "cancelled.txt", "head\n");
     write(repository.path(), "current.txt", "worktree\n");
 
-    let reviews = diff_directory(repository.path()).expect("changed scan");
+    let reviews = diff_directory(repository.path(), MAX_REVISION_BYTES).expect("changed scan");
 
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].path(), "current.txt");
@@ -228,7 +230,8 @@ fn unborn_and_nested_scans_use_standard_git_excludes() {
     write(repository.path(), "nested/global-ignored.txt", "ignored\n");
     write(repository.path(), "root-ignored/child.txt", "ignored\n");
 
-    let nested = diff_directory(&repository.path().join("nested")).expect("nested scan");
+    let nested =
+        diff_directory(&repository.path().join("nested"), MAX_REVISION_BYTES).expect("nested scan");
     let paths = nested.iter().map(ReviewEntry::path).collect::<Vec<_>>();
     assert_eq!(
         paths,
@@ -246,7 +249,7 @@ fn unborn_and_nested_scans_use_standard_git_excludes() {
     write(unborn.path(), "untracked.txt", "untracked\n");
     write(unborn.path(), "ignored.txt", "ignored\n");
 
-    let reviews = diff_directory(unborn.path()).expect("unborn scan");
+    let reviews = diff_directory(unborn.path(), MAX_REVISION_BYTES).expect("unborn scan");
     let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
     assert_eq!(paths, vec![".gitignore", "staged.txt", "untracked.txt"]);
 }
@@ -259,7 +262,7 @@ fn oversized_worktree_revision_stays_in_the_review_without_decoding_head() {
     git(repository.path(), &["commit", "--quiet", "-m", "baseline"]);
     write(repository.path(), "large.txt", "12345");
 
-    let reviews = diff_directory_with_limit(repository.path(), 4).expect("changed scan");
+    let reviews = diff_directory(repository.path(), 4).expect("changed scan");
 
     assert_eq!(reviews.len(), 1);
     assert!(matches!(
@@ -281,7 +284,7 @@ fn oversized_head_revision_stays_in_the_review_without_reading_either_body() {
     git(repository.path(), &["commit", "--quiet", "-m", "baseline"]);
     write_bytes(repository.path(), "large.txt", &[0xff]);
 
-    let reviews = diff_directory_with_limit(repository.path(), 4).expect("changed scan");
+    let reviews = diff_directory(repository.path(), 4).expect("changed scan");
 
     assert!(matches!(
         reviews.as_slice(),
@@ -302,7 +305,7 @@ fn deleted_oversized_head_revision_retains_an_absent_current_side() {
     git(repository.path(), &["commit", "--quiet", "-m", "baseline"]);
     fs::remove_file(repository.path().join("deleted.txt")).expect("delete oversized input");
 
-    let reviews = diff_directory_with_limit(repository.path(), 4).expect("changed scan");
+    let reviews = diff_directory(repository.path(), 4).expect("changed scan");
 
     assert!(matches!(
         reviews.as_slice(),
@@ -320,7 +323,7 @@ fn added_oversized_revision_retains_an_absent_head_side() {
     let repository = initialized_repository();
     write(repository.path(), "added.txt", "12345");
 
-    let reviews = diff_directory_with_limit(repository.path(), 4).expect("changed scan");
+    let reviews = diff_directory(repository.path(), 4).expect("changed scan");
 
     assert!(matches!(
         reviews.as_slice(),
@@ -341,7 +344,7 @@ fn exact_limit_is_still_diffed() {
     git(repository.path(), &["commit", "--quiet", "-m", "baseline"]);
     write(repository.path(), "exact.txt", "5678");
 
-    let reviews = diff_directory_with_limit(repository.path(), 4).expect("changed scan");
+    let reviews = diff_directory(repository.path(), 4).expect("changed scan");
 
     assert!(matches!(
         reviews.as_slice(),
@@ -357,7 +360,7 @@ fn rename_is_reviewed_as_one_addition_and_one_deletion() {
     git(repository.path(), &["commit", "--quiet", "-m", "baseline"]);
     git(repository.path(), &["mv", "old.rs", "new.rs"]);
 
-    let reviews = diff_directory(repository.path()).expect("renamed scan");
+    let reviews = diff_directory(repository.path(), MAX_REVISION_BYTES).expect("renamed scan");
     let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["new.rs", "old.rs"]);
@@ -372,7 +375,7 @@ fn sha256_repository_uses_the_same_status_and_object_path() {
     write(repository.path(), "tracked.txt", "after\n");
     write(repository.path(), "untracked.txt", "new\n");
 
-    let reviews = diff_directory(repository.path()).expect("SHA-256 scan");
+    let reviews = diff_directory(repository.path(), MAX_REVISION_BYTES).expect("SHA-256 scan");
     let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["tracked.txt", "untracked.txt"]);
@@ -391,7 +394,7 @@ fn baseline_symlink_is_not_reinterpreted_as_text() {
     fs::remove_file(&path).expect("remove tracked symlink");
     fs::write(&path, "regular replacement\n").expect("replace symlink with regular file");
 
-    let reviews = diff_directory(repository.path()).expect("type-change scan");
+    let reviews = diff_directory(repository.path(), MAX_REVISION_BYTES).expect("type-change scan");
 
     assert!(reviews.is_empty());
 }

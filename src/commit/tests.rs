@@ -1,4 +1,5 @@
 use super::*;
+use crate::review::MAX_REVISION_BYTES;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
@@ -53,8 +54,12 @@ fn commit_review_uses_pinned_trees_and_keeps_generated_files_last() {
     );
     fs::create_dir(repository.path().join("nested")).expect("create nested invocation path");
 
-    let reviews =
-        diff_commit(&repository.path().join("nested"), Path::new("HEAD~1")).expect("review commit");
+    let reviews = diff_commit(
+        &repository.path().join("nested"),
+        Path::new("HEAD~1"),
+        MAX_REVISION_BYTES,
+    )
+    .expect("review commit");
     let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
 
     assert_eq!(
@@ -78,8 +83,12 @@ fn commit_review_uses_pinned_trees_and_keeps_generated_files_last() {
     assert!(!rendered.contains("later"));
     assert!(!rendered.contains("worktree"));
 
-    let regex_reviews = diff_commit(&repository.path().join("nested"), Path::new(":/ch.nge"))
-        .expect("review commit selected by message regex");
+    let regex_reviews = diff_commit(
+        &repository.path().join("nested"),
+        Path::new(":/ch.nge"),
+        MAX_REVISION_BYTES,
+    )
+    .expect("review commit selected by message regex");
     let regex_paths = regex_reviews
         .iter()
         .map(ReviewEntry::path)
@@ -98,8 +107,12 @@ fn root_commit_and_annotated_tag_are_reviewed_against_the_empty_tree() {
         &["tag", "-a", "root-release", "-m", "root release"],
     );
 
-    let reviews =
-        diff_commit(repository.path(), Path::new("root-release")).expect("review root tag");
+    let reviews = diff_commit(
+        repository.path(),
+        Path::new("root-release"),
+        MAX_REVISION_BYTES,
+    )
+    .expect("review root tag");
 
     assert!(matches!(
         reviews.as_slice(),
@@ -129,7 +142,8 @@ fn merge_commit_is_compared_with_its_first_parent() {
         &["merge", "--quiet", "--no-ff", "side", "-m", "merge"],
     );
 
-    let reviews = diff_commit(repository.path(), Path::new("HEAD")).expect("review merge");
+    let reviews = diff_commit(repository.path(), Path::new("HEAD"), MAX_REVISION_BYTES)
+        .expect("review merge");
     let paths = reviews.iter().map(ReviewEntry::path).collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["side.txt"]);
@@ -145,8 +159,8 @@ fn oversized_commit_blob_stays_visible_without_loading_its_pair() {
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "--quiet", "-m", "large"]);
 
-    let reviews = diff_commit_with_limit(repository.path(), Path::new("HEAD"), 4)
-        .expect("review oversized commit");
+    let reviews =
+        diff_commit(repository.path(), Path::new("HEAD"), 4).expect("review oversized commit");
 
     assert!(matches!(
         reviews.as_slice(),
@@ -167,8 +181,12 @@ fn non_commit_revision_is_rejected_as_a_commitish() {
         &["commit", "--quiet", "--allow-empty", "-m", "empty"],
     );
 
-    let error = diff_commit(repository.path(), Path::new("HEAD^{tree}"))
-        .expect_err("tree must not be accepted as a commit");
+    let error = diff_commit(
+        repository.path(),
+        Path::new("HEAD^{tree}"),
+        MAX_REVISION_BYTES,
+    )
+    .expect_err("tree must not be accepted as a commit");
 
     assert!(error.to_string().contains("does not resolve to a commit"));
 }
@@ -194,8 +212,8 @@ fn sha256_root_commit_uses_the_repository_empty_tree() {
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "--quiet", "-m", "root"]);
 
-    let reviews =
-        diff_commit(repository.path(), Path::new("HEAD")).expect("review SHA-256 root commit");
+    let reviews = diff_commit(repository.path(), Path::new("HEAD"), MAX_REVISION_BYTES)
+        .expect("review SHA-256 root commit");
 
     assert!(matches!(
         reviews.as_slice(),

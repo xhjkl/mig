@@ -339,11 +339,6 @@ impl<'source> SyntaxTree<'source> {
         self.source.slice(identity)
     }
 
-    /// Concrete leaves overlapping one byte range, in source order.
-    pub fn leaves_in(&self, bytes: Range<usize>) -> impl Iterator<Item = &SyntaxNode> {
-        self.leaf_ids_in(bytes).map(|id| self.node(id))
-    }
-
     /// Concrete leaf handles overlapping one byte range, in source order.
     pub fn leaf_ids_in(&self, bytes: Range<usize>) -> impl Iterator<Item = NodeId> + '_ {
         let start = self

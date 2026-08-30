@@ -409,7 +409,11 @@ pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
             ..PhysicalLineFacts::default()
         }
     } else {
-        physical_line_correspondence(pair)
+        physical_line_correspondence_in(
+            pair,
+            0..pair.before.source.lines().len(),
+            0..pair.after.source.lines().len(),
+        )
     };
 
     let root_scope = ScopeLink {
@@ -794,15 +798,6 @@ fn nearest_scope_owner(tree: &SyntaxTree<'_>, mut candidate: NodeId) -> Option<N
     }
 }
 
-/// Align physical content once while retaining concrete terminator differences as source facts.
-fn physical_line_correspondence(pair: &SyntaxPair<'_, '_>) -> PhysicalLineFacts {
-    physical_line_correspondence_in(
-        pair,
-        0..pair.before.source.lines().len(),
-        0..pair.after.source.lines().len(),
-    )
-}
-
 /// Align physical content inside one already-corresponding semantic scope.
 fn physical_line_correspondence_in(
     pair: &SyntaxPair<'_, '_>,
@@ -1169,7 +1164,9 @@ fn local_line_fallbacks(
     }
     claim_paired_adjacent_layout(pair, graph, &mut before_claims, &mut after_claims);
 
-    let checkpoints = physical_line_checkpoints(graph);
+    let mut checkpoints = graph.line_links.clone();
+    checkpoints.extend(&graph.line_ending_edits);
+    checkpoints.sort_unstable_by_key(|link| (link.before, link.after));
     let mut before_start = 0;
     let mut after_start = 0;
     for checkpoint in checkpoints.into_iter().chain(std::iter::once(LineLink {
@@ -1454,13 +1451,6 @@ fn claim_equal_layout_run(
         before_claims[before_index] = before_claims[before_index].saturating_add(1);
         after_claims[after_index] = after_claims[after_index].saturating_add(1);
     }
-}
-
-fn physical_line_checkpoints(graph: &Correspondence) -> Vec<LineLink> {
-    let mut checkpoints = graph.line_links.clone();
-    checkpoints.extend(&graph.line_ending_edits);
-    checkpoints.sort_unstable_by_key(|link| (link.before, link.after));
-    checkpoints
 }
 
 fn unclaimed_gap_fallbacks(
@@ -2833,30 +2823,12 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             .into_iter()
             .filter(|id| self.graph.after_leaf[id.index()].is_none())
             .collect::<Vec<_>>();
-        let before_exact = before_leaves
-            .iter()
-            .map(|id| ExactLeafKey {
-                slot: pair.before.node(*id).slot,
-                fingerprint: self.before_fingerprints[id.index()].full,
-            })
-            .collect::<Vec<_>>();
-        let after_exact = after_leaves
-            .iter()
-            .map(|id| ExactLeafKey {
-                slot: pair.after.node(*id).slot,
-                fingerprint: self.after_fingerprints[id.index()].full,
-            })
-            .collect::<Vec<_>>();
         let exact_leaves = exact_leaf_matches(
             &context,
-            LeafCandidates {
-                nodes: &before_leaves,
-                keys: &before_exact,
-            },
-            LeafCandidates {
-                nodes: &after_leaves,
-                keys: &after_exact,
-            },
+            &before_leaves,
+            &after_leaves,
+            self.before_fingerprints,
+            self.after_fingerprints,
         );
         let placements = match_placements(&exact_leaves);
         for (edge, placement) in exact_leaves.into_iter().zip(placements) {
@@ -2979,11 +2951,6 @@ impl CorrespondenceBuilder<'_, '_, '_> {
     }
 }
 
-struct LeafCandidates<'input> {
-    nodes: &'input [NodeId],
-    keys: &'input [ExactLeafKey],
-}
-
 /// Exact composite pairs must agree with the recursive context walk.
 fn exact_composite_matches(
     context: &UnitContext<'_, '_, '_>,
@@ -3026,33 +2993,49 @@ fn exact_composite_matches(
 
 fn exact_leaf_matches(
     context: &UnitContext<'_, '_, '_>,
-    before: LeafCandidates<'_>,
-    after: LeafCandidates<'_>,
+    before: &[NodeId],
+    after: &[NodeId],
+    before_fingerprints: &[NodeFingerprints],
+    after_fingerprints: &[NodeFingerprints],
 ) -> Vec<OrderedMatch> {
-    let mut before_match = vec![None; before.nodes.len()];
-    let mut after_match = vec![None; after.nodes.len()];
+    let mut before_match = vec![None; before.len()];
+    let mut after_match = vec![None; after.len()];
     let before_keys = before
-        .nodes
         .iter()
         .copied()
-        .zip(before.keys.iter().copied())
+        .map(|id| {
+            (
+                id,
+                ExactLeafKey {
+                    slot: context.pair.before.node(id).slot,
+                    fingerprint: before_fingerprints[id.index()].full,
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
     let after_keys = after
-        .nodes
         .iter()
         .copied()
-        .zip(after.keys.iter().copied())
+        .map(|id| {
+            (
+                id,
+                ExactLeafKey {
+                    slot: context.pair.after.node(id).slot,
+                    fingerprint: after_fingerprints[id.index()].full,
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
 
     // Same-parent occurrences win before the remaining exact payloads pair globally.
     let mut contextual_after = HashMap::<ContextualLeafKey, VecDeque<usize>>::new();
-    for (after_index, after_id) in after.nodes.iter().copied().enumerate() {
+    for (after_index, after_id) in after.iter().copied().enumerate() {
         let Some(parent) = context.after_parent(after_id) else {
             continue;
         };
         contextual_after
             .entry(ContextualLeafKey {
-                leaf: after.keys[after_index],
+                leaf: after_keys[&after_id],
                 parent,
                 trailing_delimiter_owner: context
                     .after_trailing_delimiter_owner(after_id, &after_keys),
@@ -3062,13 +3045,8 @@ fn exact_leaf_matches(
             .or_default()
             .push_back(after_index);
     }
-    for (before_index, (before_id, before_key)) in before
-        .nodes
-        .iter()
-        .copied()
-        .zip(before.keys.iter().copied())
-        .enumerate()
-    {
+    for (before_index, before_id) in before.iter().copied().enumerate() {
+        let before_key = before_keys[&before_id];
         let parent = context.desired_after_parent(before_id);
         let after_index = parent.and_then(|parent| {
             contextual_after
@@ -3094,24 +3072,24 @@ fn exact_leaf_matches(
         after_match[after_index] = Some(before_index);
     }
 
-    let wrapped_before = (0..before.nodes.len())
+    let wrapped_before = (0..before.len())
         .filter(|index| {
             before_match[*index].is_none()
                 && context
                     .pair
                     .before
-                    .node(before.nodes[*index])
+                    .node(before[*index])
                     .decoration_owner
                     .is_none()
         })
         .collect::<Vec<_>>();
-    let wrapped_after = (0..after.nodes.len())
+    let wrapped_after = (0..after.len())
         .filter(|index| {
             after_match[*index].is_none()
                 && context
                     .pair
                     .after
-                    .node(after.nodes[*index])
+                    .node(after[*index])
                     .decoration_owner
                     .is_none()
         })
@@ -3119,14 +3097,14 @@ fn exact_leaf_matches(
     let mut wrapped_before_groups = HashMap::<FingerprintId, Vec<usize>>::new();
     for before_index in wrapped_before {
         wrapped_before_groups
-            .entry(before.keys[before_index].fingerprint)
+            .entry(before_keys[&before[before_index]].fingerprint)
             .or_default()
             .push(before_index);
     }
     let mut wrapped_after_groups = HashMap::<FingerprintId, Vec<usize>>::new();
     for after_index in wrapped_after {
         wrapped_after_groups
-            .entry(after.keys[after_index].fingerprint)
+            .entry(after_keys[&after[after_index]].fingerprint)
             .or_default()
             .push(after_index);
     }
@@ -3139,8 +3117,8 @@ fn exact_leaf_matches(
                 let reparenting = unique_containment_reparenting(
                     context.pair,
                     context.parents,
-                    before.nodes[before_group[left]],
-                    after.nodes[after_group[right]],
+                    before[before_group[left]],
+                    after[after_group[right]],
                 );
                 u64::from(reparenting.is_some())
             })
@@ -3152,24 +3130,24 @@ fn exact_leaf_matches(
         }
     }
 
-    let remaining_before = (0..before.nodes.len())
+    let remaining_before = (0..before.len())
         .filter(|index| {
             before_match[*index].is_none()
                 && context
                     .pair
                     .before
-                    .node(before.nodes[*index])
+                    .node(before[*index])
                     .decoration_owner
                     .is_none()
         })
         .collect::<Vec<_>>();
-    let remaining_after = (0..after.nodes.len())
+    let remaining_after = (0..after.len())
         .filter(|index| {
             after_match[*index].is_none()
                 && context
                     .pair
                     .after
-                    .node(after.nodes[*index])
+                    .node(after[*index])
                     .decoration_owner
                     .is_none()
         })
@@ -3178,10 +3156,10 @@ fn exact_leaf_matches(
         .iter()
         .map(|index| {
             (
-                context.desired_after_parent(before.nodes[*index]),
-                before.keys[*index],
+                context.desired_after_parent(before[*index]),
+                before_keys[&before[*index]],
                 context
-                    .desired_after_trailing_delimiter_owner(before.nodes[*index], &before_keys)
+                    .desired_after_trailing_delimiter_owner(before[*index], &before_keys)
                     .for_global_match(),
             )
         })
@@ -3190,10 +3168,10 @@ fn exact_leaf_matches(
         .iter()
         .map(|index| {
             (
-                context.after_parent(after.nodes[*index]),
-                after.keys[*index],
+                context.after_parent(after[*index]),
+                after_keys[&after[*index]],
                 context
-                    .after_trailing_delimiter_owner(after.nodes[*index], &after_keys)
+                    .after_trailing_delimiter_owner(after[*index], &after_keys)
                     .for_global_match(),
             )
         })

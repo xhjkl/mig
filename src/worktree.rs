@@ -1,6 +1,6 @@
 use crate::{
     input::{BoundedBytes, GitBlob, OpenFile, decode_text},
-    review::{FileNotice, MAX_REVISION_BYTES, ReviewEntry, review_source_pair},
+    review::{FileNotice, ReviewEntry, review_source_pair},
 };
 use anyhow::{Context, Result};
 use gix::ObjectId;
@@ -25,12 +25,8 @@ enum GitChange {
     Dirty,
 }
 
-/// Presented text reviews with dirty files most buoyant and generated files least.
-pub fn diff_directory(directory: &Path) -> Result<Vec<ReviewEntry>> {
-    diff_directory_with_limit(directory, MAX_REVISION_BYTES)
-}
-
-fn diff_directory_with_limit(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> {
+/// Present bounded text reviews with dirty files most buoyant and generated files least.
+pub fn diff_directory(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> {
     let repo = gix::discover(directory).with_context(|| {
         format!(
             "failed to discover a Git repository from {}",

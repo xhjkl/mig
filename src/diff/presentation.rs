@@ -97,7 +97,10 @@ fn source_row(tree: &SyntaxTree<'_>, line: &SelectedLine, mark: DiffMark) -> Sou
         .line(line.number)
         .expect("formed source line exists");
     let bytes = source.content_bytes.clone();
-    let leaves = tree.leaves_in(bytes.clone()).collect::<Vec<_>>();
+    let leaves = tree
+        .leaf_ids_in(bytes.clone())
+        .map(|id| tree.node(id))
+        .collect::<Vec<_>>();
     let mut boundaries = vec![bytes.start, bytes.end];
     for leaf in &leaves {
         boundaries.push(leaf.bytes.start.max(bytes.start));

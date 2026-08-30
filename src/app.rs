@@ -36,12 +36,12 @@ pub fn run() -> Result<()> {
         (None, None) => {
             let directory = env::current_dir();
             let directory = directory.context("failed to locate the current directory")?;
-            worktree::diff_directory(&directory)?
+            worktree::diff_directory(&directory, MAX_REVISION_BYTES)?
         }
         (Some(commitish), None) => {
             let directory = env::current_dir();
             let directory = directory.context("failed to locate the current directory")?;
-            commit::diff_commit(&directory, &commitish)?
+            commit::diff_commit(&directory, &commitish, MAX_REVISION_BYTES)?
         }
         (Some(before), Some(after)) => {
             let review = load_file_pair(&before, &after, cli.path.as_deref(), MAX_REVISION_BYTES)?;

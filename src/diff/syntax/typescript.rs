@@ -70,7 +70,7 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
         let identity = declaration_identity(node).map(|name| name.byte_range());
         let review = (parent_kind == Some("program"))
             .then(|| ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines));
-        let owner = is_declaration_owner(node.kind());
+        let owner = !matches!(node.kind(), "ambient_declaration" | "export_statement");
         return NodeAnnotation {
             review,
             identity,
@@ -197,10 +197,6 @@ fn is_declaration(kind: &str) -> bool {
             | "using_declaration"
             | "variable_declaration"
     )
-}
-
-fn is_declaration_owner(kind: &str) -> bool {
-    is_declaration(kind) && !matches!(kind, "ambient_declaration" | "export_statement")
 }
 
 fn is_member(kind: &str) -> bool {
