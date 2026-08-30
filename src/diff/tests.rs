@@ -436,6 +436,64 @@ fn line_insertions_and_deletions_keep_their_source_numbers() {
 }
 
 #[test]
+fn nested_transfer_keeps_current_rows_in_source_order() {
+    let before = concat!(
+        "const Card = () => (\n",
+        "\t<>\n",
+        "\t\t<div>\n",
+        "\t\t\t<File />\n",
+        "\t\t\t<Keep>\n",
+        "\t\t\t\t<One />\n",
+        "\t\t\t\t<Two />\n",
+        "\t\t\t\t<Three />\n",
+        "\t\t\t\t<Four />\n",
+        "\t\t\t\t<Five />\n",
+        "\t\t\t\t<Six />\n",
+        "\t\t\t\t<Seven />\n",
+        "\t\t\t</Keep>\n",
+        "\t\t</div>\n",
+        "\t\t<Portrait />\n",
+        "\t\t<Composer />\n",
+        "\t\t<Moved />\n",
+        "\t</>\n",
+        ")\n",
+    );
+    let after = concat!(
+        "const Card = () => (\n",
+        "\t<>\n",
+        "\t\t<Portrait />\n",
+        "\t\t<div>\n",
+        "\t\t\t<Composer />\n",
+        "\t\t\t<File />\n",
+        "\t\t\t<Keep>\n",
+        "\t\t\t\t<One />\n",
+        "\t\t\t\t<Two />\n",
+        "\t\t\t\t<Three />\n",
+        "\t\t\t\t<Four />\n",
+        "\t\t\t\t<Five />\n",
+        "\t\t\t\t<Six />\n",
+        "\t\t\t\t<Seven />\n",
+        "\t\t\t</Keep>\n",
+        "\t\t\t<Moved />\n",
+        "\t\t</div>\n",
+        "\t</>\n",
+        ")\n",
+    );
+
+    let diff = diff_file("alpha.tsx", before, after).expect("TSX must diff");
+
+    assert_eq!(
+        marked_line_occurrences(&diff, "<Moved />", DiffMark::Removed),
+        1
+    );
+    assert_eq!(
+        marked_line_occurrences(&diff, "<Moved />", DiffMark::Added),
+        1
+    );
+    assert_source_space_invariants("alpha.tsx", &diff);
+}
+
+#[test]
 fn recovered_html_wrapper_preserves_its_payload() {
     let before = "<p>\n \t<img />\n</p>\n";
     let after = concat!(

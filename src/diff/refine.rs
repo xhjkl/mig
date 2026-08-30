@@ -67,13 +67,7 @@ pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<Refine
             complete_context_halos(pair, &source_layout, hunk);
             complete_display_gaps(pair, &source_layout, hunk);
         }
-        hunk.groups.sort_by_key(|group| {
-            group
-                .iter()
-                .map(|fact| (fact.script_order, fact.order))
-                .min()
-                .expect("display group owns a source fact")
-        });
+        hunk.groups.sort_by_key(|group| display_group_order(group));
     }
     deduplicate_context_rows(&mut hunks);
 
@@ -252,6 +246,21 @@ fn minimum_script_order<'fact>(
         .map(|fact| fact.script_order)
         .min()
         .unwrap_or(fallback)
+}
+
+/// Order one display group by semantic position and current-world geometry.
+/// Before-only facts anchor the group only when it has no current-side coverage.
+fn display_group_order(group: &[SourceFact]) -> (usize, SourceOrder) {
+    let first = group.first().expect("display group owns a source fact");
+    let script_order = minimum_script_order(group, first.script_order);
+    let order = group
+        .iter()
+        .filter(|fact| fact.coverage.after.is_some())
+        .map(|fact| fact.order)
+        .min()
+        .or_else(|| group.iter().map(|fact| fact.order).min())
+        .expect("display group owns a source fact");
+    (script_order, order)
 }
 
 fn context_fact(line: super::tree_diff::SelectedLine, source_layout: &SourceLayout) -> SourceFact {
