@@ -7,8 +7,7 @@ use super::context::{
 };
 use super::syntax::{NodeId, SyntaxPair, SyntaxTree};
 use super::tree_diff::{
-    ChangeNature, RawSourceDiff, SourceChange, SourceFact, SourceHunk, SourceLayout, SourceOrder,
-    select_line,
+    ChangeNature, RawSourceDiff, ReviewGeometry, SourceChange, SourceFact, SourceHunk, SourceOrder,
 };
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -46,15 +45,15 @@ impl ReviewCluster {
 pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<RefinedHunk> {
     let RawSourceDiff {
         hunks,
-        source_layout,
+        review_geometry,
     } = raw;
     let hunks = hunks
         .into_iter()
-        .flat_map(|hunk| split_source_hunk(pair, &source_layout, hunk))
+        .flat_map(|hunk| split_source_hunk(pair, &review_geometry, hunk))
         .collect::<Vec<_>>();
     let mut hunks = hunks
         .into_iter()
-        .map(|hunk| place_hunk(hunk, &source_layout))
+        .map(|hunk| place_hunk(hunk, &review_geometry))
         .collect::<Vec<_>>();
 
     // Geometry is source-ordered so only neighboring context halos can merge.
@@ -64,8 +63,8 @@ pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<Refine
     hunks.sort_by_key(review_order);
     for hunk in &mut hunks {
         if !hunk.halo_lines.is_empty() {
-            complete_context_halos(pair, &source_layout, hunk);
-            complete_display_gaps(pair, &source_layout, hunk);
+            complete_context_halos(pair, &review_geometry, hunk);
+            complete_display_gaps(pair, &review_geometry, hunk);
         }
         hunk.groups.sort_by_key(|group| display_group_order(group));
     }
@@ -89,7 +88,7 @@ pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<Refine
 /// Split one complete source hunk into local review regions.
 fn split_source_hunk(
     pair: &SyntaxPair<'_, '_>,
-    source_layout: &SourceLayout,
+    geometry: &ReviewGeometry,
     hunk: SourceHunk,
 ) -> Vec<SourceHunk> {
     let signals = hunk
@@ -124,13 +123,13 @@ fn split_source_hunk(
 
     clusters
         .into_iter()
-        .map(|cluster| select_review_region(pair, source_layout, &hunk, &context_rows, cluster))
+        .map(|cluster| select_review_region(pair, geometry, &hunk, &context_rows, cluster))
         .collect()
 }
 
 fn select_review_region(
     pair: &SyntaxPair<'_, '_>,
-    source_layout: &SourceLayout,
+    geometry: &ReviewGeometry,
     hunk: &SourceHunk,
     context_rows: &HashMap<usize, usize>,
     cluster: Range<usize>,
@@ -146,7 +145,7 @@ fn select_review_region(
         hunk.facts[cluster]
             .iter()
             .flat_map(|fact| fact.coverage.before.clone().into_iter().flatten())
-            .filter_map(|line| source_layout.current_anchor(line)),
+            .filter_map(|line| geometry.current_anchor(line)),
     );
     let mut hierarchy = hunk
         .context_root
@@ -181,12 +180,8 @@ fn select_review_region(
     let mut hierarchy = hierarchy.into_iter().collect::<Vec<_>>();
     hierarchy.sort_unstable();
     for number in hierarchy {
-        let source = pair
-            .after
-            .source
-            .line(number)
-            .expect("hierarchy line belongs to the current unit");
-        facts.push(context_fact(select_line(source, &[]), source_layout));
+        debug_assert!(pair.after.source.line(number).is_some());
+        facts.push(context_fact(number, geometry));
     }
 
     let order = facts
@@ -263,18 +258,18 @@ fn display_group_order(group: &[SourceFact]) -> (usize, SourceOrder) {
     (script_order, order)
 }
 
-fn context_fact(line: super::tree_diff::SelectedLine, source_layout: &SourceLayout) -> SourceFact {
+fn context_fact(line: usize, geometry: &ReviewGeometry) -> SourceFact {
     let mut coverage = LineCoverage {
         before: None,
-        after: Some(line.number..line.number + 1),
+        after: Some(line..line + 1),
     };
-    if let Some(before) = source_layout.aligned_before_line(line.number) {
+    if let Some(before) = geometry.aligned_before_line(line) {
         coverage.before = Some(before..before + 1);
     }
-    let order = SourceOrder::current(line.number);
-    let script_order = source_layout.script_order(line.number);
+    let order = SourceOrder::current(line);
+    let script_order = geometry.script_order(line);
     SourceFact {
-        change: SourceChange::Current(line),
+        change: SourceChange::Context(line),
         coverage,
         order,
         script_order,
@@ -343,11 +338,11 @@ fn structural_context_lines(
 }
 
 /// Resolve one unranked hunk into current-world review geometry.
-fn place_hunk(hunk: SourceHunk, source_layout: &SourceLayout) -> ReviewCluster {
+fn place_hunk(hunk: SourceHunk, geometry: &ReviewGeometry) -> ReviewCluster {
     let (before_lines, after_lines) = signal_lines(&hunk.facts);
     let mapped_before = before_lines
         .iter()
-        .filter_map(|line| source_layout.current_anchor(*line))
+        .filter_map(|line| geometry.current_anchor(*line))
         .collect::<Vec<_>>();
     let focus = if let Some(line) = hunk.context_anchor {
         line..line + 1
@@ -432,6 +427,23 @@ fn merge_window(focus: Range<usize>, nature: ChangeNature) -> Range<usize> {
 
 /// Give each uninterrupted current-world source occurrence one final display owner.
 fn deduplicate_context_rows(hunks: &mut Vec<ReviewCluster>) {
+    let material = hunks
+        .iter()
+        .flat_map(|hunk| &hunk.groups)
+        .flatten()
+        .filter(|fact| fact.change.has_signal())
+        .flat_map(|fact| fact.change.displayed_after())
+        .collect::<HashSet<_>>();
+    for hunk in hunks.iter_mut() {
+        for group in &mut hunk.groups {
+            group.retain(|fact| {
+                fact.change
+                    .context_line()
+                    .is_none_or(|line| !material.contains(&line))
+            });
+        }
+    }
+
     let mut visible = HashSet::new();
     for hunk in hunks.iter_mut() {
         for group in &mut hunk.groups {
@@ -472,7 +484,7 @@ fn claim_visible_context(fact: &SourceFact, visible: &mut HashSet<usize>) -> boo
 /// Complete each signal's three-line context halo against the whole current file.
 fn complete_context_halos(
     pair: &SyntaxPair<'_, '_>,
-    source_layout: &SourceLayout,
+    geometry: &ReviewGeometry,
     hunk: &mut ReviewCluster,
 ) {
     let line_count = pair.after.source.lines().len();
@@ -497,13 +509,8 @@ fn complete_context_halos(
             if !shown.insert(number) {
                 continue;
             }
-            let line = pair
-                .after
-                .source
-                .line(number)
-                .expect("selected current context line exists");
-            hunk.groups
-                .push(vec![context_fact(select_line(line, &[]), source_layout)]);
+            debug_assert!(pair.after.source.line(number).is_some());
+            hunk.groups.push(vec![context_fact(number, geometry)]);
         }
     }
 }
@@ -511,7 +518,7 @@ fn complete_context_halos(
 /// Fill or explicitly fold gaps introduced by sparse hierarchy context.
 fn complete_display_gaps(
     pair: &SyntaxPair<'_, '_>,
-    source_layout: &SourceLayout,
+    geometry: &ReviewGeometry,
     hunk: &mut ReviewCluster,
 ) {
     let mut displayed = hunk
@@ -524,7 +531,7 @@ fn complete_display_gaps(
     displayed.dedup();
     let before_displayed = displayed
         .iter()
-        .filter_map(|line| source_layout.aligned_before_line(*line))
+        .filter_map(|line| geometry.aligned_before_line(*line))
         .collect::<Vec<_>>();
     trim_elisions_behind_context(&mut hunk.groups, &before_displayed, &displayed);
     let elisions = hunk
@@ -549,13 +556,8 @@ fn complete_display_gaps(
         }
         if omitted.len() == 1 {
             let number = omitted.start;
-            let source = pair
-                .after
-                .source
-                .line(number)
-                .expect("one omitted current context line exists");
-            hunk.groups
-                .push(vec![context_fact(select_line(source, &[]), source_layout)]);
+            debug_assert!(pair.after.source.line(number).is_some());
+            hunk.groups.push(vec![context_fact(number, geometry)]);
             continue;
         }
         let coverage = LineCoverage {

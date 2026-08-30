@@ -4,9 +4,10 @@ use super::context::ranges_overlap;
 use super::refine::RefinedHunk;
 use super::syntax::SyntaxTree;
 use super::tree_diff::{
-    CompactChange, LineEndingChange, SelectedLine, SourceChange, changed_sequence_ranges,
+    CompactChange, LineEndingChange, MoveBlock, SourceChange, changed_sequence_ranges,
 };
 use super::{LineCoverage, LineEnding, SyntaxClass};
+use std::ops::Range;
 
 /// Diff role layered over syntax styling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,11 +92,13 @@ pub struct PresentedFile {
 }
 
 /// Split one source line at syntax and diff-mark boundaries.
-fn source_row(tree: &SyntaxTree<'_>, line: &SelectedLine, mark: DiffMark) -> SourceRow {
-    let source = tree
-        .source
-        .line(line.number)
-        .expect("formed source line exists");
+fn source_row(
+    tree: &SyntaxTree<'_>,
+    number: usize,
+    changed_ranges: &[Range<usize>],
+    mark: DiffMark,
+) -> SourceRow {
+    let source = tree.source.line(number).expect("formed source line exists");
     let bytes = source.content_bytes.clone();
     let leaves = tree
         .leaf_ids_in(bytes.clone())
@@ -106,12 +109,12 @@ fn source_row(tree: &SyntaxTree<'_>, line: &SelectedLine, mark: DiffMark) -> Sou
         boundaries.push(leaf.bytes.start.max(bytes.start));
         boundaries.push(leaf.bytes.end.min(bytes.end));
     }
-    for highlight in &line.highlights {
-        if !ranges_overlap(highlight, &bytes) {
+    for changed in changed_ranges {
+        if !ranges_overlap(changed, &bytes) {
             continue;
         }
-        boundaries.push(highlight.start.max(bytes.start));
-        boundaries.push(highlight.end.min(bytes.end));
+        boundaries.push(changed.start.max(bytes.start));
+        boundaries.push(changed.end.min(bytes.end));
     }
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -132,17 +135,13 @@ fn source_row(tree: &SyntaxTree<'_>, line: &SelectedLine, mark: DiffMark) -> Sou
             .and_then(|leaf| leaf.leaf)
             .map(|leaf| leaf.syntax)
             .unwrap_or(SyntaxClass::Plain);
-        let changed = line
-            .highlights
+        let changed = changed_ranges
             .iter()
-            .any(|highlight| highlight.start <= segment.start && highlight.end >= segment.end);
+            .any(|changed| changed.start <= segment.start && changed.end >= segment.end);
         let mark = if changed { mark } else { DiffMark::Context };
         push_span(&mut spans, text, syntax, mark);
     }
-    SourceRow {
-        number: line.number,
-        spans,
-    }
+    SourceRow { number, spans }
 }
 
 /// Coalesce adjacent text with identical syntax and diff marks.
@@ -239,14 +238,22 @@ fn present_change(
     change: SourceChange,
 ) -> Vec<ReviewRow> {
     match change {
-        SourceChange::Current(line) => vec![ReviewRow::Current(source_row(
+        SourceChange::Context(line) => vec![ReviewRow::Current(source_row(
             after_tree,
-            &line,
+            line,
+            &[],
+            DiffMark::Context,
+        ))],
+        SourceChange::Edited(line) => vec![ReviewRow::Current(source_row(
+            after_tree,
+            line.number,
+            &line.changed_bytes,
             DiffMark::Added,
         ))],
         SourceChange::Reflow(line) => vec![ReviewRow::Reflow(source_row(
             after_tree,
-            &line,
+            line,
+            &[],
             DiffMark::Context,
         ))],
         SourceChange::Replace {
@@ -256,7 +263,14 @@ fn present_change(
         } => {
             let mut rows = before
                 .iter()
-                .map(|line| ReviewRow::Removed(source_row(before_tree, line, DiffMark::Removed)))
+                .map(|line| {
+                    ReviewRow::Removed(source_row(
+                        before_tree,
+                        line.number,
+                        &line.changed_bytes,
+                        DiffMark::Removed,
+                    ))
+                })
                 .collect::<Vec<_>>();
             rows.extend(
                 line_endings
@@ -265,11 +279,14 @@ fn present_change(
                     .copied()
                     .map(line_ending_row),
             );
-            rows.extend(
-                after
-                    .iter()
-                    .map(|line| ReviewRow::Added(source_row(after_tree, line, DiffMark::Added))),
-            );
+            rows.extend(after.iter().map(|line| {
+                ReviewRow::Added(source_row(
+                    after_tree,
+                    line.number,
+                    &line.changed_bytes,
+                    DiffMark::Added,
+                ))
+            }));
             rows.extend(
                 line_endings
                     .into_iter()
@@ -279,13 +296,7 @@ fn present_change(
             rows
         }
         SourceChange::LineEnding(change) => vec![line_ending_row(change)],
-        SourceChange::Moved {
-            before,
-            after: line,
-        } => vec![ReviewRow::Moved {
-            before,
-            after: source_row(after_tree, &line, DiffMark::Context),
-        }],
+        SourceChange::Move(change) => move_rows(after_tree, change),
         SourceChange::Compact(change) => {
             vec![ReviewRow::Wordwise(word_diff(
                 before_tree,
@@ -295,6 +306,91 @@ fn present_change(
         }
         SourceChange::Elision(coverage) => vec![ReviewRow::Elision(coverage)],
     }
+}
+
+/// Expand one semantic move into the existing compact review-row contract.
+fn move_rows(after_tree: &SyntaxTree<'_>, change: MoveBlock) -> Vec<ReviewRow> {
+    let mut lines = change.after.clone();
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let mut rows = vec![ReviewRow::Moved {
+        before: Some(change.before.start),
+        after: source_row(after_tree, first, &[], DiffMark::Context),
+    }];
+    rows.extend(
+        change
+            .line_endings
+            .iter()
+            .filter(|ending| ending.after.is_none())
+            .copied()
+            .map(line_ending_row),
+    );
+    rows.extend(
+        change
+            .line_endings
+            .iter()
+            .filter(|ending| ending.after.is_some_and(|endpoint| endpoint.line == first))
+            .copied()
+            .map(line_ending_row),
+    );
+    if change.after.len() == 1 {
+        return rows;
+    }
+
+    let last = change.after.end - 1;
+    let show_only_middle = (change.after.len() == 3).then_some(change.after.start + 1);
+    let has_ending = |line| {
+        change
+            .line_endings
+            .iter()
+            .any(|ending| ending.after.is_some_and(|endpoint| endpoint.line == line))
+    };
+    let mut line = change.after.start + 1;
+    while line < last {
+        if show_only_middle == Some(line) || has_ending(line) {
+            rows.push(ReviewRow::Current(source_row(
+                after_tree,
+                line,
+                &[],
+                DiffMark::Context,
+            )));
+            rows.extend(
+                change
+                    .line_endings
+                    .iter()
+                    .filter(|ending| ending.after.is_some_and(|endpoint| endpoint.line == line))
+                    .copied()
+                    .map(line_ending_row),
+            );
+            line += 1;
+            continue;
+        }
+
+        let start = line;
+        while line < last && show_only_middle != Some(line) && !has_ending(line) {
+            line += 1;
+        }
+        let offset = start - change.after.start;
+        let end_offset = line - change.after.start;
+        rows.push(ReviewRow::Elision(LineCoverage {
+            before: (change.before.len() == change.after.len())
+                .then(|| change.before.start + offset..change.before.start + end_offset),
+            after: Some(start..line),
+        }));
+    }
+    rows.push(ReviewRow::Moved {
+        before: None,
+        after: source_row(after_tree, last, &[], DiffMark::Context),
+    });
+    rows.extend(
+        change
+            .line_endings
+            .into_iter()
+            .filter(|ending| ending.after.is_some_and(|endpoint| endpoint.line == last))
+            .map(line_ending_row),
+    );
+    rows
 }
 
 fn line_ending_row(change: LineEndingChange) -> ReviewRow {

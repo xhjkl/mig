@@ -436,7 +436,7 @@ fn line_insertions_and_deletions_keep_their_source_numbers() {
 }
 
 #[test]
-fn nested_transfer_keeps_current_rows_in_source_order() {
+fn exact_nested_transfer_is_presented_once_at_its_destination() {
     let before = concat!(
         "const Card = () => (\n",
         "\t<>\n",
@@ -482,15 +482,372 @@ fn nested_transfer_keeps_current_rows_in_source_order() {
 
     let diff = diff_file("alpha.tsx", before, after).expect("TSX must diff");
 
-    assert_eq!(
-        marked_line_occurrences(&diff, "<Moved />", DiffMark::Removed),
-        1
-    );
-    assert_eq!(
-        marked_line_occurrences(&diff, "<Moved />", DiffMark::Added),
-        1
-    );
+    for (payload, before, after) in [("<Composer />", 16, 5), ("<Moved />", 17, 16)] {
+        assert_eq!(
+            diff.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.rows)
+                .filter(|row| {
+                    matches!(
+                        row,
+                        ReviewRow::Moved {
+                            before: Some(old),
+                            after: current,
+                        } if *old == before
+                            && current.number == after
+                            && line_text(current).trim() == payload
+                    )
+                })
+                .count(),
+            1,
+            "{payload} must have one move producer: {diff:#?}",
+        );
+        assert_eq!(
+            marked_line_occurrences(&diff, payload, DiffMark::Removed),
+            0
+        );
+        assert_eq!(marked_line_occurrences(&diff, payload, DiffMark::Added), 0);
+        assert_eq!(
+            source_lines(&diff)
+                .into_iter()
+                .filter(|line| line_text(line).trim() == payload)
+                .count(),
+            1,
+            "{payload} must be rendered once across all hunks: {diff:#?}",
+        );
+    }
     assert_source_space_invariants("alpha.tsx", &diff);
+}
+
+#[test]
+fn exact_nested_transfers_follow_their_crossed_destination_order() {
+    let before = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<div>\n",
+        "\t\t\t<Anchor />\n",
+        "\t\t\t<Middle />\n",
+        "\t\t</div>\n",
+        "\t\t<Camera />\n",
+        "\t\t<Microphone />\n",
+        "\t</article>\n",
+        ")\n",
+    );
+    let after = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<div>\n",
+        "\t\t\t<Anchor />\n",
+        "\t\t\t<Microphone />\n",
+        "\t\t\t<Middle />\n",
+        "\t\t\t<Camera />\n",
+        "\t\t</div>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+
+    let diff = diff_file("alpha.tsx", before, after).expect("TSX must diff");
+    let moves = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .filter_map(|row| {
+            let ReviewRow::Moved { before, after } = row else {
+                return None;
+            };
+            let payload = line_text(after);
+            matches!(payload.trim(), "<Camera />" | "<Microphone />").then_some((
+                *before,
+                after.number,
+                payload.trim().to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        moves,
+        vec![
+            (Some(8), 5, "<Microphone />".to_owned()),
+            (Some(7), 7, "<Camera />".to_owned()),
+        ],
+        "relocations must follow current-world geometry: {diff:#?}",
+    );
+    for payload in ["<Camera />", "<Microphone />"] {
+        assert_eq!(
+            marked_line_occurrences(&diff, payload, DiffMark::Removed),
+            0
+        );
+        assert_eq!(marked_line_occurrences(&diff, payload, DiffMark::Added), 0);
+        assert_eq!(
+            source_lines(&diff)
+                .into_iter()
+                .filter(|line| line_text(line).trim() == payload)
+                .count(),
+            1,
+            "{payload} must be rendered once across all hunks: {diff:#?}",
+        );
+    }
+    assert_source_space_invariants("alpha.tsx", &diff);
+}
+
+#[test]
+fn exact_multiline_transfer_uses_move_provenance_and_elides_its_body() {
+    let before = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<div class=\"self-controls\">\n",
+        "\t\t\t<Screen />\n",
+        "\t\t</div>\n",
+        "\t\t<Show when={liveMedia()}>\n",
+        "\t\t\t<div class=\"self-live-controls\">\n",
+        "\t\t\t\t<ToggleButton\n",
+        "\t\t\t\t\taccessibleName=\"camera\"\n",
+        "\n",
+        "\t\t\t\t\tlabel=\"cam\"\n",
+        "\t\t\t\t/>\n",
+        "\t\t\t</div>\n",
+        "\t\t</Show>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+    let after = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<div class=\"self-controls\">\n",
+        "\t\t\t<Screen />\n",
+        "\t\t\t<Show when={liveMedia()}>\n",
+        "\t\t\t\t<div class=\"self-live-controls\">\n",
+        "\t\t\t\t\t<ToggleButton\n",
+        "\t\t\t\t\t\taccessibleName=\"camera\"\n",
+        "\n",
+        "\t\t\t\t\t\tlabel=\"cam\"\n",
+        "\t\t\t\t\t/>\n",
+        "\t\t\t\t</div>\n",
+        "\t\t\t</Show>\n",
+        "\t\t</div>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+
+    let diff = diff_file("alpha.tsx", before, after).expect("TSX must diff");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rows.iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    ReviewRow::Moved {
+                        before: Some(6),
+                        after,
+                    } if after.number == 5 && line_text(after).contains("<Show when=")
+                )
+            })
+            .count(),
+        1,
+    );
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            ReviewRow::Moved {
+                before: None,
+                after,
+            } if after.number == 13 && line_text(after).contains("</Show>")
+        )
+    }));
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row,
+            ReviewRow::Elision(coverage)
+                if coverage.before == Some(7..14) && coverage.after == Some(6..13)
+        )
+    }));
+    for line in ["<Show when={liveMedia()}>", "</Show>"] {
+        assert_eq!(marked_line_occurrences(&diff, line, DiffMark::Removed), 0);
+        assert_eq!(marked_line_occurrences(&diff, line, DiffMark::Added), 0);
+        assert_eq!(
+            source_lines(&diff)
+                .into_iter()
+                .filter(|source| line_text(source).trim() == line)
+                .count(),
+            1,
+            "{line} must be rendered once across all hunks: {diff:#?}",
+        );
+    }
+    assert_source_space_invariants("alpha.tsx", &diff);
+}
+
+#[test]
+fn duplicate_cross_owner_payload_stays_an_explicit_remove_and_add() {
+    let before = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<Alpha>\n",
+        "\t\t\t<AlphaAnchor />\n",
+        "\t\t\t<Show when={live}><Controls /></Show>\n",
+        "\t\t</Alpha>\n",
+        "\t\t<Beta>\n",
+        "\t\t\t<BetaAnchor />\n",
+        "\t\t\t<Show when={live}><Controls /></Show>\n",
+        "\t\t</Beta>\n",
+        "\t\t<Target>\n",
+        "\t\t\t<TargetAnchor />\n",
+        "\t\t</Target>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+    let after = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<Alpha>\n",
+        "\t\t\t<AlphaAnchor />\n",
+        "\t\t</Alpha>\n",
+        "\t\t<Beta>\n",
+        "\t\t\t<BetaAnchor />\n",
+        "\t\t</Beta>\n",
+        "\t\t<Target>\n",
+        "\t\t\t<TargetAnchor />\n",
+        "\t\t\t<Show when={live}><Controls /></Show>\n",
+        "\t\t</Target>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+
+    let diff = diff_file("alpha.tsx", before, after).expect("TSX must diff");
+
+    assert_eq!(
+        marked_line_occurrences(&diff, "<Show when={live}", DiffMark::Removed),
+        2,
+    );
+    assert_eq!(
+        marked_line_occurrences(&diff, "<Show when={live}", DiffMark::Added),
+        1,
+    );
+    assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+        matches!(row, ReviewRow::Moved { after, .. } if line_text(after).contains("<Show"))
+    }));
+    assert_source_space_invariants("alpha.tsx", &diff);
+}
+
+#[test]
+fn exact_payload_does_not_relocate_between_paired_sibling_owners() {
+    let before = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<Alpha>\n",
+        "\t\t\t<AlphaAnchor />\n",
+        "\t\t\t<Show when={live}>\n",
+        "\t\t\t\t<Camera />\n",
+        "\t\t\t</Show>\n",
+        "\t\t</Alpha>\n",
+        "\t\t<Beta>\n",
+        "\t\t\t<BetaAnchor />\n",
+        "\t\t\t<Show when={live}>\n",
+        "\t\t\t\t<Microphone />\n",
+        "\t\t\t</Show>\n",
+        "\t\t</Beta>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+    let after = concat!(
+        "const Card = () => (\n",
+        "\t<article>\n",
+        "\t\t<Alpha>\n",
+        "\t\t\t<AlphaAnchor />\n",
+        "\t\t\t<Show when={live}>\n",
+        "\t\t\t\t<Microphone />\n",
+        "\t\t\t</Show>\n",
+        "\t\t</Alpha>\n",
+        "\t\t<Beta>\n",
+        "\t\t\t<BetaAnchor />\n",
+        "\t\t\t<Show when={live}>\n",
+        "\t\t\t\t<Camera />\n",
+        "\t\t\t</Show>\n",
+        "\t\t</Beta>\n",
+        "\t</article>\n",
+        ")\n",
+    );
+
+    let diff = diff_file("alpha.tsx", before, after).expect("TSX must diff");
+
+    for payload in ["<Camera />", "<Microphone />"] {
+        assert_eq!(
+            marked_line_occurrences(&diff, payload, DiffMark::Removed),
+            1
+        );
+        assert_eq!(marked_line_occurrences(&diff, payload, DiffMark::Added), 1);
+    }
+    assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+        matches!(row, ReviewRow::Moved { after, .. } if line_text(after).contains("<Show"))
+    }));
+    assert_source_space_invariants("alpha.tsx", &diff);
+}
+
+#[test]
+fn exact_payload_cannot_cross_a_nested_definition_owner() {
+    let cases = [
+        (
+            "alpha.ts",
+            concat!(
+                "function outer() {\n",
+                "  inner();\n",
+                "  function nested() {\n",
+                "    stay();\n",
+                "  }\n",
+                "}\n",
+            ),
+            concat!(
+                "function outer() {\n",
+                "  function nested() {\n",
+                "    stay();\n",
+                "    inner();\n",
+                "  }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "alpha.rs",
+            concat!(
+                "fn outer() {\n",
+                "    inner();\n",
+                "    fn nested() {\n",
+                "        stay();\n",
+                "    }\n",
+                "}\n",
+            ),
+            concat!(
+                "fn outer() {\n",
+                "    fn nested() {\n",
+                "        stay();\n",
+                "        inner();\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+    ];
+
+    for (path, before, after) in cases {
+        let diff = diff_file(path, before, after).expect("source must diff");
+
+        assert_eq!(
+            marked_line_occurrences(&diff, "inner();", DiffMark::Removed),
+            1,
+            "{path} must retain the old semantic owner: {diff:#?}",
+        );
+        assert_eq!(
+            marked_line_occurrences(&diff, "inner();", DiffMark::Added),
+            1,
+            "{path} must retain the new semantic owner: {diff:#?}",
+        );
+        assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.rows).any(|row| {
+            matches!(row, ReviewRow::Moved { after, .. } if line_text(after).trim() == "inner();")
+        }));
+        assert_source_space_invariants(path, &diff);
+    }
 }
 
 #[test]

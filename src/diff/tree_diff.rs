@@ -6,7 +6,7 @@
 use super::context::{include_range, ranges_overlap};
 use super::correspondence::{
     Correspondence, LeafRelation, LineLink, MatchedUnit, NodeLink, ParentCorrespondence, Placement,
-    UnitEdit,
+    RelocatedNode, UnitEdit, local_line_links,
 };
 use super::source::SourceLine;
 use super::syntax::{
@@ -33,33 +33,39 @@ enum RevisionSide {
     After,
 }
 
-/// One numbered source line plus the changed byte intervals it owns.
+/// One one-based source line plus the changed source-byte intervals it owns.
 #[derive(Clone, Debug)]
 pub struct SelectedLine {
     pub number: usize,
-    pub highlights: Vec<Range<usize>>,
+    pub changed_bytes: Vec<Range<usize>>,
 }
 
 impl SelectedLine {
     pub fn has_changes(&self) -> bool {
-        !self.highlights.is_empty()
+        !self.changed_bytes.is_empty()
     }
 }
 
-/// A row-sized source event retained without allocating styled presentation text.
+/// One semantic move retained as a whole until the presentation boundary.
+#[derive(Clone, Debug)]
+pub struct MoveBlock {
+    /// One-based, half-open source-line ranges.
+    pub before: Range<usize>,
+    pub after: Range<usize>,
+    pub line_endings: Vec<LineEndingChange>,
+}
+
+/// A transient source event retained without allocating styled presentation text.
 #[derive(Clone, Debug)]
 enum RowEvent {
-    Current(SelectedLine),
-    Reflow(SelectedLine),
+    Context(usize),
+    Edited(SelectedLine),
+    Reflow(usize),
     Removed(SelectedLine),
     Added(SelectedLine),
     LineEnding(LineEndingChange),
-    Moved {
-        before: Option<usize>,
-        after: SelectedLine,
-    },
+    Move(MoveBlock),
     Compact(CompactChange),
-    Elision(LineCoverage),
 }
 
 /// One indivisible source change handed to review refinement.
@@ -68,25 +74,23 @@ enum RowEvent {
 /// so ordering, coalescing, and context selection cannot separate their meanings.
 #[derive(Clone, Debug)]
 pub enum SourceChange {
-    Current(SelectedLine),
-    Reflow(SelectedLine),
+    Context(usize),
+    Edited(SelectedLine),
+    Reflow(usize),
     Replace {
         before: Vec<SelectedLine>,
         after: Vec<SelectedLine>,
         line_endings: Vec<LineEndingChange>,
     },
     LineEnding(LineEndingChange),
-    Moved {
-        before: Option<usize>,
-        after: SelectedLine,
-    },
+    Move(MoveBlock),
     Compact(CompactChange),
     Elision(LineCoverage),
 }
 
 impl SourceChange {
     pub fn is_context(&self) -> bool {
-        matches!(self, Self::Current(line) if !line.has_changes())
+        matches!(self, Self::Context(_))
     }
 
     pub fn has_signal(&self) -> bool {
@@ -95,21 +99,28 @@ impl SourceChange {
 
     pub fn context_line(&self) -> Option<usize> {
         match self {
-            Self::Current(line) if !line.has_changes() => Some(line.number),
+            Self::Context(line) => Some(*line),
             _ => None,
         }
     }
 
     /// Current-world source rows physically emitted by this change.
     pub fn displayed_after(&self) -> impl Iterator<Item = usize> + '_ {
-        let (lines, one) = match self {
-            Self::Current(line) | Self::Reflow(line) => (&[][..], Some(line.number)),
-            Self::Replace { after, .. } => (after.as_slice(), None),
-            Self::Moved { after, .. } => (&[][..], Some(after.number)),
-            Self::Compact(change) => (&[][..], change.after_line),
-            Self::LineEnding(_) | Self::Elision(_) => (&[][..], None),
+        let (lines, range) = match self {
+            Self::Context(line) | Self::Reflow(line) => (&[][..], *line..line.saturating_add(1)),
+            Self::Edited(line) => (&[][..], line.number..line.number.saturating_add(1)),
+            Self::Replace { after, .. } => (after.as_slice(), 0..0),
+            Self::Move(change) => (&[][..], change.after.clone()),
+            Self::Compact(change) => {
+                let range = change
+                    .after_line
+                    .map(|line| line..line.saturating_add(1))
+                    .unwrap_or(0..0);
+                (&[][..], range)
+            }
+            Self::LineEnding(_) | Self::Elision(_) => (&[][..], 0..0),
         };
-        lines.iter().map(|line| line.number).chain(one)
+        lines.iter().map(|line| line.number).chain(range)
     }
 }
 
@@ -131,7 +142,7 @@ pub struct CompactChange {
     pub after_bytes: Option<Range<usize>>,
 }
 
-/// One concrete line terminator and the source row that owns it.
+/// One concrete line terminator and its one-based source row.
 #[derive(Clone, Copy, Debug)]
 pub struct LineEndingEndpoint {
     pub line: usize,
@@ -148,27 +159,27 @@ pub struct LineEndingChange {
 /// Select changed byte intervals on one source line without allocating its text.
 pub fn select_line(line: &SourceLine, changed: &[Range<usize>]) -> SelectedLine {
     let bytes = line.content_bytes.clone();
-    let mut highlights = Vec::<Range<usize>>::new();
+    let mut changed_ranges = Vec::<Range<usize>>::new();
     for range in changed {
         if !ranges_overlap(range, &bytes) {
             continue;
         }
-        highlights.push(range.start.max(bytes.start)..range.end.min(bytes.end));
+        changed_ranges.push(range.start.max(bytes.start)..range.end.min(bytes.end));
     }
-    highlights.sort_unstable_by_key(|range| range.start);
-    let mut merged = Vec::<Range<usize>>::with_capacity(highlights.len());
-    for highlight in highlights {
+    changed_ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged = Vec::<Range<usize>>::with_capacity(changed_ranges.len());
+    for changed in changed_ranges {
         if let Some(previous) = merged.last_mut()
-            && highlight.start <= previous.end
+            && changed.start <= previous.end
         {
-            previous.end = previous.end.max(highlight.end);
+            previous.end = previous.end.max(changed.end);
             continue;
         }
-        merged.push(highlight);
+        merged.push(changed);
     }
     SelectedLine {
         number: line.number,
-        highlights: merged,
+        changed_bytes: merged,
     }
 }
 
@@ -181,8 +192,8 @@ struct DraftFragment {
     context_root: Option<NodeId>,
 }
 
-/// Physical alignment and review order shared by source formation and refinement.
-pub struct SourceLayout {
+/// Current-world anchors and ordering shared by source formation and refinement.
+pub struct ReviewGeometry {
     before_order: Vec<SourceOrder>,
     after_to_before: Vec<Option<usize>>,
     after_script_order: Vec<usize>,
@@ -202,7 +213,11 @@ impl SourceSequence {
             after_owner: vec![None; pair.after.source.lines().len() + 1],
             after_units: Vec::new(),
         };
-        for (order, edit) in correspondence.units.iter().enumerate() {
+        for (order, edit) in correspondence
+            .source
+            .review_units(&correspondence.tree)
+            .enumerate()
+        {
             match edit {
                 UnitEdit::Matched(unit) => {
                     sequence.claim_before(pair.before.node(unit.before).lines.clone(), order);
@@ -246,7 +261,7 @@ impl SourceSequence {
         }
     }
 
-    fn group_rank(&self, group: &[RowEvent], source_layout: &SourceLayout) -> usize {
+    fn group_rank(&self, group: &[RowEvent], geometry: &ReviewGeometry) -> usize {
         let mut owners = group.iter().flat_map(|row| {
             let after = row_after_source_line(row)
                 .and_then(|line| self.after_owner.get(line).copied().flatten());
@@ -268,7 +283,7 @@ impl SourceSequence {
                 group
                     .iter()
                     .filter_map(row_before_source_line)
-                    .filter_map(|line| source_layout.current_anchor(line))
+                    .filter_map(|line| geometry.current_anchor(line))
                     .min()
             })
             .unwrap_or(1);
@@ -332,14 +347,16 @@ pub struct SourceHunk {
 /// Compiler-visible handoff from tree differencing to review refinement.
 pub struct RawSourceDiff {
     pub hunks: Vec<SourceHunk>,
-    pub source_layout: SourceLayout,
+    pub review_geometry: ReviewGeometry,
 }
 
-impl SourceLayout {
-    fn new(graph: &Correspondence, before_lines: usize, after_lines: usize) -> Self {
+impl ReviewGeometry {
+    fn new(pair: &SyntaxPair<'_, '_>, graph: &Correspondence) -> Self {
+        let before_lines = pair.before.source.lines().len();
+        let after_lines = pair.after.source.lines().len();
         let mut before_to_after = vec![None; before_lines + 1];
         let mut after_to_before = vec![None; after_lines + 1];
-        for link in graph.line_links.iter().chain(&graph.line_ending_edits) {
+        for link in graph.source.lines.iter().chain(&graph.source.line_endings) {
             let before = link.before + 1;
             let after = link.after + 1;
             if let Some(mapped) = before_to_after.get_mut(before) {
@@ -417,15 +434,10 @@ impl SourceLayout {
 
 /// Form unranked source hunks from one neutral syntax correspondence graph.
 pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> RawSourceDiff {
-    let mut source_layout = SourceLayout::new(
-        correspondence,
-        pair.before.source.lines().len(),
-        pair.after.source.lines().len(),
-    );
     if pair.before.source.as_str() == pair.after.source.as_str() {
         return RawSourceDiff {
             hunks: Vec::new(),
-            source_layout,
+            review_geometry: ReviewGeometry::new(pair, correspondence),
         };
     }
 
@@ -457,7 +469,7 @@ pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> 
             pair,
             correspondence,
             LineCoverage { before, after },
-            &correspondence.composites,
+            &correspondence.tree.composites,
             None,
             LineAnchors {
                 basis: AnchorBasis::Physical,
@@ -472,33 +484,35 @@ pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> 
     };
     // Correspondence owns sameness and wrapper decisions. Resolve those facts before
     // source placement, hunk coalescing, or halo expansion can depend on the row shape.
+    classify_relocated_nodes(&mut changes, pair, correspondence);
     normalize_stable_revision_rows(&mut changes, correspondence);
     normalize_containment(&mut changes, pair, correspondence);
+    let mut review_geometry = ReviewGeometry::new(pair, correspondence);
     let sequence = (!source_ordered).then(|| SourceSequence::new(pair, correspondence));
     if let Some(sequence) = &sequence {
-        source_layout.apply_sequence(sequence);
+        review_geometry.apply_sequence(sequence);
     }
     let hunks = changes
         .into_iter()
-        .map(|hunk| form_source_hunk(hunk, &source_layout, sequence.as_ref()))
+        .map(|hunk| form_source_hunk(hunk, &review_geometry, sequence.as_ref()))
         .collect();
     RawSourceDiff {
         hunks,
-        source_layout,
+        review_geometry,
     }
 }
 
 /// Freeze transient producer rows into atomic, source-located facts.
 fn form_source_hunk(
     hunk: DraftFragment,
-    source_layout: &SourceLayout,
+    geometry: &ReviewGeometry,
     sequence: Option<&SourceSequence>,
 ) -> SourceHunk {
     let order = hunk
         .context_anchor_order
-        .or_else(|| event_rows_order(&hunk.rows, source_layout))
+        .or_else(|| event_rows_order(&hunk.rows, geometry))
         .expect("draft hunk owns at least one source row");
-    let after_lines = source_layout.after_to_before.len().saturating_sub(1);
+    let after_lines = geometry.after_to_before.len().saturating_sub(1);
     let context_anchor = hunk.context_anchor_order.and_then(|order| {
         (after_lines > 0).then(|| order.after_gap.saturating_add(1).clamp(1, after_lines))
     });
@@ -506,13 +520,13 @@ fn form_source_hunk(
         .into_iter()
         .map(|events| {
             let script_order = sequence
-                .map(|sequence| sequence.group_rank(&events, source_layout))
+                .map(|sequence| sequence.group_rank(&events, geometry))
                 .unwrap_or_else(|| {
-                    event_rows_order(&events, source_layout)
+                    event_rows_order(&events, geometry)
                         .unwrap_or(order)
                         .after_gap
                 });
-            source_fact(events, source_layout, order, script_order)
+            source_fact(events, geometry, order, script_order)
         })
         .collect::<Vec<_>>();
 
@@ -550,12 +564,12 @@ fn atomic_event_groups(rows: Vec<RowEvent>) -> Vec<Vec<RowEvent>> {
 
 fn source_fact(
     events: Vec<RowEvent>,
-    source_layout: &SourceLayout,
+    geometry: &ReviewGeometry,
     fallback_order: SourceOrder,
     script_order: usize,
 ) -> SourceFact {
-    let coverage = event_group_coverage(&events, source_layout);
-    let order = event_rows_order(&events, source_layout).unwrap_or(fallback_order);
+    let coverage = event_group_coverage(&events, geometry);
+    let order = event_rows_order(&events, geometry).unwrap_or(fallback_order);
     let change = if events
         .first()
         .is_some_and(|row| matches!(row, RowEvent::Removed(_) | RowEvent::Added(_)))
@@ -583,12 +597,12 @@ fn source_fact(
             .next()
             .expect("source fact owns one event")
         {
-            RowEvent::Current(line) => SourceChange::Current(line),
+            RowEvent::Context(line) => SourceChange::Context(line),
+            RowEvent::Edited(line) => SourceChange::Edited(line),
             RowEvent::Reflow(line) => SourceChange::Reflow(line),
             RowEvent::LineEnding(change) => SourceChange::LineEnding(change),
-            RowEvent::Moved { before, after } => SourceChange::Moved { before, after },
+            RowEvent::Move(change) => SourceChange::Move(change),
             RowEvent::Compact(change) => SourceChange::Compact(change),
-            RowEvent::Elision(coverage) => SourceChange::Elision(coverage),
             RowEvent::Removed(_) | RowEvent::Added(_) => {
                 unreachable!("one-sided revision rows are replacements too")
             }
@@ -602,19 +616,24 @@ fn source_fact(
     }
 }
 
-fn event_group_coverage(events: &[RowEvent], source_layout: &SourceLayout) -> LineCoverage {
+fn event_group_coverage(events: &[RowEvent], geometry: &ReviewGeometry) -> LineCoverage {
     let mut coverage = LineCoverage {
         before: None,
         after: None,
     };
     for event in events {
-        if let RowEvent::Elision(elision) = event {
-            include_range(&mut coverage.before, elision.before.clone());
-            include_range(&mut coverage.after, elision.after.clone());
+        if let RowEvent::Move(change) = event {
+            include_range(&mut coverage.before, Some(change.before.clone()));
+            include_range(&mut coverage.after, Some(change.after.clone()));
             continue;
         }
-        if let RowEvent::Current(line) | RowEvent::Reflow(line) = event
-            && let Some(before) = source_layout.aligned_before_line(line.number)
+        let current_line = match event {
+            RowEvent::Context(line) | RowEvent::Reflow(line) => Some(*line),
+            RowEvent::Edited(line) => Some(line.number),
+            _ => None,
+        };
+        if let Some(line) = current_line
+            && let Some(before) = geometry.aligned_before_line(line)
         {
             include_range(&mut coverage.before, Some(before..before + 1));
         }
@@ -628,7 +647,7 @@ fn event_group_coverage(events: &[RowEvent], source_layout: &SourceLayout) -> Li
     coverage
 }
 
-fn event_rows_order(events: &[RowEvent], source_layout: &SourceLayout) -> Option<SourceOrder> {
+fn event_rows_order(events: &[RowEvent], geometry: &ReviewGeometry) -> Option<SourceOrder> {
     events
         .iter()
         .filter_map(row_after_source_line)
@@ -638,9 +657,174 @@ fn event_rows_order(events: &[RowEvent], source_layout: &SourceLayout) -> Option
             events
                 .iter()
                 .filter_map(row_before_source_line)
-                .map(|line| source_layout.before_order(line))
+                .map(|line| geometry.before_order(line))
                 .min()
         })
+}
+
+/// Replace one exact cross-owner remove/add pair with the established move producer.
+fn classify_relocated_nodes(
+    changes: &mut Vec<DraftFragment>,
+    pair: &SyntaxPair<'_, '_>,
+    correspondence: &Correspondence,
+) {
+    let relocations = correspondence
+        .tree
+        .relocated_nodes()
+        .iter()
+        .copied()
+        .filter(|relocation| relocation_has_uniform_source_shape(pair, *relocation))
+        .filter(|relocation| relocation_rows_are_available(changes, pair, *relocation))
+        .collect::<Vec<_>>();
+    if relocations.is_empty() {
+        return;
+    }
+
+    let mut relocations = relocations;
+    relocations.sort_unstable_by_key(|relocation| pair.after.node(relocation.after).lines.start);
+    for relocation in relocations {
+        remove_relocation_rows(changes, pair, relocation);
+        let change = form_exact_relocation(pair, relocation)
+            .expect("an exact relocation owns current source rows");
+        changes.push(change);
+    }
+    changes.retain(|change| change.rows.iter().any(row_has_signal));
+}
+
+/// Remove the ordinary one-sided rows superseded by one semantic move.
+fn remove_relocation_rows(
+    changes: &mut [DraftFragment],
+    pair: &SyntaxPair<'_, '_>,
+    relocation: RelocatedNode,
+) {
+    let before = pair.before.node(relocation.before).lines.clone();
+    let after = pair.after.node(relocation.after).lines.clone();
+    for change in changes {
+        change.rows.retain(|row| {
+            !matches!(row, RowEvent::Removed(line) if before.contains(&line.number))
+                && !matches!(row, RowEvent::Added(line) if after.contains(&line.number))
+        });
+    }
+}
+
+/// Promote only ranges currently owned once as ordinary one-sided source rows.
+fn relocation_rows_are_available(
+    changes: &[DraftFragment],
+    pair: &SyntaxPair<'_, '_>,
+    relocation: RelocatedNode,
+) -> bool {
+    let before = pair.before.node(relocation.before).lines.clone();
+    let after = pair.after.node(relocation.after).lines.clone();
+    let mut removed = vec![0_u8; before.len()];
+    let mut added = vec![0_u8; after.len()];
+
+    for row in changes.iter().flat_map(|change| &change.rows) {
+        match row {
+            RowEvent::Removed(line) if before.contains(&line.number) => {
+                let offset = line.number - before.start;
+                removed[offset] = removed[offset].saturating_add(1);
+                continue;
+            }
+            RowEvent::Added(line) if after.contains(&line.number) => {
+                let offset = line.number - after.start;
+                added[offset] = added[offset].saturating_add(1);
+                continue;
+            }
+            RowEvent::LineEnding(change)
+                if change
+                    .before
+                    .is_some_and(|endpoint| before.contains(&endpoint.line))
+                    || change
+                        .after
+                        .is_some_and(|endpoint| after.contains(&endpoint.line)) =>
+            {
+                return false;
+            }
+            row => {
+                if row_before_source_line(row).is_some_and(|line| before.contains(&line))
+                    || row_after_source_line(row).is_some_and(|line| after.contains(&line))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    removed.into_iter().all(|claims| claims == 1) && added.into_iter().all(|claims| claims == 1)
+}
+
+#[derive(Eq, PartialEq)]
+enum IndentationShift {
+    Stable,
+    Added(String),
+    Removed(String),
+}
+
+/// Admit source-complete nodes changed by one shared, non-empty indentation shift.
+/// Unchanged indentation is ambiguous with parser-recovered ownership around stable source.
+fn relocation_has_uniform_source_shape(
+    pair: &SyntaxPair<'_, '_>,
+    relocation: RelocatedNode,
+) -> bool {
+    if !node_owns_complete_lines(&pair.before, relocation.before)
+        || !node_owns_complete_lines(&pair.after, relocation.after)
+    {
+        return false;
+    }
+    let before_lines = pair.before.node(relocation.before).lines.clone();
+    let after_lines = pair.after.node(relocation.after).lines.clone();
+    if before_lines.is_empty() || before_lines.len() != after_lines.len() {
+        return false;
+    }
+
+    let mut shared_shift = None;
+    for (before, after) in before_lines.zip(after_lines) {
+        let Some(before) = pair.before.source.line(before) else {
+            return false;
+        };
+        let Some(after) = pair.after.source.line(after) else {
+            return false;
+        };
+        let before = pair.before.source.text(before);
+        let after = pair.after.source.text(after);
+        let (before_indent, before_payload) = split_indentation(before);
+        let (after_indent, after_payload) = split_indentation(after);
+        if before_payload != after_payload {
+            return false;
+        }
+        if before_payload.is_empty() {
+            continue;
+        }
+        let Some(shift) = indentation_shift(before_indent, after_indent) else {
+            return false;
+        };
+        if shared_shift.as_ref().is_some_and(|shared| shared != &shift) {
+            return false;
+        }
+        shared_shift = Some(shift);
+    }
+    shared_shift.is_some_and(|shift| shift != IndentationShift::Stable)
+}
+
+fn split_indentation(line: &str) -> (&str, &str) {
+    let indent = line
+        .as_bytes()
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    line.split_at(indent)
+}
+
+fn indentation_shift(before: &str, after: &str) -> Option<IndentationShift> {
+    if before == after {
+        return Some(IndentationShift::Stable);
+    }
+    if let Some(added) = after.strip_suffix(before) {
+        return Some(IndentationShift::Added(added.to_owned()));
+    }
+    if let Some(removed) = before.strip_suffix(after) {
+        return Some(IndentationShift::Removed(removed.to_owned()));
+    }
+    None
 }
 
 /// Present exact physical correspondence once, in the current revision.
@@ -648,7 +832,7 @@ fn event_rows_order(events: &[RowEvent], source_layout: &SourceLayout) -> Option
 /// Independently formed structural units can claim the two sides of a stable line as if it
 /// were a removal and addition. The physical-line graph is the language-neutral authority for
 /// those rows: old ghosts disappear and one current owner remains as context. Explicit
-/// structural movement already uses `Moved` rows and remains outside this normalization.
+/// structural movement already uses atomic move blocks and remains outside this normalization.
 fn normalize_stable_revision_rows(
     changes: &mut Vec<DraftFragment>,
     correspondence: &Correspondence,
@@ -666,13 +850,13 @@ fn normalize_stable_revision_rows(
             RowEvent::Added(line) => {
                 changed_after.insert(line.number);
             }
-            RowEvent::Current(line) if !line.has_changes() => {
-                current_owners.insert(line.number);
-                context_owners.insert(line.number);
+            RowEvent::Context(line) => {
+                current_owners.insert(*line);
+                context_owners.insert(*line);
             }
             _ => {
                 let after = match row {
-                    RowEvent::LineEnding(_) | RowEvent::Elision(_) => None,
+                    RowEvent::LineEnding(_) => None,
                     row => row_after_source_line(row),
                 };
                 current_owners.extend(after);
@@ -682,7 +866,8 @@ fn normalize_stable_revision_rows(
     }
 
     let stable = correspondence
-        .line_links
+        .source
+        .lines
         .iter()
         .filter_map(|link| {
             let before = link.before + 1;
@@ -720,19 +905,17 @@ fn normalize_stable_revision_rows(
             .flat_map(|row| {
                 if matches!(
                     &row,
-                    RowEvent::Current(line)
-                        if !line.has_changes() && relocated_after.contains(&line.number)
+                    RowEvent::Context(line) if relocated_after.contains(line)
                 ) {
                     return Vec::new();
                 }
                 match row {
                     RowEvent::Removed(line) if stable_before.contains(&line.number) => Vec::new(),
-                    RowEvent::Added(mut line) if stable_after.contains(&line.number) => {
+                    RowEvent::Added(line) if stable_after.contains(&line.number) => {
                         if !current_owners.insert(line.number) {
                             return Vec::new();
                         }
-                        line.highlights.clear();
-                        vec![RowEvent::Current(line)]
+                        vec![RowEvent::Context(line.number)]
                     }
                     row => vec![row],
                 }
@@ -754,7 +937,7 @@ fn normalize_containment(
 ) {
     let mut wrapper_pairs = HashSet::new();
     let mut stable_exact = Vec::new();
-    for link in &correspondence.leaf_links {
+    for link in correspondence.tree.leaf_links() {
         let before = pair.before.node(link.before);
         let after = pair.after.node(link.after);
         if link.placement != Placement::Stable {
@@ -858,7 +1041,7 @@ fn normalize_containment(
                         return Some(RowEvent::Removed(line));
                     };
                     let line = retained_source_row(&pair.before, &line, ranges);
-                    if !line_has_material_highlight(&pair.before, &line) {
+                    if !line_has_material_change(&pair.before, &line) {
                         return None;
                     }
                     material_removed.insert(line.number);
@@ -886,7 +1069,7 @@ fn normalize_containment(
                     if paired_removal {
                         RowEvent::Added(line)
                     } else {
-                        RowEvent::Current(line)
+                        current_event(line)
                     }
                 }
                 row => row,
@@ -930,16 +1113,16 @@ fn retained_source_row(
     let source = &tree.source.lines()[line.number - 1];
     let mut cursor = source.content_bytes.start;
     let mut retained = retained.to_vec();
-    for highlight in &line.highlights {
-        if cursor < highlight.start
+    for changed_range in &line.changed_bytes {
+        if cursor < changed_range.start
             && tree
                 .source
-                .slice(cursor..highlight.start)
+                .slice(cursor..changed_range.start)
                 .is_some_and(|text| text.chars().all(char::is_whitespace))
         {
-            retained.push(cursor..highlight.start);
+            retained.push(cursor..changed_range.start);
         }
-        cursor = cursor.max(highlight.end);
+        cursor = cursor.max(changed_range.end);
     }
     if cursor < source.content_bytes.end
         && tree
@@ -975,10 +1158,10 @@ fn ranges_excluding(bytes: Range<usize>, excluded: &[Range<usize>]) -> Vec<Range
     changed
 }
 
-fn line_has_material_highlight(tree: &SyntaxTree<'_>, line: &SelectedLine) -> bool {
-    line.highlights.iter().any(|highlight| {
+fn line_has_material_change(tree: &SyntaxTree<'_>, line: &SelectedLine) -> bool {
+    line.changed_bytes.iter().any(|changed_range| {
         tree.source
-            .slice(highlight.clone())
+            .slice(changed_range.clone())
             .is_some_and(|text| !text.trim().is_empty())
     })
 }
@@ -1009,14 +1192,23 @@ fn bridge_retained_layout(tree: &SyntaxTree<'_>, ranges: &mut Vec<Range<usize>>)
 
 fn row_has_signal(row: &RowEvent) -> bool {
     match row {
-        RowEvent::Current(line) => line.has_changes(),
-        RowEvent::Reflow(_)
+        RowEvent::Context(_) => false,
+        RowEvent::Edited(_)
+        | RowEvent::Reflow(_)
         | RowEvent::Removed(_)
         | RowEvent::Added(_)
         | RowEvent::LineEnding(_)
-        | RowEvent::Moved { .. }
+        | RowEvent::Move(_)
         | RowEvent::Compact(_) => true,
-        RowEvent::Elision(_) => false,
+    }
+}
+
+/// Preserve whether one retained current row carries a material source edit.
+fn current_event(line: SelectedLine) -> RowEvent {
+    if line.has_changes() {
+        RowEvent::Edited(line)
+    } else {
+        RowEvent::Context(line.number)
     }
 }
 
@@ -1044,7 +1236,7 @@ fn form_units(
     let mut fragments = Vec::new();
     let mut preceding_after_lines = 0;
 
-    for edit in &correspondence.units {
+    for edit in correspondence.source.review_units(&correspondence.tree) {
         match edit {
             UnitEdit::Matched(unit) => {
                 form_matched_unit(pair, correspondence, anchor_facts, unit, &mut fragments);
@@ -1092,7 +1284,7 @@ fn form_units(
             }
         }
     }
-    for fallback in &correspondence.line_fallbacks {
+    for fallback in &correspondence.source.fallbacks {
         let excerpts = form_line_region(
             pair,
             correspondence,
@@ -1124,7 +1316,7 @@ fn form_matched_unit(
 ) {
     let after_node = pair.after.node(unit.after);
     if unit.placement == Placement::Reordered && unit.relation.full_equal() {
-        fragments.extend(form_move(pair, correspondence, unit));
+        fragments.extend(form_move(pair, unit));
         return;
     }
     if unit.relation.source_equal() {
@@ -1134,7 +1326,7 @@ fn form_matched_unit(
     if unit.role == SourceRole::Wiring {
         let before = pair.before.node(unit.before);
         if before.lines.len() != 1 || after_node.lines.len() != 1 {
-            let composites = correspondence.unit_composites(unit);
+            let composites = correspondence.tree.unit_composites(unit);
             let excerpts = form_line_region(
                 pair,
                 correspondence,
@@ -1169,7 +1361,7 @@ fn form_matched_unit(
 
     match unit.comparison {
         ComparisonStrategy::Linewise => {
-            let composites = correspondence.unit_composites(unit);
+            let composites = correspondence.tree.unit_composites(unit);
             fragments.extend(form_line_region(
                 pair,
                 correspondence,
@@ -1217,7 +1409,7 @@ fn form_matched_unit(
                         before: Some(pair.before.node(unit.before).lines.clone()),
                         after: Some(after_node.lines.clone()),
                     },
-                    correspondence.unit_composites(unit),
+                    correspondence.tree.unit_composites(unit),
                     Some(unit.after),
                     LineAnchors {
                         basis: structural_anchor_basis(pair, unit),
@@ -1255,6 +1447,7 @@ fn has_retainable_reparented_region(
         pair.after.source.lines().len(),
     );
     correspondence
+        .tree
         .unit_composites(unit)
         .iter()
         .copied()
@@ -1275,7 +1468,7 @@ fn has_unmatched_before_content(
                 ContentChannel::Comment | ContentChannel::Layout
             )
         });
-        significant && correspondence.before_leaf_link(leaf_id).is_none()
+        significant && correspondence.tree.before_leaf_link(leaf_id).is_none()
     })
 }
 
@@ -1315,76 +1508,62 @@ fn form_one_sided_lines(
     }
 }
 
-fn form_move(
-    pair: &SyntaxPair<'_, '_>,
-    correspondence: &Correspondence,
-    unit: &MatchedUnit,
-) -> Option<DraftFragment> {
+fn form_move(pair: &SyntaxPair<'_, '_>, unit: &MatchedUnit) -> Option<DraftFragment> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
-    let mut lines = after
-        .lines
-        .clone()
-        .filter_map(|number| pair.after.source.line(number))
-        .map(|line| select_line(line, &[]))
-        .collect::<Vec<_>>();
-    let first = lines.first().cloned()?;
-    if let Some(rows) = moved_rows_with_line_endings(
-        pair,
-        before.lines.clone(),
-        after.lines.clone(),
-        correspondence.unit_line_links(unit),
-        &lines,
-    ) {
-        return draft_fragment(ChangeNature::Move, rows, None);
-    }
-    if lines.len() == 1 {
-        return draft_fragment(
-            ChangeNature::Move,
-            vec![RowEvent::Moved {
-                before: Some(before.lines.start),
-                after: first,
-            }],
-            None,
-        );
-    }
-
-    let last = lines.pop().expect("a multi-line move has a final line");
-    lines.remove(0);
-    let mut rows = vec![RowEvent::Moved {
-        before: Some(before.lines.start),
-        after: first,
-    }];
-    if lines.len() == 1 {
-        rows.push(RowEvent::Current(
-            lines.pop().expect("one middle line remains"),
-        ));
-    } else if !lines.is_empty() {
-        rows.push(RowEvent::Elision(LineCoverage {
-            before: Some(before.lines.start + 1..before.lines.end.saturating_sub(1)),
-            after: Some(after.lines.start + 1..after.lines.end.saturating_sub(1)),
-        }));
-    }
-    rows.push(RowEvent::Moved {
-        before: None,
-        after: last,
-    });
-    draft_fragment(ChangeNature::Move, rows, None)
+    let line_links = local_line_links(pair, unit.before, unit.after);
+    form_moved_lines(pair, before.lines.clone(), after.lines.clone(), &line_links)
 }
 
-/// A move remains the primary fact, but concrete terminator edits inside it cannot disappear.
-fn moved_rows_with_line_endings(
+fn form_exact_relocation(
+    pair: &SyntaxPair<'_, '_>,
+    relocation: RelocatedNode,
+) -> Option<DraftFragment> {
+    let before = pair.before.node(relocation.before).lines.clone();
+    let after = pair.after.node(relocation.after).lines.clone();
+    let before_indices = line_indices(Some(before.clone()), pair.before.source.lines().len());
+    let after_indices = line_indices(Some(after.clone()), pair.after.source.lines().len());
+    let links = before_indices
+        .zip(after_indices)
+        .map(|(before, after)| LineLink { before, after })
+        .collect::<Vec<_>>();
+    form_moved_lines(pair, before, after, &links)
+}
+
+fn form_moved_lines(
+    pair: &SyntaxPair<'_, '_>,
+    before: Range<usize>,
+    after: Range<usize>,
+    line_links: &[LineLink],
+) -> Option<DraftFragment> {
+    if after.is_empty()
+        || after
+            .clone()
+            .any(|number| pair.after.source.line(number).is_none())
+    {
+        return None;
+    }
+    let line_endings = move_line_ending_changes(pair, before.clone(), after.clone(), line_links);
+    draft_fragment(
+        ChangeNature::Move,
+        vec![RowEvent::Move(MoveBlock {
+            before,
+            after,
+            line_endings,
+        })],
+        None,
+    )
+}
+
+/// Retain concrete terminator edits without expanding a semantic move into display rows.
+fn move_line_ending_changes(
     pair: &SyntaxPair<'_, '_>,
     before: Range<usize>,
     after: Range<usize>,
     links: &[LineLink],
-    lines: &[SelectedLine],
-) -> Option<Vec<RowEvent>> {
+) -> Vec<LineEndingChange> {
     let before_indices = line_indices(Some(before.clone()), pair.before.source.lines().len());
     let after_indices = line_indices(Some(after.clone()), pair.after.source.lines().len());
-    if after_indices.len() != lines.len() {
-        return None;
-    }
     let mut matched_before = vec![false; before_indices.len()];
     let mut matched_after = vec![false; after_indices.len()];
     let mut endings = vec![None; after_indices.len()];
@@ -1446,53 +1625,15 @@ fn moved_rows_with_line_endings(
             });
         }
     }
-    if before_only.is_empty() && endings.iter().all(Option::is_none) {
-        return None;
-    }
-
-    let mut rows = vec![RowEvent::Moved {
-        before: Some(before.start),
-        after: lines[0].clone(),
-    }];
-    for endpoint in before_only {
-        rows.push(RowEvent::LineEnding(LineEndingChange {
+    let mut changes = before_only
+        .into_iter()
+        .map(|endpoint| LineEndingChange {
             before: Some(endpoint),
             after: None,
-        }));
-    }
-    rows.extend(endings[0].map(RowEvent::LineEnding));
-    if lines.len() == 1 {
-        return Some(rows);
-    }
-
-    let last = lines.len() - 1;
-    let show_only_middle = (lines.len() == 3).then_some(1);
-    let mut offset = 1;
-    while offset < last {
-        let selected = show_only_middle == Some(offset) || endings[offset].is_some();
-        if selected {
-            rows.push(RowEvent::Current(lines[offset].clone()));
-            rows.extend(endings[offset].map(RowEvent::LineEnding));
-            offset += 1;
-            continue;
-        }
-
-        let start = offset;
-        while offset < last && show_only_middle != Some(offset) && endings[offset].is_none() {
-            offset += 1;
-        }
-        rows.push(RowEvent::Elision(LineCoverage {
-            before: (before.len() == after.len())
-                .then(|| before.start + start..before.start + offset),
-            after: Some(after.start + start..after.start + offset),
-        }));
-    }
-    rows.push(RowEvent::Moved {
-        before: None,
-        after: lines[last].clone(),
-    });
-    rows.extend(endings[last].map(RowEvent::LineEnding));
-    Some(rows)
+        })
+        .collect::<Vec<_>>();
+    changes.extend(endings.into_iter().flatten());
+    changes
 }
 
 fn form_reflow(
@@ -1505,6 +1646,7 @@ fn form_reflow(
     let before_lines = line_indices(Some(before.lines.clone()), pair.before.source.lines().len());
     let after_lines = line_indices(Some(after.lines.clone()), pair.after.source.lines().len());
     let exact_after = correspondence
+        .source
         .line_links_in(before_lines, after_lines)
         .map(|link| link.after + 1)
         .collect::<HashSet<_>>();
@@ -1512,12 +1654,11 @@ fn form_reflow(
         .lines
         .clone()
         .filter_map(|number| pair.after.source.line(number))
-        .map(|line| select_line(line, &[]))
         .map(|line| {
             if exact_after.contains(&line.number) {
-                RowEvent::Current(line)
+                RowEvent::Context(line.number)
             } else {
-                RowEvent::Reflow(line)
+                RowEvent::Reflow(line.number)
             }
         })
         .collect::<Vec<_>>();
@@ -1540,6 +1681,7 @@ fn form_reflow_with_comments(
     let before_lines = line_indices(Some(before.lines.clone()), pair.before.source.lines().len());
     let after_lines = line_indices(Some(after.lines.clone()), pair.after.source.lines().len());
     let exact_after = correspondence
+        .source
         .line_links_in(before_lines, after_lines)
         .filter(|link| {
             !before_comment_lines.contains(&(link.before + 1))
@@ -1555,7 +1697,6 @@ fn form_reflow_with_comments(
         .lines
         .clone()
         .filter_map(|number| pair.after.source.line(number))
-        .map(|line| select_line(line, &[]))
     {
         while edits
             .peek()
@@ -1567,9 +1708,9 @@ fn form_reflow_with_comments(
             continue;
         }
         let row = if exact_after.contains(&line.number) {
-            RowEvent::Current(line)
+            RowEvent::Context(line.number)
         } else {
-            RowEvent::Reflow(line)
+            RowEvent::Reflow(line.number)
         };
         rows.push(row);
     }
@@ -1608,7 +1749,7 @@ fn form_payload(
                 before: Some(before.lines.clone()),
                 after: Some(after.lines.clone()),
             },
-            correspondence.unit_composites(unit),
+            correspondence.tree.unit_composites(unit),
             Some(unit.after),
             LineAnchors {
                 basis: structural_anchor_basis(pair, unit),
@@ -1619,6 +1760,7 @@ fn form_payload(
     }
     edits.extend(modified_payload_edits(pair, correspondence, unit));
     let mut changed_before = correspondence
+        .tree
         .unit_leaf_links(unit)
         .iter()
         .filter(|link| {
@@ -1627,6 +1769,7 @@ fn form_payload(
         .map(|link| link.before)
         .collect::<HashSet<_>>();
     let mut changed_after = correspondence
+        .tree
         .unit_leaf_links(unit)
         .iter()
         .filter(|link| {
@@ -1635,6 +1778,7 @@ fn form_payload(
         .map(|link| link.after)
         .collect::<HashSet<_>>();
     for composite in correspondence
+        .tree
         .unit_composites(unit)
         .iter()
         .filter(|composite| composite.placement == Placement::Reordered)
@@ -1647,7 +1791,7 @@ fn form_payload(
             !matches!(
                 leaf.channel,
                 ContentChannel::Comment | ContentChannel::Layout
-            ) && correspondence.before_leaf_link(*node).is_none()
+            ) && correspondence.tree.before_leaf_link(*node).is_none()
         })
     }));
     changed_after.extend(descendant_leaves(&pair.after, unit.after).filter(|node| {
@@ -1655,7 +1799,7 @@ fn form_payload(
             !matches!(
                 leaf.channel,
                 ContentChannel::Comment | ContentChannel::Layout
-            ) && correspondence.after_leaf_link(*node).is_none()
+            ) && correspondence.tree.after_leaf_link(*node).is_none()
         })
     }));
     changed_before.retain(|leaf| !dependents.before.contains(leaf));
@@ -1672,7 +1816,7 @@ fn form_payload(
         .filter_map(|number| pair.before.source.line(number))
         .filter(|line| !claimed_before.contains(&line.number))
         .map(|line| select_line(line, &before_marked))
-        .any(|line| line.has_changes() && !line_is_fully_highlighted(&pair.before, &line));
+        .any(|line| line.has_changes() && !line_is_fully_changed(&pair.before, &line));
     if partial_removal {
         return form_line_region(
             pair,
@@ -1681,7 +1825,7 @@ fn form_payload(
                 before: Some(before.lines.clone()),
                 after: Some(after.lines.clone()),
             },
-            correspondence.unit_composites(unit),
+            correspondence.tree.unit_composites(unit),
             Some(unit.after),
             LineAnchors {
                 basis: structural_anchor_basis(pair, unit),
@@ -1706,7 +1850,7 @@ fn form_payload(
                 before: Some(before.lines.clone()),
                 after: Some(after.lines.clone()),
             },
-            correspondence.unit_composites(unit),
+            correspondence.tree.unit_composites(unit),
             Some(unit.after),
             LineAnchors {
                 basis: structural_anchor_basis(pair, unit),
@@ -1738,7 +1882,7 @@ fn form_payload(
         if changed_lines.contains(&line.number) {
             continue;
         }
-        rows.push(RowEvent::Current(line));
+        rows.push(current_event(line));
     }
     for edit in edits {
         append_line_edit_rows(&mut rows, edit);
@@ -1768,56 +1912,65 @@ fn payload_requires_node_snap(
     correspondence: &Correspondence,
     unit: &MatchedUnit,
 ) -> bool {
-    correspondence.unit_leaf_links(unit).iter().any(|link| {
-        if link.relation != LeafRelation::Modified {
-            return false;
-        }
-        let before = pair.before.node(link.before);
-        let after = pair.after.node(link.after);
-        let significant = before.leaf.is_some_and(|leaf| {
-            !matches!(
-                leaf.channel,
-                ContentChannel::Comment | ContentChannel::Layout
-            )
-        }) && after.leaf.is_some_and(|leaf| {
-            !matches!(
-                leaf.channel,
-                ContentChannel::Comment | ContentChannel::Layout
-            )
-        });
-        if !significant {
-            return false;
-        }
-        if before.lines.len() > 1 || after.lines.len() > 1 {
-            return true;
-        }
-
-        let owner = correspondence
-            .scopes
-            .iter()
-            .filter(|scope| {
-                pair.before.contains(scope.before, link.before)
-                    && pair.after.contains(scope.after, link.after)
-                    && pair.before.contains(unit.before, scope.before)
-                    && pair.after.contains(unit.after, scope.after)
-            })
-            .min_by_key(|scope| {
-                pair.before.node(scope.before).bytes.len()
-                    + pair.after.node(scope.after).bytes.len()
+    correspondence
+        .tree
+        .unit_leaf_links(unit)
+        .iter()
+        .any(|link| {
+            if link.relation != LeafRelation::Modified {
+                return false;
+            }
+            let before = pair.before.node(link.before);
+            let after = pair.after.node(link.after);
+            let significant = before.leaf.is_some_and(|leaf| {
+                !matches!(
+                    leaf.channel,
+                    ContentChannel::Comment | ContentChannel::Layout
+                )
+            }) && after.leaf.is_some_and(|leaf| {
+                !matches!(
+                    leaf.channel,
+                    ContentChannel::Comment | ContentChannel::Layout
+                )
             });
-        let Some(owner) = owner else {
-            return false;
-        };
-        if parser_node_frames_match(pair, owner.before, owner.after) {
-            return false;
-        }
+            if !significant {
+                return false;
+            }
+            if before.lines.len() > 1 || after.lines.len() > 1 {
+                return true;
+            }
 
-        !correspondence.unit_leaf_links(unit).iter().any(|retained| {
-            retained.wrapper.is_some()
-                && pair.before.contains(owner.before, retained.before)
-                && pair.after.contains(owner.after, retained.after)
+            let owner = correspondence
+                .tree
+                .scopes
+                .iter()
+                .filter(|scope| {
+                    pair.before.contains(scope.before, link.before)
+                        && pair.after.contains(scope.after, link.after)
+                        && pair.before.contains(unit.before, scope.before)
+                        && pair.after.contains(unit.after, scope.after)
+                })
+                .min_by_key(|scope| {
+                    pair.before.node(scope.before).bytes.len()
+                        + pair.after.node(scope.after).bytes.len()
+                });
+            let Some(owner) = owner else {
+                return false;
+            };
+            if parser_node_frames_match(pair, owner.before, owner.after) {
+                return false;
+            }
+
+            !correspondence
+                .tree
+                .unit_leaf_links(unit)
+                .iter()
+                .any(|retained| {
+                    retained.wrapper.is_some()
+                        && pair.before.contains(owner.before, retained.before)
+                        && pair.after.contains(owner.after, retained.after)
+                })
         })
-    })
 }
 
 /// Whether a matched parser node occupies equivalent physical-line surroundings.
@@ -1871,17 +2024,19 @@ fn comment_edits(
 ) -> Vec<LineEdit> {
     let mut edits = Vec::new();
     let linked_before = correspondence
+        .tree
         .unit_leaf_links(unit)
         .iter()
         .map(|link| link.before)
         .collect::<HashSet<_>>();
     let linked_after = correspondence
+        .tree
         .unit_leaf_links(unit)
         .iter()
         .map(|link| link.after)
         .collect::<HashSet<_>>();
 
-    for link in correspondence.unit_leaf_links(unit) {
+    for link in correspondence.tree.unit_leaf_links(unit) {
         let before_leaf = pair.before.node(link.before).leaf;
         let after_leaf = pair.after.node(link.after).leaf;
         let comment = before_leaf.is_some_and(|leaf| leaf.channel == ContentChannel::Comment)
@@ -1956,7 +2111,7 @@ fn retained_decorations(
     unit: &MatchedUnit,
 ) -> RetainedDecorations {
     let mut dependents = RetainedDecorations::default();
-    for link in correspondence.unit_composites(unit) {
+    for link in correspondence.tree.unit_composites(unit) {
         let before = pair.before.node(link.before);
         let after = pair.after.node(link.after);
         if before.decoration_owner.is_none()
@@ -1972,7 +2127,7 @@ fn retained_decorations(
             .after
             .extend(descendant_leaves(&pair.after, link.after));
     }
-    for link in correspondence.unit_leaf_links(unit) {
+    for link in correspondence.tree.unit_leaf_links(unit) {
         if link.relation != LeafRelation::Exact
             || pair.before.node(link.before).decoration_owner.is_none()
             || pair.after.node(link.after).decoration_owner.is_none()
@@ -2040,7 +2195,7 @@ fn modified_payload_edits(
     unit: &MatchedUnit,
 ) -> Vec<LineEdit> {
     let mut edits = Vec::new();
-    for link in correspondence.unit_leaf_links(unit) {
+    for link in correspondence.tree.unit_leaf_links(unit) {
         if link.relation != LeafRelation::Modified {
             continue;
         }
@@ -2118,7 +2273,7 @@ fn fully_marked_line_edits(
     let mut edits = Vec::new();
     for line in before_lines.filter_map(|number| pair.before.source.line(number)) {
         let display = select_line(line, before_marked);
-        if line_is_fully_highlighted(&pair.before, &display) {
+        if line_is_fully_changed(&pair.before, &display) {
             edits.push(changed_line_edit(
                 &pair.before,
                 Some(line),
@@ -2129,7 +2284,7 @@ fn fully_marked_line_edits(
     }
     for line in after_lines.filter_map(|number| pair.after.source.line(number)) {
         let display = select_line(line, after_marked);
-        if line_is_fully_highlighted(&pair.after, &display) {
+        if line_is_fully_changed(&pair.after, &display) {
             edits.push(changed_line_edit(
                 &pair.before,
                 None,
@@ -2141,22 +2296,22 @@ fn fully_marked_line_edits(
     edits
 }
 
-fn line_is_fully_highlighted(tree: &SyntaxTree<'_>, line: &SelectedLine) -> bool {
-    if !line_has_material_highlight(tree, line) {
+fn line_is_fully_changed(tree: &SyntaxTree<'_>, line: &SelectedLine) -> bool {
+    if !line_has_material_change(tree, line) {
         return false;
     }
     let source = &tree.source.lines()[line.number - 1];
     let mut cursor = source.content_bytes.start;
-    for highlight in &line.highlights {
-        if cursor < highlight.start
+    for changed_range in &line.changed_bytes {
+        if cursor < changed_range.start
             && tree
                 .source
-                .slice(cursor..highlight.start)
+                .slice(cursor..changed_range.start)
                 .is_some_and(|text| !text.trim().is_empty())
         {
             return false;
         }
-        cursor = cursor.max(highlight.end);
+        cursor = cursor.max(changed_range.end);
     }
     cursor >= source.content_bytes.end
         || tree
@@ -2827,6 +2982,7 @@ fn line_facts(
                     }
                     Retention::Reflow => {
                         let unchanged_after = correspondence
+                            .source
                             .line_links_in(region.before.clone(), region.after.clone())
                             .map(|link| link.after)
                             .collect();
@@ -2884,6 +3040,7 @@ fn physical_line_checkpoints(
     after: Range<usize>,
 ) -> Vec<LineCheckpoint> {
     let mut checkpoints = correspondence
+        .source
         .line_links_in(before.clone(), after.clone())
         .map(|link| LineCheckpoint::Exact {
             before: link.before,
@@ -2892,6 +3049,7 @@ fn physical_line_checkpoints(
         .collect::<Vec<_>>();
     checkpoints.extend(
         correspondence
+            .source
             .line_ending_edits_in(before.clone(), after.clone())
             .map(|link| LineCheckpoint::TerminatorEdit {
                 before: link.before,
@@ -2909,10 +3067,7 @@ fn physical_line_checkpoints(
 fn append_line_fact_rows(rows: &mut Vec<RowEvent>, pair: &SyntaxPair<'_, '_>, fact: &LineFact) {
     match fact {
         LineFact::Context { after } => {
-            rows.push(RowEvent::Current(select_line(
-                &pair.after.source.lines()[*after],
-                &[],
-            )));
+            rows.push(RowEvent::Context(pair.after.source.lines()[*after].number));
         }
         LineFact::Edit { before, after } => {
             append_line_change_rows(rows, pair, before.clone(), after.clone());
@@ -2992,9 +3147,9 @@ fn append_retained_region_rows(
     unchanged_after: &HashSet<usize>,
 ) {
     for index in after.clone() {
-        let line = select_line(&pair.after.source.lines()[index], &[]);
+        let line = pair.after.source.lines()[index].number;
         let row = if unchanged_after.contains(&index) {
-            RowEvent::Current(line)
+            RowEvent::Context(line)
         } else {
             RowEvent::Reflow(line)
         };
@@ -3004,12 +3159,12 @@ fn append_retained_region_rows(
 
 fn row_after_source_line(row: &RowEvent) -> Option<usize> {
     match row {
-        RowEvent::Current(line) | RowEvent::Reflow(line) => Some(line.number),
+        RowEvent::Context(line) | RowEvent::Reflow(line) => Some(*line),
+        RowEvent::Edited(line) => Some(line.number),
         RowEvent::Added(line) => Some(line.number),
-        RowEvent::Moved { after, .. } => Some(after.number),
+        RowEvent::Move(change) => Some(change.after.start),
         RowEvent::Compact(word) => word.after_line,
         RowEvent::LineEnding(change) => change.after.map(|endpoint| endpoint.line),
-        RowEvent::Elision(coverage) => coverage.after.as_ref().map(|range| range.start),
         RowEvent::Removed(_) => None,
     }
 }
@@ -3017,10 +3172,11 @@ fn row_after_source_line(row: &RowEvent) -> Option<usize> {
 fn row_before_source_line(row: &RowEvent) -> Option<usize> {
     match row {
         RowEvent::Removed(line) => Some(line.number),
-        RowEvent::Moved { before, .. } => *before,
+        RowEvent::Move(change) => Some(change.before.start),
         RowEvent::Compact(word) => word.before_line,
         RowEvent::LineEnding(change) => change.before.map(|endpoint| endpoint.line),
-        RowEvent::Elision(coverage) => coverage.before.as_ref().map(|range| range.start),
-        RowEvent::Current(_) | RowEvent::Reflow(_) | RowEvent::Added(_) => None,
+        RowEvent::Context(_) | RowEvent::Edited(_) | RowEvent::Reflow(_) | RowEvent::Added(_) => {
+            None
+        }
     }
 }

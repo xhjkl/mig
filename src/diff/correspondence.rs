@@ -1,4 +1,4 @@
-//! Language-agnostic commonality over neutral before/after trees.
+//! Build neutral tree correspondence and project it onto physical source.
 
 use super::source::LineEnding;
 use super::syntax::{
@@ -11,31 +11,41 @@ use std::ops::Range;
 
 const MAX_LOCAL_ALIGNMENT_CELLS: usize = 16_384;
 
-/// SyntaxTree-only edit graph consumed without structural or unit rematching.
+/// Product of the canonical tree diff and its physical-source projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Correspondence {
-    /// Semantic review units not superseded by an exact local line fallback.
+    pub tree: TreeDiff,
+    pub source: SourceProjection,
+}
+
+/// Canonical edit script and one-to-one links between neutral syntax trees.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeDiff {
     pub units: Vec<UnitEdit>,
-    /// Global non-crossing physical-line alignment certified by semantic-scope gaps.
-    pub line_links: Vec<LineLink>,
-    /// Content-paired physical rows whose concrete terminators differ.
-    pub line_ending_edits: Vec<LineLink>,
-    /// Source-exact regions reviewed linewise without discarding neighboring syntax.
-    pub line_fallbacks: Vec<LineFallback>,
-    /// Physical row pairs local to reordered units and therefore non-monotone globally.
-    unit_line_links: Vec<LineLink>,
-    pub leaf_links: Vec<LeafLink>,
-    /// Dense before-node lookup into `leaf_links`.
-    before_leaf: Vec<Option<usize>>,
-    /// Dense after-node lookup into `leaf_links`.
-    after_leaf: Vec<Option<usize>>,
-    /// Exact named-subtree links, including nested structural evidence.
+    leaves: LeafCorrespondence,
     pub composites: Vec<NodeLink>,
-    /// Complete parser-node correspondence used to keep later selection on node boundaries.
+    relocations: Vec<RelocatedNode>,
     pub scopes: Vec<ScopeLink>,
 }
 
-impl Correspondence {
+/// One-to-one leaf links plus their dense node indexes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LeafCorrespondence {
+    links: Vec<LeafLink>,
+    before: Vec<Option<usize>>,
+    after: Vec<Option<usize>>,
+}
+
+/// Physical-row links, local fallbacks, and the structural units they leave authoritative.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceProjection {
+    pub lines: Vec<LineLink>,
+    pub line_endings: Vec<LineLink>,
+    pub fallbacks: Vec<LineFallback>,
+    review_units: Vec<usize>,
+}
+
+impl SourceProjection {
     /// Exact physical-line links wholly contained by a pair of absolute line ranges.
     pub fn line_links_in(
         &self,
@@ -43,12 +53,10 @@ impl Correspondence {
         after: Range<usize>,
     ) -> impl Iterator<Item = LineLink> + '_ {
         let start = self
-            .line_links
+            .lines
             .partition_point(|link| link.before < before.start);
-        let end = self
-            .line_links
-            .partition_point(|link| link.before < before.end);
-        self.line_links[start..end]
+        let end = self.lines.partition_point(|link| link.before < before.end);
+        self.lines[start..end]
             .iter()
             .copied()
             .filter(move |link| after.contains(&link.after))
@@ -61,25 +69,35 @@ impl Correspondence {
         after: Range<usize>,
     ) -> impl Iterator<Item = LineLink> + '_ {
         let start = self
-            .line_ending_edits
+            .line_endings
             .partition_point(|link| link.before < before.start);
         let end = self
-            .line_ending_edits
+            .line_endings
             .partition_point(|link| link.before < before.end);
-        self.line_ending_edits[start..end]
+        self.line_endings[start..end]
             .iter()
             .copied()
             .filter(move |link| after.contains(&link.after))
     }
 
+    /// Structural units not superseded by a more reliable local line fallback.
+    pub fn review_units<'tree>(
+        &'tree self,
+        tree: &'tree TreeDiff,
+    ) -> impl Iterator<Item = &'tree UnitEdit> + 'tree {
+        self.review_units.iter().map(|index| &tree.units[*index])
+    }
+}
+
+impl TreeDiff {
     /// Leaf links owned by one matched review unit.
     pub fn unit_leaf_links(&self, unit: &MatchedUnit) -> &[LeafLink] {
-        &self.leaf_links[unit.leaf_links.clone()]
+        &self.leaves.links[unit.leaf_links.clone()]
     }
 
-    /// Content-paired physical rows owned by one reordered review unit.
-    pub fn unit_line_links(&self, unit: &MatchedUnit) -> &[LineLink] {
-        &self.unit_line_links[unit.line_links.clone()]
+    /// All one-to-one leaf links in before-node order.
+    pub fn leaf_links(&self) -> &[LeafLink] {
+        &self.leaves.links
     }
 
     /// Exact composite links owned by one matched review unit.
@@ -87,16 +105,21 @@ impl Correspondence {
         &self.composites[unit.composites.clone()]
     }
 
+    /// Unique exact nodes retained under a different paired owner.
+    pub fn relocated_nodes(&self) -> &[RelocatedNode] {
+        &self.relocations
+    }
+
     /// Link terminating at one after-world leaf.
     pub fn after_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
-        let link = self.after_leaf.get(node.index()).copied().flatten()?;
-        self.leaf_links.get(link)
+        let link = self.leaves.after.get(node.index()).copied().flatten()?;
+        self.leaves.links.get(link)
     }
 
     /// Link originating at one before-world leaf.
     pub fn before_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
-        let link = self.before_leaf.get(node.index()).copied().flatten()?;
-        self.leaf_links.get(link)
+        let link = self.leaves.before.get(node.index()).copied().flatten()?;
+        self.leaves.links.get(link)
     }
 }
 
@@ -133,7 +156,6 @@ pub struct MatchedUnit {
     pub role: SourceRole,
     pub relation: ContentRelation,
     pub placement: Placement,
-    line_links: Range<usize>,
     leaf_links: Range<usize>,
     composites: Range<usize>,
 }
@@ -195,6 +217,14 @@ pub struct NodeLink {
     parent: ParentCorrespondence,
     pub wrapper: Option<Reparenting>,
     pub placement: Placement,
+}
+
+/// One exact subtree transferred between paired nested owners.
+/// Source formation decides whether its physical rows support move presentation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RelocatedNode {
+    pub before: NodeId,
+    pub after: NodeId,
 }
 
 /// One semantic-container pair that fences all descendant correspondence.
@@ -388,7 +418,7 @@ struct UnitKey<'source> {
     identity: &'source str,
 }
 
-/// Build the complete neutral correspondence graph for one symmetric tree pair.
+/// Build the neutral tree diff, then project it onto physical source.
 pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
     let mut interner = FingerprintInterner::default();
     let before_fingerprints = fingerprints(&pair.before, &mut interner);
@@ -403,42 +433,28 @@ pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         pair.after.root,
     );
     let stable = stable_unit_matches(&before_match, &before_units, &after_units);
-    let physical = if pair.before.grammar.is_none() {
-        PhysicalLineFacts {
-            exact: line_links_from_unit_matches(pair, &before_units, &after_units, &before_match),
-            ..PhysicalLineFacts::default()
-        }
-    } else {
-        physical_line_correspondence_in(
-            pair,
-            0..pair.before.source.lines().len(),
-            0..pair.after.source.lines().len(),
-        )
-    };
-
     let root_scope = ScopeLink {
         before: pair.before.root,
         after: pair.after.root,
         placement: Placement::Stable,
         parent: ParentCorrespondence::Direct,
     };
-    let graph = Correspondence {
+    let tree = TreeDiff {
         units: Vec::new(),
-        line_links: Vec::new(),
-        line_ending_edits: Vec::new(),
-        line_fallbacks: Vec::new(),
-        unit_line_links: Vec::new(),
-        leaf_links: Vec::new(),
-        before_leaf: vec![None; pair.before.nodes.len()],
-        after_leaf: vec![None; pair.after.nodes.len()],
+        leaves: LeafCorrespondence {
+            links: Vec::new(),
+            before: vec![None; pair.before.nodes.len()],
+            after: vec![None; pair.after.nodes.len()],
+        },
         composites: Vec::new(),
+        relocations: Vec::new(),
         scopes: vec![root_scope],
     };
     let mut before_scope = vec![None; pair.before.nodes.len()];
     let mut after_scope = vec![None; pair.after.nodes.len()];
     before_scope[pair.before.root.index()] = Some(0);
     after_scope[pair.after.root.index()] = Some(0);
-    let mut builder = CorrespondenceBuilder {
+    let mut builder = TreeDiffBuilder {
         pair,
         before_units: &before_units,
         after_units: &after_units,
@@ -450,61 +466,274 @@ pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
         before_subtree_sizes: &before_subtree_sizes,
         before_scope,
         after_scope,
-        graph,
+        tree,
     };
     let units = builder.unit_script();
-    builder.graph.units = units;
-    let mut graph = builder.graph;
-    let scope_proof = ScopeProof::new(pair, &graph.scopes);
-    if pair.before.grammar.is_none() {
-        graph.line_links = physical.exact;
-        graph.line_ending_edits = physical.ending_edits;
+    builder.tree.units = units;
+    let relocations = cross_owner_relocations(
+        pair,
+        &builder.tree,
+        &before_fingerprints,
+        &after_fingerprints,
+        &before_subtree_sizes,
+    );
+    builder.tree.relocations = relocations;
+    let tree = builder.tree;
+    let source = project_source(pair, &tree);
+    Correspondence { tree, source }
+}
+
+/// Project canonical tree edits onto exact rows and local linewise fallbacks.
+fn project_source(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff) -> SourceProjection {
+    let physical = if pair.before.grammar.is_none() {
+        PhysicalLineFacts {
+            exact: line_links_from_tree_matches(pair, tree),
+            ..PhysicalLineFacts::default()
+        }
     } else {
-        let scoped = scoped_physical_line_correspondence(pair, &graph, &scope_proof, &physical);
-        graph.line_links = scoped.exact;
-        graph.line_ending_edits = scoped.ending_edits;
-    }
+        physical_line_correspondence_in(
+            pair,
+            0..pair.before.source.lines().len(),
+            0..pair.after.source.lines().len(),
+        )
+    };
+    let scope_proof = ScopeProof::new(pair, &tree.scopes);
+    let (lines, line_endings) = if pair.before.grammar.is_none() {
+        (physical.exact, physical.ending_edits)
+    } else {
+        let scoped = scoped_physical_line_correspondence(pair, tree, &scope_proof, &physical);
+        (scoped.exact, scoped.ending_edits)
+    };
+    let mut source = SourceProjection {
+        lines,
+        line_endings,
+        fallbacks: Vec::new(),
+        review_units: Vec::new(),
+    };
     if pair.before.grammar.is_some() {
-        let fallbacks = local_line_fallbacks(pair, &graph, physical.missing_terminators);
-        let suppressed = graph
+        let fallbacks = local_line_fallbacks(pair, tree, &source, physical.missing_terminators);
+        source.review_units = tree
             .units
             .iter()
-            .map(|edit| {
-                let unit = unit_line_geometry(pair, &graph, edit);
-                fallbacks.iter().any(|fallback| {
+            .enumerate()
+            .filter_map(|(index, edit)| {
+                let unit = unit_line_geometry(pair, &source, edit);
+                let overlaps_fallback = fallbacks.iter().any(|fallback| {
                     (!unit.before.is_empty()
                         && unit.before.start < fallback.before.end
                         && fallback.before.start < unit.before.end)
                         || (!unit.after.is_empty()
                             && unit.after.start < fallback.after.end
                             && fallback.after.start < unit.after.end)
-                })
+                });
+                (!overlaps_fallback).then_some(index)
             })
-            .collect::<Vec<_>>();
-        graph.units = std::mem::take(&mut graph.units)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, edit)| (!suppressed[index]).then_some(edit))
             .collect();
-        graph.line_fallbacks = fallbacks;
+        source.fallbacks = fallbacks;
+    } else {
+        source.review_units = (0..tree.units.len()).collect();
     }
     debug_assert!(
-        scope_correspondence_is_valid(pair, &graph, &graph.scopes, &scope_proof),
+        scope_correspondence_is_valid(pair, tree, &source, &scope_proof),
         "correspondence escaped a semantic-container fence"
     );
-    graph
+    source
+}
+
+/// Recover one exact subtree transferred between already-paired nested owners.
+///
+/// This is deliberately separate from ordinary containment correspondence: both owners survive,
+/// so treating the transfer as a wrap or unwrap would let payload tunnel between sibling domains.
+fn cross_owner_relocations(
+    pair: &SyntaxPair<'_, '_>,
+    tree: &TreeDiff,
+    before_fingerprints: &[NodeFingerprints],
+    after_fingerprints: &[NodeFingerprints],
+    before_subtree_sizes: &[usize],
+) -> Vec<RelocatedNode> {
+    let (before_to_after, after_to_before) = paired_composite_owners(tree);
+    let before_is_paired = |candidate| before_to_after.contains_key(&candidate);
+    let after_is_paired = |candidate| after_to_before.contains_key(&candidate);
+    let mut candidates = Vec::new();
+
+    for edit in &tree.units {
+        let UnitEdit::Matched(unit) = edit else {
+            continue;
+        };
+        let mut before_groups = HashMap::<FingerprintId, Vec<NodeId>>::new();
+        for before in descendant_composites(&pair.before, unit.before) {
+            if before_to_after.contains_key(&before) {
+                continue;
+            }
+            before_groups
+                .entry(before_fingerprints[before.index()].full)
+                .or_default()
+                .push(before);
+        }
+        let mut after_groups = HashMap::<FingerprintId, Vec<NodeId>>::new();
+        for after in descendant_composites(&pair.after, unit.after) {
+            if after_to_before.contains_key(&after) {
+                continue;
+            }
+            after_groups
+                .entry(after_fingerprints[after.index()].full)
+                .or_default()
+                .push(after);
+        }
+
+        for (fingerprint, before_group) in before_groups {
+            let Some(after_group) = after_groups.get(&fingerprint) else {
+                continue;
+            };
+            let ([before], [after]) = (before_group.as_slice(), after_group.as_slice()) else {
+                continue;
+            };
+            let before = *before;
+            let after = *after;
+            let before_node = pair.before.node(before);
+            let after_node = pair.after.node(after);
+            if before_node.seals_wrappers()
+                || after_node.seals_wrappers()
+                || before_node.slot != after_node.slot
+            {
+                continue;
+            }
+
+            let (Some(before_parent), Some(after_parent)) = (before_node.parent, after_node.parent)
+            else {
+                continue;
+            };
+            let Some(before_parent_after) = before_to_after.get(&before_parent).copied() else {
+                continue;
+            };
+            let Some(after_parent_before) = after_to_before.get(&after_parent).copied() else {
+                continue;
+            };
+            if before_parent_after == after_parent || after_parent_before == before_parent {
+                continue;
+            }
+
+            let moved_inward = paired_owner_is_nearest_open_ancestor(
+                &pair.before,
+                after_parent_before,
+                before_parent,
+                &before_is_paired,
+            ) && paired_owner_is_nearest_open_ancestor(
+                &pair.after,
+                after_parent,
+                before_parent_after,
+                &after_is_paired,
+            );
+            let moved_outward = paired_owner_is_nearest_open_ancestor(
+                &pair.before,
+                before_parent,
+                after_parent_before,
+                &before_is_paired,
+            ) && paired_owner_is_nearest_open_ancestor(
+                &pair.after,
+                before_parent_after,
+                after_parent,
+                &after_is_paired,
+            );
+            if !moved_inward && !moved_outward {
+                continue;
+            }
+            candidates.push(RelocatedNode { before, after });
+        }
+    }
+
+    // Claiming outer exact roots first keeps every source row under one relocation producer.
+    candidates.sort_by(|left, right| {
+        before_subtree_sizes[right.before.index()]
+            .cmp(&before_subtree_sizes[left.before.index()])
+            .then_with(|| left.before.cmp(&right.before))
+    });
+    let mut relocations = Vec::<RelocatedNode>::new();
+    for candidate in candidates {
+        let overlaps = relocations.iter().any(|relocation| {
+            pair.before.contains(relocation.before, candidate.before)
+                || pair.before.contains(candidate.before, relocation.before)
+                || pair.after.contains(relocation.after, candidate.after)
+                || pair.after.contains(candidate.after, relocation.after)
+        });
+        if !overlaps {
+            relocations.push(candidate);
+        }
+    }
+    relocations.sort_unstable_by_key(|relocation| relocation.before);
+    relocations
+}
+
+/// Prove `outer` is the first paired owner above `inner` on an open containment spine.
+fn paired_owner_is_nearest_open_ancestor(
+    tree: &SyntaxTree<'_>,
+    inner: NodeId,
+    outer: NodeId,
+    is_paired: &impl Fn(NodeId) -> bool,
+) -> bool {
+    let mut branch = inner;
+    let Some(mut candidate) = tree.node(inner).parent else {
+        return false;
+    };
+    loop {
+        if is_paired(candidate) {
+            return candidate == outer;
+        }
+
+        let node = tree.node(candidate);
+        if node.seals_wrappers()
+            || node.review.is_some()
+            || node.decoration_owner.is_some()
+            || node
+                .children
+                .iter()
+                .copied()
+                .any(|child| child != branch && subtree_contains_fence(tree, child, is_paired))
+        {
+            return false;
+        }
+        branch = candidate;
+        let Some(parent) = node.parent else {
+            return false;
+        };
+        candidate = parent;
+    }
+}
+
+/// Build the one-to-one composite owner map established by ordinary correspondence.
+fn paired_composite_owners(tree: &TreeDiff) -> (HashMap<NodeId, NodeId>, HashMap<NodeId, NodeId>) {
+    let mut before_to_after = HashMap::new();
+    let mut after_to_before = HashMap::new();
+    let mut insert = |before, after| {
+        let previous_after = before_to_after.insert(before, after);
+        let previous_before = after_to_before.insert(after, before);
+        debug_assert!(previous_after.is_none_or(|previous| previous == after));
+        debug_assert!(previous_before.is_none_or(|previous| previous == before));
+    };
+    for edit in &tree.units {
+        if let UnitEdit::Matched(unit) = edit {
+            insert(unit.before, unit.after);
+        }
+    }
+    for link in &tree.scopes {
+        insert(link.before, link.after);
+    }
+    for link in &tree.composites {
+        insert(link.before, link.after);
+    }
+    (before_to_after, after_to_before)
 }
 
 fn scope_correspondence_is_valid(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
-    scopes: &[ScopeLink],
+    tree: &TreeDiff,
+    source: &SourceProjection,
     scope_proof: &ScopeProof,
 ) -> bool {
     if !scope_proof.one_to_one {
         return false;
     }
-    if scopes.iter().any(|link| {
+    if tree.scopes.iter().any(|link| {
         !parent_correspondence_is_valid(pair, scope_proof, link.before, link.after, link.parent)
     }) {
         return false;
@@ -512,14 +741,15 @@ fn scope_correspondence_is_valid(
     let edge_is_valid = |before, after, parent| {
         parent_correspondence_is_valid(pair, scope_proof, before, after, parent)
     };
-    if graph
-        .leaf_links
+    if tree
+        .leaves
+        .links
         .iter()
         .any(|link| !edge_is_valid(link.before, link.after, link.parent))
     {
         return false;
     }
-    if graph
+    if tree
         .composites
         .iter()
         .any(|link| !edge_is_valid(link.before, link.after, link.parent))
@@ -528,16 +758,16 @@ fn scope_correspondence_is_valid(
     }
 
     let line_is_scoped = |link| scope_proof.line_has_scoped_cover(link, false);
-    if graph
-        .line_links
+    if source
+        .lines
         .iter()
         .copied()
         .any(|link| !line_is_scoped(link))
     {
         return false;
     }
-    if graph
-        .line_ending_edits
+    if source
+        .line_endings
         .iter()
         .copied()
         .any(|link| !line_is_scoped(link))
@@ -584,20 +814,17 @@ fn enclosing_semantic_scope(tree: &SyntaxTree<'_>, node: NodeId) -> Option<NodeI
     nearest_scope_owner(tree, tree.node(node).parent?)
 }
 
-/// Exact line-leaf unit edges are the canonical physical-line graph for line trees.
-fn line_links_from_unit_matches(
-    pair: &SyntaxPair<'_, '_>,
-    before: &[UnitRecord<'_>],
-    after: &[UnitRecord<'_>],
-    before_match: &[Option<usize>],
-) -> Vec<LineLink> {
-    before_match
+/// Project exact matched units directly into the physical graph for line trees.
+fn line_links_from_tree_matches(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff) -> Vec<LineLink> {
+    let mut links = tree
+        .units
         .iter()
-        .enumerate()
-        .filter_map(|(before_index, after_index)| {
-            let after_index = (*after_index)?;
-            let before_node = pair.before.node(before[before_index].id);
-            let after_node = pair.after.node(after[after_index].id);
+        .filter_map(|edit| {
+            let UnitEdit::Matched(unit) = edit else {
+                return None;
+            };
+            let before_node = pair.before.node(unit.before);
+            let after_node = pair.after.node(unit.after);
             let before_source = pair.before.source.slice(before_node.bytes.clone())?;
             let after_source = pair.after.source.slice(after_node.bytes.clone())?;
             (before_source == after_source).then(|| LineLink {
@@ -605,7 +832,9 @@ fn line_links_from_unit_matches(
                 after: after_node.lines.start.saturating_sub(1),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    links.sort_unstable_by_key(|link| (link.before, link.after));
+    links
 }
 
 #[derive(Default)]
@@ -892,10 +1121,24 @@ fn physical_line_correspondence_in(
     facts
 }
 
+/// Derive physical row pairs local to one already-matched node pair.
+pub fn local_line_links(pair: &SyntaxPair<'_, '_>, before: NodeId, after: NodeId) -> Vec<LineLink> {
+    let mut facts = physical_line_correspondence_in(
+        pair,
+        zero_based_lines(&pair.before, before),
+        zero_based_lines(&pair.after, after),
+    );
+    facts.exact.append(&mut facts.ending_edits);
+    facts
+        .exact
+        .sort_unstable_by_key(|link| (link.before, link.after));
+    facts.exact
+}
+
 /// Separate scoped physical anchors from exact payload recurring in another semantic owner.
 fn scoped_physical_line_correspondence(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
+    tree: &TreeDiff,
     scope_proof: &ScopeProof,
     global: &PhysicalLineFacts,
 ) -> PhysicalLineFacts {
@@ -903,7 +1146,7 @@ fn scoped_physical_line_correspondence(
         missing_terminators: global.missing_terminators.clone(),
         ..PhysicalLineFacts::default()
     };
-    let semantically_reordered_lines = semantically_reordered_line_links(pair, graph);
+    let semantically_reordered_lines = semantically_reordered_line_links(pair, tree);
     let before_candidates = pair
         .before
         .source
@@ -1104,10 +1347,19 @@ fn line_links_are_monotone(exact: &[LineLink], endings: &[LineLink]) -> bool {
 /// Collect reordered leaf rows whose physical equality cannot erase semantic movement.
 fn semantically_reordered_line_links(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
+    tree: &TreeDiff,
 ) -> HashSet<LineLink> {
     let mut lines = HashSet::new();
-    for link in &graph.leaf_links {
+    for relocation in &tree.relocations {
+        let before = zero_based_lines(&pair.before, relocation.before);
+        let after = zero_based_lines(&pair.after, relocation.after);
+        lines.extend(
+            before
+                .zip(after)
+                .map(|(before, after)| LineLink { before, after }),
+        );
+    }
+    for link in &tree.leaves.links {
         if link.relation != LeafRelation::Exact
             || link.placement != Placement::Reordered
             || !node_owns_complete_lines(&pair.before, link.before)
@@ -1142,16 +1394,17 @@ struct UnitLineGeometry {
 /// Retain syntax everywhere except concrete physical regions it cannot own exactly.
 fn local_line_fallbacks(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
+    tree: &TreeDiff,
+    source: &SourceProjection,
     mut fallbacks: Vec<LineFallback>,
 ) -> Vec<LineFallback> {
     // A move producer can own an unmatched EOF terminator without borrowing
     // the empty global-LCS coordinate on the opposite revision.
-    fallbacks.retain(|fallback| !move_owns_missing_terminator(pair, graph, fallback));
-    let units = graph
+    fallbacks.retain(|fallback| !move_owns_missing_terminator(pair, tree, fallback));
+    let units = tree
         .units
         .iter()
-        .map(|edit| unit_line_geometry(pair, graph, edit))
+        .map(|edit| unit_line_geometry(pair, source, edit))
         .collect::<Vec<_>>();
     let mut before_claims = vec![0_u16; pair.before.source.lines().len()];
     let mut after_claims = vec![0_u16; pair.after.source.lines().len()];
@@ -1162,10 +1415,10 @@ fn local_line_fallbacks(
         increment_claims(&mut before_claims, unit.before.clone());
         increment_claims(&mut after_claims, unit.after.clone());
     }
-    claim_paired_adjacent_layout(pair, graph, &mut before_claims, &mut after_claims);
+    claim_paired_adjacent_layout(pair, tree, &mut before_claims, &mut after_claims);
 
-    let mut checkpoints = graph.line_links.clone();
-    checkpoints.extend(&graph.line_ending_edits);
+    let mut checkpoints = source.lines.clone();
+    checkpoints.extend(&source.line_endings);
     checkpoints.sort_unstable_by_key(|link| (link.before, link.after));
     let mut before_start = 0;
     let mut after_start = 0;
@@ -1183,8 +1436,8 @@ fn local_line_fallbacks(
         after_start = checkpoint.after.saturating_add(1);
     }
 
-    for link in &graph.line_ending_edits {
-        if move_owns_line_ending(pair, graph, *link) {
+    for link in &source.line_endings {
+        if move_owns_line_ending(pair, tree, *link) {
             continue;
         }
         fallbacks.push(LineFallback {
@@ -1199,13 +1452,13 @@ fn local_line_fallbacks(
 
 fn move_owns_missing_terminator(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
+    tree: &TreeDiff,
     fallback: &LineFallback,
 ) -> bool {
     if fallback.before.is_empty() == fallback.after.is_empty() {
         return false;
     }
-    graph.units.iter().any(|edit| {
+    tree.units.iter().any(|edit| {
         let UnitEdit::Matched(unit) = edit else {
             return false;
         };
@@ -1227,12 +1480,8 @@ fn range_contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
 }
 
 /// Exact reordered units render their own concrete terminator facts beside the move.
-fn move_owns_line_ending(
-    pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
-    link: LineLink,
-) -> bool {
-    graph.units.iter().any(|edit| {
+fn move_owns_line_ending(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff, link: LineLink) -> bool {
+    tree.units.iter().any(|edit| {
         let UnitEdit::Matched(unit) = edit else {
             return false;
         };
@@ -1245,7 +1494,7 @@ fn move_owns_line_ending(
 
 fn unit_line_geometry(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
+    source: &SourceProjection,
     edit: &UnitEdit,
 ) -> UnitLineGeometry {
     let mut geometry = match edit {
@@ -1269,17 +1518,17 @@ fn unit_line_geometry(
             expands_fallback: true,
         },
     };
-    geometry.expands_fallback &= !unit_lines_are_physically_paired(graph, &geometry);
+    geometry.expands_fallback &= !unit_lines_are_physically_paired(source, &geometry);
     geometry
 }
 
-fn unit_lines_are_physically_paired(graph: &Correspondence, unit: &UnitLineGeometry) -> bool {
+fn unit_lines_are_physically_paired(source: &SourceProjection, unit: &UnitLineGeometry) -> bool {
     if unit.before.len() != unit.after.len() {
         return false;
     }
-    let mut pairs = graph
+    let mut pairs = source
         .line_links_in(unit.before.clone(), unit.after.clone())
-        .chain(graph.line_ending_edits_in(unit.before.clone(), unit.after.clone()))
+        .chain(source.line_ending_edits_in(unit.before.clone(), unit.after.clone()))
         .collect::<Vec<_>>();
     pairs.sort_unstable_by_key(|link| (link.before, link.after));
     pairs.len() == unit.before.len()
@@ -1318,11 +1567,11 @@ fn increment_claims(claims: &mut [u16], lines: Range<usize>) {
 /// Equal blank separators may travel with their matched owner without becoming edit signal.
 fn claim_paired_adjacent_layout(
     pair: &SyntaxPair<'_, '_>,
-    graph: &Correspondence,
+    tree: &TreeDiff,
     before_claims: &mut [u16],
     after_claims: &mut [u16],
 ) {
-    for edit in &graph.units {
+    for edit in &tree.units {
         let UnitEdit::Matched(unit) = edit else {
             continue;
         };
@@ -2278,8 +2527,8 @@ fn ordered_script_anchors(
     anchors
 }
 
-/// Stateful graph assembly keeps mutation local while tree facts stay immutable.
-struct CorrespondenceBuilder<'input, 'before, 'after> {
+/// Assemble the canonical tree edit script and its one-to-one node links.
+struct TreeDiffBuilder<'input, 'before, 'after> {
     pair: &'input SyntaxPair<'before, 'after>,
     before_units: &'input [UnitRecord<'before>],
     after_units: &'input [UnitRecord<'after>],
@@ -2291,10 +2540,10 @@ struct CorrespondenceBuilder<'input, 'before, 'after> {
     before_subtree_sizes: &'input [usize],
     before_scope: Vec<Option<usize>>,
     after_scope: Vec<Option<usize>>,
-    graph: Correspondence,
+    tree: TreeDiff,
 }
 
-impl CorrespondenceBuilder<'_, '_, '_> {
+impl TreeDiffBuilder<'_, '_, '_> {
     fn unit_script(&mut self) -> Vec<UnitEdit> {
         let script_anchors =
             ordered_script_anchors(self.before_match, self.before_units, self.stable);
@@ -2382,8 +2631,8 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         } else {
             Placement::Reordered
         };
-        let leaf_start = self.graph.leaf_links.len();
-        let composite_start = self.graph.composites.len();
+        let leaf_start = self.tree.leaves.links.len();
+        let composite_start = self.tree.composites.len();
         self.link_unit_contents(before, after, placement);
         let comparison = ComparisonStrategy::reconcile(
             self.before_units[before_index].comparison,
@@ -2393,19 +2642,6 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             self.before_units[before_index].role,
             self.after_units[after_index].role,
         );
-        let line_start = self.graph.unit_line_links.len();
-        if placement == Placement::Reordered && relation.full_equal() {
-            let mut lines = physical_line_correspondence_in(
-                self.pair,
-                zero_based_lines(&self.pair.before, before),
-                zero_based_lines(&self.pair.after, after),
-            );
-            self.graph.unit_line_links.append(&mut lines.exact);
-            self.graph.unit_line_links.append(&mut lines.ending_edits);
-            self.graph.unit_line_links[line_start..]
-                .sort_unstable_by_key(|link| (link.before, link.after));
-        }
-
         edits.push(UnitEdit::Matched(MatchedUnit {
             before,
             after,
@@ -2413,9 +2649,8 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             role,
             relation,
             placement,
-            line_links: line_start..self.graph.unit_line_links.len(),
-            leaf_links: leaf_start..self.graph.leaf_links.len(),
-            composites: composite_start..self.graph.composites.len(),
+            leaf_links: leaf_start..self.tree.leaves.links.len(),
+            composites: composite_start..self.tree.composites.len(),
         }));
     }
 }
@@ -2640,7 +2875,7 @@ struct AnonymousContextKey<'source> {
     identities: Vec<ContextIdentity<'source>>,
 }
 
-impl CorrespondenceBuilder<'_, '_, '_> {
+impl TreeDiffBuilder<'_, '_, '_> {
     fn link_unit_contents(
         &mut self,
         before_unit: NodeId,
@@ -2742,12 +2977,12 @@ impl CorrespondenceBuilder<'_, '_, '_> {
             })
             .collect::<Vec<_>>();
         scopes.sort_unstable_by_key(|link| link.before);
-        let scope_start = self.graph.scopes.len();
+        let scope_start = self.tree.scopes.len();
         for scope in scopes {
             if self.push_scope_link(scope) {
                 continue;
             }
-            for link in self.graph.scopes.drain(scope_start..) {
+            for link in self.tree.scopes.drain(scope_start..) {
                 self.before_scope[link.before.index()] = None;
                 self.after_scope[link.after.index()] = None;
             }
@@ -2813,15 +3048,15 @@ impl CorrespondenceBuilder<'_, '_, '_> {
                 .expect("every maximal exact root survives its own cover");
             self.link_exact_subtree(before, after, link.placement, link.parent, link.wrapper);
         }
-        self.graph.composites.extend(exact_links);
+        self.tree.composites.extend(exact_links);
 
         let before_leaves = descendant_leaves(&pair.before, before_unit)
             .into_iter()
-            .filter(|id| self.graph.before_leaf[id.index()].is_none())
+            .filter(|id| self.tree.leaves.before[id.index()].is_none())
             .collect::<Vec<_>>();
         let after_leaves = descendant_leaves(&pair.after, after_unit)
             .into_iter()
-            .filter(|id| self.graph.after_leaf[id.index()].is_none())
+            .filter(|id| self.tree.leaves.after[id.index()].is_none())
             .collect::<Vec<_>>();
         let exact_leaves = exact_leaf_matches(
             &context,
@@ -2850,11 +3085,11 @@ impl CorrespondenceBuilder<'_, '_, '_> {
 
         let before_remaining = before_leaves
             .into_iter()
-            .filter(|id| self.graph.before_leaf[id.index()].is_none())
+            .filter(|id| self.tree.leaves.before[id.index()].is_none())
             .collect::<Vec<_>>();
         let after_remaining = after_leaves
             .into_iter()
-            .filter(|id| self.graph.after_leaf[id.index()].is_none())
+            .filter(|id| self.tree.leaves.after[id.index()].is_none())
             .collect::<Vec<_>>();
         let before_shapes = before_remaining
             .iter()
@@ -4614,7 +4849,7 @@ fn subtree_sizes(tree: &SyntaxTree<'_>) -> Vec<usize> {
     sizes
 }
 
-impl CorrespondenceBuilder<'_, '_, '_> {
+impl TreeDiffBuilder<'_, '_, '_> {
     fn link_exact_subtree(
         &mut self,
         before: NodeId,
@@ -4683,19 +4918,19 @@ impl CorrespondenceBuilder<'_, '_, '_> {
 
     /// Claim one leaf pair without replacing either endpoint's existing partner.
     fn push_leaf_link(&mut self, link: LeafLink) -> bool {
-        let before = self.graph.before_leaf[link.before.index()];
-        let after = self.graph.after_leaf[link.after.index()];
+        let before = self.tree.leaves.before[link.before.index()];
+        let after = self.tree.leaves.after[link.after.index()];
         if before.is_some() || after.is_some() {
             return before == after
                 && before
-                    .and_then(|index| self.graph.leaf_links.get(index))
+                    .and_then(|index| self.tree.leaves.links.get(index))
                     .is_some_and(|existing| existing == &link);
         }
 
-        let index = self.graph.leaf_links.len();
-        self.graph.before_leaf[link.before.index()] = Some(index);
-        self.graph.after_leaf[link.after.index()] = Some(index);
-        self.graph.leaf_links.push(link);
+        let index = self.tree.leaves.links.len();
+        self.tree.leaves.before[link.before.index()] = Some(index);
+        self.tree.leaves.after[link.after.index()] = Some(index);
+        self.tree.leaves.links.push(link);
         true
     }
 
@@ -4706,13 +4941,13 @@ impl CorrespondenceBuilder<'_, '_, '_> {
         if before.is_some() || after.is_some() {
             return before == after
                 && before
-                    .and_then(|index| self.graph.scopes.get(index))
+                    .and_then(|index| self.tree.scopes.get(index))
                     .is_some_and(|existing| existing == &link);
         }
-        let index = self.graph.scopes.len();
+        let index = self.tree.scopes.len();
         self.before_scope[link.before.index()] = Some(index);
         self.after_scope[link.after.index()] = Some(index);
-        self.graph.scopes.push(link);
+        self.tree.scopes.push(link);
         true
     }
 }

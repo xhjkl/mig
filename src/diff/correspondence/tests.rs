@@ -85,9 +85,10 @@ fn scoped_physical_alignment_cannot_cross_opaque_sibling_boundaries() {
     let pair = syntax_pair(Path::new("alpha.html"), before, after, false).expect("HTML syntax");
     let graph = correspond(&pair);
     let mut links = graph
-        .line_links
+        .source
+        .lines
         .iter()
-        .chain(&graph.line_ending_edits)
+        .chain(&graph.source.line_endings)
         .copied()
         .collect::<Vec<_>>();
     links.sort_unstable_by_key(|link| (link.before, link.after));
@@ -121,7 +122,7 @@ fn exact_leaf_cannot_cross_between_sealed_sibling_parents() {
     let graph = correspond(&pair);
     let unit = only_matched(&graph);
 
-    assert!(!graph.unit_leaf_links(unit).iter().any(|link| {
+    assert!(!graph.tree.unit_leaf_links(unit).iter().any(|link| {
         pair.before.leaf_text(link.before) == Some("gamma")
             && pair.after.leaf_text(link.after) == Some("gamma")
     }));
@@ -134,6 +135,7 @@ fn unique_wrapper_path_can_cross_multiple_transparent_nodes() {
     let pair = syntax_pair(Path::new("alpha.ts"), before, after, false).expect("TypeScript syntax");
     let graph = correspond(&pair);
     let retained = graph
+        .tree
         .composites
         .iter()
         .find(|link| {
@@ -171,6 +173,7 @@ fn trailing_delimiter_correspondence_stays_with_its_field() {
     let before_comma = comma_owned_on_line(&pair.before, 3);
     let after_comma = comma_owned_on_line(&pair.after, 3);
     let link = graph
+        .tree
         .before_leaf_link(before_comma)
         .expect("gamma's comma correspondence");
 
@@ -218,7 +221,7 @@ fn comma_owned_on_line(tree: &SyntaxTree<'_>, line: usize) -> NodeId {
 }
 
 fn only_matched(graph: &Correspondence) -> &MatchedUnit {
-    let mut matched = graph.units.iter().filter_map(|edit| {
+    let mut matched = graph.tree.units.iter().filter_map(|edit| {
         let UnitEdit::Matched(unit) = edit else {
             return None;
         };
@@ -230,4 +233,27 @@ fn only_matched(graph: &Correspondence) -> &MatchedUnit {
         "expected exactly one matched unit"
     );
     unit
+}
+
+#[test]
+fn source_fallback_does_not_delete_tree_edits() {
+    let pair = syntax_pair(
+        Path::new("alpha.rs"),
+        "fn a() {}\nfn b() {}",
+        "fn a() {}\n",
+        false,
+    )
+    .expect("Rust syntax");
+    let graph = correspond(&pair);
+
+    assert_eq!(graph.tree.units.len(), 2);
+    assert!(
+        graph
+            .tree
+            .units
+            .iter()
+            .any(|edit| matches!(edit, UnitEdit::Removed { .. }))
+    );
+    assert_eq!(graph.source.fallbacks.len(), 1);
+    assert_eq!(graph.source.review_units(&graph.tree).count(), 1);
 }
