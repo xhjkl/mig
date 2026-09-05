@@ -121,12 +121,13 @@ pub fn annotate(node: Node<'_>, source: &str) -> NodeAnnotation {
 }
 
 pub fn whitespace_is_syntax(parent_kind: &str, spelling: &str) -> bool {
-    // Same-line whitespace between elements contributes to rendered text.
+    // Preserving same-line spaces between elements; they can separate rendered words.
     matches!(parent_kind, "document" | "element") && !spelling.contains(['\n', '\r'])
         || matches!(parent_kind, "attribute_value" | "quoted_attribute_value")
 }
 
-/// Restore explicit paragraph closes displaced by a paragraph-closing block element.
+/// Restore source nesting when a block element made the parser close a paragraph early.
+/// Accept only an unambiguous explicit `</p>`; other recovery requires line fallback.
 pub fn normalize_recovery(source: &Source<'_>, nodes: &mut [SyntaxNode]) -> bool {
     if nodes.iter().any(|node| node.missing) {
         return false;

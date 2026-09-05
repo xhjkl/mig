@@ -1,4 +1,4 @@
-//! Translate source-coordinate review facts into public, styled review rows.
+//! Turn source coordinates into styled rows after refinement has fixed their order and coverage.
 
 use super::context::ranges_overlap;
 use super::refine::RefinedHunk;
@@ -9,7 +9,7 @@ use super::tree_diff::{
 use super::{LineCoverage, LineEnding, SyntaxClass};
 use std::ops::Range;
 
-/// Diff role layered over syntax styling.
+/// Change emphasis, independent of syntax coloring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiffMark {
     Context,
@@ -17,7 +17,6 @@ pub enum DiffMark {
     Added,
 }
 
-/// Smallest independently styled slice of one displayed source line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceSpan {
     pub text: String,
@@ -25,7 +24,7 @@ pub struct SourceSpan {
     pub mark: DiffMark,
 }
 
-/// One numbered source line materialized for review.
+/// A one-based source line with its terminator excluded from the spans.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceRow {
     pub number: usize,
@@ -33,13 +32,12 @@ pub struct SourceRow {
 }
 
 impl SourceRow {
-    /// Whether this line carries an added or removed source span.
     pub fn has_changes(&self) -> bool {
         self.spans.iter().any(|span| span.mark != DiffMark::Context)
     }
 }
 
-/// One low-signal replacement compacted to its shared affixes.
+/// Compact wiring edit with its common prefix and suffix shown only once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WordDiff {
     pub before_line: Option<usize>,
@@ -50,39 +48,36 @@ pub struct WordDiff {
     pub suffix: String,
 }
 
-/// Presentation-ready row in a bounded diff hunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReviewRow {
-    /// Current-world source; span marks distinguish changed payload from context.
+    /// Current source; span marks distinguish edits from unchanged context.
     Current(SourceRow),
-    /// Current-world source whose payload survived a physical-layout change.
+    /// Retained source whose layout changed, such as an indentation shift.
     Reflow(SourceRow),
-    /// One historical source row removed from the previous revision.
     Removed(SourceRow),
-    /// One source row added to the current revision.
     Added(SourceRow),
     LineEnding {
         before: Option<LineEnding>,
         after: Option<LineEnding>,
     },
+    /// First or last visible row of a move; only the first carries the old line number.
     Moved {
         before: Option<usize>,
         after: SourceRow,
     },
     Wordwise(WordDiff),
     Elision(LineCoverage),
-    /// Ordered sentinel that makes the displayed file boundary part of the row stream.
+    /// File boundary included in the row stream so it scrolls with the source.
     FileBoundary,
 }
 
-/// Bounded view into a file containing related, presentation-ready rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewHunk {
     pub coverage: LineCoverage,
     pub rows: Vec<ReviewRow>,
 }
 
-/// Presentation-ready stream of bounded hunks for one source file.
+/// Styled hunks in review-priority order, which may differ from source order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentedFile {
     pub path: String,
@@ -144,7 +139,6 @@ fn source_row(
     SourceRow { number, spans }
 }
 
-/// Coalesce adjacent text with identical syntax and diff marks.
 fn push_span(spans: &mut Vec<SourceSpan>, text: &str, syntax: SyntaxClass, mark: DiffMark) {
     if text.is_empty() {
         return;
@@ -163,7 +157,6 @@ fn push_span(spans: &mut Vec<SourceSpan>, text: &str, syntax: SyntaxClass, mark:
     });
 }
 
-/// Materialize a compact source-coordinate replacement at the presentation boundary.
 fn word_diff(before: &SyntaxTree<'_>, after: &SyntaxTree<'_>, change: CompactChange) -> WordDiff {
     let before_text = change
         .before_bytes
@@ -187,7 +180,7 @@ fn word_diff(before: &SyntaxTree<'_>, after: &SyntaxTree<'_>, change: CompactCha
     }
 }
 
-/// Materialize all refined source facts at the public presentation boundary.
+/// Render refined changes while preserving their order and coverage.
 pub fn present_hunks(
     before: &SyntaxTree<'_>,
     after: &SyntaxTree<'_>,
@@ -211,6 +204,7 @@ pub fn present_hunks(
                     .as_ref()
                     .is_some_and(|coverage| coverage.end == before_lines.saturating_add(1))
     });
+    // Placing the EOF marker last, even when review priority has reordered the hunks.
     let last_hunk = hunks.len().saturating_sub(1);
     hunks
         .into_iter()
@@ -308,7 +302,7 @@ fn present_change(
     }
 }
 
-/// Expand one semantic move into the existing compact review-row contract.
+/// Compact moves around their endpoints, keeping terminator edits visible.
 fn move_rows(after_tree: &SyntaxTree<'_>, change: MoveBlock) -> Vec<ReviewRow> {
     let mut lines = change.after.clone();
     let Some(first) = lines.next() else {

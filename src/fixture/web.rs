@@ -1,6 +1,5 @@
 use super::Fixture;
 
-/// CSS side of the metasyntactic wrapper fixture.
 pub const CSS: Fixture = Fixture {
     path: "alpha.css",
     before: r#".alpha {
@@ -41,7 +40,6 @@ pub const CSS: Fixture = Fixture {
 "#,
 };
 
-/// HTML side of the metasyntactic wrapper fixture.
 pub const HTML: Fixture = Fixture {
     path: "alpha.html",
     before: r#"<article class="alpha">
@@ -72,7 +70,6 @@ pub const HTML: Fixture = Fixture {
 "#,
 };
 
-/// TypeScript side of the metasyntactic wrapper fixture.
 pub const TYPESCRIPT: Fixture = Fixture {
     path: "alpha.ts",
     before: r#"export interface Alpha {
@@ -109,5 +106,5 @@ export function delta(alpha: Alpha): string {
 "#,
 };
 
-/// Lexical ribbon order for the web visual fixture.
+/// Fixture order as displayed in the review ribbon.
 pub const ALL: &[Fixture] = &[CSS, HTML, TYPESCRIPT];

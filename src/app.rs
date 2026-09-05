@@ -7,7 +7,6 @@ use clap::Parser;
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Current worktree changes, one commit, or two concrete text-file revisions.
 #[derive(Parser)]
 #[command(
     name = "m",
@@ -111,7 +110,7 @@ fn load_file_pair(
     review_source_pair(&path, Some(&before_source), Some(&after_source))
 }
 
-/// Stable UI label for Git difftool pairs whose directories are temporary.
+/// Use a shared filename to hide temporary directories in Git difftool labels.
 fn display_pair_path(before: &Path, after: &Path) -> PathBuf {
     if before.file_name() != after.file_name() {
         return after.into();

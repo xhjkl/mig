@@ -1,6 +1,5 @@
 pub mod web;
 
-/// Static source pair consumed by a visual fixture binary.
 #[derive(Clone, Copy)]
 pub struct Fixture {
     pub path: &'static str,
@@ -8,10 +7,8 @@ pub struct Fixture {
     pub after: &'static str,
 }
 
-/// Display name for the metasyntactic structural-review fixture.
 pub const LABEL: &str = "alpha.rs";
 
-/// Rust source on the old side of the visual fixture.
 pub const BEFORE: &str = r#"use crate::alpha::Alpha;
 use crate::beta::Beta;
 use crate::gamma::theta;
@@ -64,7 +61,6 @@ fn eta() -> Duration {
 }
 "#;
 
-/// Rust source on the new side of the visual fixture.
 pub const AFTER: &str = r#"use crate::alpha::Alpha;
 use crate::beta::Beta;
 use crate::gamma::{Theta, Iota};

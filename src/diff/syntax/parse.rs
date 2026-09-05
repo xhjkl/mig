@@ -5,14 +5,15 @@ use anyhow::{Result, anyhow};
 
 const MAX_SYNTAX_NODES: usize = 500_000;
 
-/// Concrete parser tree bound to the exact source revision it describes.
+/// Parser tree kept with the exact source and grammar needed to interpret its nodes.
 pub struct ParsedFile<'source> {
     pub source: Source<'source>,
     pub grammar: Grammar,
     pub tree: Tree,
 }
 
-/// Parse one source revision with the selected concrete grammar.
+/// Parse a revision, returning `None` if its root is missing or its tree exceeds the node budget.
+/// Recovery inside the tree is left for the language lowerer to assess.
 pub fn parse(
     source: Source<'_>,
     grammar: Grammar,

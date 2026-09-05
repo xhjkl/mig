@@ -1,4 +1,4 @@
-//! Build neutral tree correspondence and project it onto physical source.
+//! Match syntax within corresponding owners, then decide which physical rows can use those matches.
 
 use super::source::LineEnding;
 use super::syntax::{
@@ -11,14 +11,13 @@ use std::ops::Range;
 
 const MAX_LOCAL_ALIGNMENT_CELLS: usize = 16_384;
 
-/// Product of the canonical tree diff and its physical-source projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Correspondence {
     pub tree: TreeDiff,
     pub source: SourceProjection,
 }
 
-/// Canonical edit script and one-to-one links between neutral syntax trees.
+/// Syntax matches retained even where source projection falls back to linewise review.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeDiff {
     pub units: Vec<UnitEdit>,
@@ -28,7 +27,7 @@ pub struct TreeDiff {
     pub scopes: Vec<ScopeLink>,
 }
 
-/// One-to-one leaf links plus their dense node indexes.
+/// Leaf pairs with at most one partner per node in either revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LeafCorrespondence {
     links: Vec<LeafLink>,
@@ -36,7 +35,7 @@ struct LeafCorrespondence {
     after: Vec<Option<usize>>,
 }
 
-/// Physical-row links, local fallbacks, and the structural units they leave authoritative.
+/// Physical line alignment and the choice of syntax or linewise review for each region.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceProjection {
     pub lines: Vec<LineLink>,
@@ -46,7 +45,7 @@ pub struct SourceProjection {
 }
 
 impl SourceProjection {
-    /// Exact physical-line links wholly contained by a pair of absolute line ranges.
+    /// Select exact line matches inside the supplied zero-based ranges.
     pub fn line_links_in(
         &self,
         before: Range<usize>,
@@ -62,7 +61,7 @@ impl SourceProjection {
             .filter(move |link| after.contains(&link.after))
     }
 
-    /// Terminator edits wholly contained by a pair of absolute line ranges.
+    /// Select paired terminator edits inside the supplied zero-based ranges.
     pub fn line_ending_edits_in(
         &self,
         before: Range<usize>,
@@ -80,7 +79,7 @@ impl SourceProjection {
             .filter(move |link| after.contains(&link.after))
     }
 
-    /// Structural units not superseded by a more reliable local line fallback.
+    /// Yield tree edits whose rows are not claimed by a linewise fallback.
     pub fn review_units<'tree>(
         &'tree self,
         tree: &'tree TreeDiff,
@@ -90,40 +89,35 @@ impl SourceProjection {
 }
 
 impl TreeDiff {
-    /// Leaf links owned by one matched review unit.
     pub fn unit_leaf_links(&self, unit: &MatchedUnit) -> &[LeafLink] {
         &self.leaves.links[unit.leaf_links.clone()]
     }
 
-    /// All one-to-one leaf links in before-node order.
     pub fn leaf_links(&self) -> &[LeafLink] {
         &self.leaves.links
     }
 
-    /// Exact composite links owned by one matched review unit.
     pub fn unit_composites(&self, unit: &MatchedUnit) -> &[NodeLink] {
         &self.composites[unit.composites.clone()]
     }
 
-    /// Unique exact nodes retained under a different paired owner.
     pub fn relocated_nodes(&self) -> &[RelocatedNode] {
         &self.relocations
     }
 
-    /// Link terminating at one after-world leaf.
     pub fn after_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
         let link = self.leaves.after.get(node.index()).copied().flatten()?;
         self.leaves.links.get(link)
     }
 
-    /// Link originating at one before-world leaf.
     pub fn before_leaf_link(&self, node: NodeId) -> Option<&LeafLink> {
         let link = self.leaves.before.get(node.index()).copied().flatten()?;
         self.leaves.links.get(link)
     }
 }
 
-/// One exact physical-line correspondence, using zero-based source-line indices.
+/// Paired physical rows, addressed by zero-based source-line indices.
+/// Exact matches and terminator edits are stored separately in `SourceProjection`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LineLink {
     pub before: usize,
@@ -137,7 +131,6 @@ pub struct LineFallback {
     pub after: Range<usize>,
 }
 
-/// One review unit in the merged before/after edit script.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnitEdit {
     Matched(MatchedUnit),
@@ -145,14 +138,13 @@ pub enum UnitEdit {
     Added { after: NodeId },
 }
 
-/// One-to-one review-unit correspondence and the facts derived from it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatchedUnit {
     pub before: NodeId,
     pub after: NodeId,
-    /// Symmetric comparison behavior chosen from both frontend classifications.
+    /// Comparison policy reconciled symmetrically from both revisions.
     pub comparison: ComparisonStrategy,
-    /// Symmetric source role chosen from both frontend classifications.
+    /// Source role reconciled symmetrically from both revisions.
     pub role: SourceRole,
     pub relation: ContentRelation,
     pub placement: Placement,
@@ -160,7 +152,8 @@ pub struct MatchedUnit {
     composites: Range<usize>,
 }
 
-/// Strongest equality shared by one matched unit, from exact spelling to changed syntax.
+/// Strongest applicable equality level.
+/// Source includes layout; full fingerprints omit layout leaves, and payload also omits comments.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ContentRelation {
     SourceEqual,
@@ -190,7 +183,6 @@ pub enum Placement {
     Reordered,
 }
 
-/// One-to-one concrete-leaf correspondence inside a matched review unit.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LeafLink {
     pub before: NodeId,
@@ -198,18 +190,18 @@ pub struct LeafLink {
     pub relation: LeafRelation,
     pub placement: Placement,
     pub parent: ParentCorrespondence,
-    /// Enclosing transparent transition retained for presentation as reflow.
+    /// Enclosing wrapper change, carried to presentation so retained content can appear as reflow.
     pub wrapper: Option<Reparenting>,
 }
 
-/// Whether a leaf retained exact payload or only a compatible structural role.
+/// Exact payload equality or a replacement inferred from matching syntax roles.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LeafRelation {
     Exact,
     Modified,
 }
 
-/// Exact named subtree, possibly retained beneath a different matched parent.
+/// Exact named subtree with placement and wrapper evidence for presentation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NodeLink {
     pub before: NodeId,
@@ -219,15 +211,15 @@ pub struct NodeLink {
     pub placement: Placement,
 }
 
-/// One exact subtree transferred between paired nested owners.
-/// Source formation decides whether its physical rows support move presentation.
+/// Exact subtree transferred between surviving nested owners.
+/// Source formation must still validate line ownership and indentation before displaying a move.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RelocatedNode {
     pub before: NodeId,
     pub after: NodeId,
 }
 
-/// One semantic-container pair that fences all descendant correspondence.
+/// Paired semantic containers that constrain where descendant nodes and lines may match.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ScopeLink {
     pub before: NodeId,
@@ -236,14 +228,14 @@ pub struct ScopeLink {
     parent: ParentCorrespondence,
 }
 
-/// Positive proof relating the immediate semantic parents of one syntax link.
+/// Evidence that a link connects matched semantic parents, possibly through a wrapper.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ParentCorrespondence {
     Direct,
     Reparented(Reparenting),
 }
 
-/// Selective parent traversal proven to be a transparent wrap or unwrap.
+/// Wrapper insertion or removal justified by a single surviving containment path.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Reparenting {
     Wrapped,
@@ -264,14 +256,12 @@ struct NodeAtom {
     missing: bool,
 }
 
-/// Incoming child slot and collision-free fingerprint, shared by recursive and leaf matching.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FingerprintEdge {
     slot: ChildSlot,
     fingerprint: FingerprintId,
 }
 
-/// Exact recursive shape; payload is present for concrete leaves, including opaque source.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FingerprintKey<'source> {
     atom: NodeAtom,
@@ -279,7 +269,6 @@ struct FingerprintKey<'source> {
     children: Vec<FingerprintEdge>,
 }
 
-/// Shared before/after interner whose equality check resolves all hash collisions.
 #[derive(Default)]
 struct FingerprintInterner<'source> {
     ids: HashMap<FingerprintKey<'source>, FingerprintId>,
@@ -304,7 +293,8 @@ struct NodeFingerprints {
     shape: FingerprintId,
 }
 
-/// Recursive full/payload fingerprints for every arena node.
+/// Intern fingerprints comparable across both revisions through the shared interner.
+/// Full omits layout children, payload also omits comments, and shape omits leaf text.
 fn fingerprints<'source>(
     tree: &'source SyntaxTree<'_>,
     interner: &mut FingerprintInterner<'source>,
@@ -399,7 +389,6 @@ struct UnitRecord<'source> {
     role: SourceRole,
 }
 
-/// Build the neutral tree diff, then project it onto physical source.
 pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
     let mut interner = FingerprintInterner::default();
     let before_fingerprints = fingerprints(&pair.before, &mut interner);
@@ -464,7 +453,6 @@ pub fn correspond(pair: &SyntaxPair<'_, '_>) -> Correspondence {
     Correspondence { tree, source }
 }
 
-/// Project canonical tree edits onto exact rows and local linewise fallbacks.
 fn project_source(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff) -> SourceProjection {
     let physical = if pair.before.grammar.is_none() {
         PhysicalLineFacts {
@@ -521,10 +509,8 @@ fn project_source(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff) -> SourceProjectio
     source
 }
 
-/// Recover one exact subtree transferred between already-paired nested owners.
-///
-/// This is deliberately separate from ordinary containment correspondence: both owners survive,
-/// so treating the transfer as a wrap or unwrap would let payload tunnel between sibling domains.
+/// Find exact subtrees transferred between surviving nested owners.
+/// Keeping these moves separate from wrapper changes preserves sibling boundaries.
 fn cross_owner_relocations(
     pair: &SyntaxPair<'_, '_>,
     tree: &TreeDiff,
@@ -623,7 +609,7 @@ fn cross_owner_relocations(
         }
     }
 
-    // Claiming outer exact roots first keeps every source row under one relocation producer.
+    // Claiming outer subtrees first so nested candidates cannot report the same move twice.
     candidates.sort_by(|left, right| {
         before_subtree_sizes[right.before.index()]
             .cmp(&before_subtree_sizes[left.before.index()])
@@ -645,7 +631,7 @@ fn cross_owner_relocations(
     relocations
 }
 
-/// Prove `outer` is the first paired owner above `inner` on an open containment spine.
+/// Check that `outer` is the nearest paired ancestor of `inner`, with no competing owner branches.
 fn paired_owner_is_nearest_open_ancestor(
     tree: &SyntaxTree<'_>,
     inner: NodeId,
@@ -681,7 +667,6 @@ fn paired_owner_is_nearest_open_ancestor(
     }
 }
 
-/// Build the one-to-one composite owner map established by ordinary correspondence.
 fn paired_composite_owners(tree: &TreeDiff) -> (HashMap<NodeId, NodeId>, HashMap<NodeId, NodeId>) {
     let mut before_to_after = HashMap::new();
     let mut after_to_before = HashMap::new();
@@ -783,7 +768,7 @@ fn enclosing_semantic_scope(tree: &SyntaxTree<'_>, node: NodeId) -> Option<NodeI
     nearest_scope_owner(tree, tree.node(node).parent?)
 }
 
-/// Project exact matched units directly into the physical graph for line trees.
+/// Reuse line-tree matches as physical anchors without running another alignment.
 fn line_links_from_tree_matches(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff) -> Vec<LineLink> {
     let mut links = tree
         .units
@@ -816,11 +801,11 @@ struct PhysicalLineFacts {
 #[derive(Eq, Hash, PartialEq)]
 struct ScopedLineValue<'source> {
     text: &'source str,
-    /// After-world scope ids provide one canonical witness on both revisions.
+    /// Scope owners expressed as after-revision node ids on both sides of the comparison.
     scopes: Vec<NodeId>,
 }
 
-/// Whether one physical row carries enough payload to anchor without a local syntax owner.
+/// Reject ambiguous blank and punctuation-only anchors outside matched containers.
 fn line_can_anchor_without_owner(text: &str) -> bool {
     let text = text.trim();
     !text.is_empty()
@@ -829,7 +814,7 @@ fn line_can_anchor_without_owner(text: &str) -> bool {
             .all(|character| character.is_ascii_punctuation())
 }
 
-/// Canonical semantic-scope witnesses used by every physical-line anchor.
+/// Matched semantic scopes used to validate line and node correspondence.
 struct ScopeProof {
     before_lines: Vec<Vec<NodeId>>,
     after_lines: Vec<Vec<NodeId>>,
@@ -989,7 +974,8 @@ fn nearest_scope_owner(tree: &SyntaxTree<'_>, mut candidate: NodeId) -> Option<N
     }
 }
 
-/// Align physical content inside one already-corresponding semantic scope.
+/// Align line ranges by text and record changes to their terminators.
+/// Syntax anchors require a separate check that these matches respect scope ownership.
 fn physical_line_correspondence_in(
     pair: &SyntaxPair<'_, '_>,
     before_bounds: Range<usize>,
@@ -1025,8 +1011,8 @@ fn physical_line_correspondence_in(
         let after_anchor = after_bounds.start + anchor.after;
         let before_gap = &before.source.lines()[before_start..before_anchor];
         let after_gap = &after.source.lines()[after_start..after_anchor];
-        // Unequal gaps cannot gain row correspondence merely because a
-        // terminator differs at the same ordinal offset.
+        // Pairing terminator edits by offset only in equal-length gaps; insertions or
+        // deletions make that offset unreliable.
         let paired = if before_gap.len() == after_gap.len() {
             before_gap.len()
         } else {
@@ -1083,7 +1069,7 @@ fn physical_line_correspondence_in(
     facts
 }
 
-/// Derive physical row pairs local to one already-matched node pair.
+/// Pair rows within a matched node pair, including rows with changed terminators.
 pub fn local_line_links(pair: &SyntaxPair<'_, '_>, before: NodeId, after: NodeId) -> Vec<LineLink> {
     let mut facts = physical_line_correspondence_in(
         pair,
@@ -1097,7 +1083,7 @@ pub fn local_line_links(pair: &SyntaxPair<'_, '_>, before: NodeId, after: NodeId
     facts.exact
 }
 
-/// Separate scoped physical anchors from exact payload recurring in another semantic owner.
+/// Keep physical anchors within matched scopes so repeated text cannot cross between owners.
 fn scoped_physical_line_correspondence(
     pair: &SyntaxPair<'_, '_>,
     tree: &TreeDiff,
@@ -1195,9 +1181,8 @@ fn scoped_physical_line_correspondence(
         .filter(|(line, _)| !claimed_after.contains(line))
         .collect::<Vec<_>>();
 
-    // Semantic anchors partition the weaker text-only fallback. Matching each gap
-    // independently prevents a repeated line in one owner from crossing a stronger
-    // owner-local correspondence and rewinding the eventual source edit script.
+    // Aligning each gap separately so text matches cannot cross the stronger syntax
+    // anchors and put the eventual source edits out of order.
     let mut semantic_anchors = scoped
         .exact
         .iter()
@@ -1306,7 +1291,7 @@ fn line_links_are_monotone(exact: &[LineLink], endings: &[LineLink]) -> bool {
         .all(|links| links[0].before < links[1].before && links[0].after < links[1].after)
 }
 
-/// Collect reordered leaf rows whose physical equality cannot erase semantic movement.
+/// Collect moved rows that must not become unchanged line anchors.
 fn semantically_reordered_line_links(
     pair: &SyntaxPair<'_, '_>,
     tree: &TreeDiff,
@@ -1353,15 +1338,15 @@ struct UnitLineGeometry {
     expands_fallback: bool,
 }
 
-/// Retain syntax everywhere except concrete physical regions it cannot own exactly.
+/// Choose linewise review where syntax would omit a change or claim a line twice.
 fn local_line_fallbacks(
     pair: &SyntaxPair<'_, '_>,
     tree: &TreeDiff,
     source: &SourceProjection,
     mut fallbacks: Vec<LineFallback>,
 ) -> Vec<LineFallback> {
-    // A move producer can own an unmatched EOF terminator without borrowing
-    // the empty global-LCS coordinate on the opposite revision.
+    // Letting moved units report their own missing EOF terminator; global line alignment
+    // may place its empty counterpart far from the move.
     fallbacks.retain(|fallback| !move_owns_missing_terminator(pair, tree, fallback));
     let units = tree
         .units
@@ -1370,6 +1355,8 @@ fn local_line_fallbacks(
         .collect::<Vec<_>>();
     let mut before_claims = vec![0_u16; pair.before.source.lines().len()];
     let mut after_claims = vec![0_u16; pair.after.source.lines().len()];
+    // Allowing unchanged units to claim rows skipped by line alignment only when every
+    // byte agrees, including layout and terminators.
     for unit in units
         .iter()
         .filter(|unit| unit.changed || unit_lines_are_source_equal(pair, unit))
@@ -1441,7 +1428,7 @@ fn range_contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-/// Exact reordered units render their own concrete terminator facts beside the move.
+/// Check whether an exact move can present this terminator edit itself.
 fn move_owns_line_ending(pair: &SyntaxPair<'_, '_>, tree: &TreeDiff, link: LineLink) -> bool {
     tree.units.iter().any(|edit| {
         let UnitEdit::Matched(unit) = edit else {
@@ -1499,7 +1486,6 @@ fn unit_lines_are_physically_paired(source: &SourceProjection, unit: &UnitLineGe
         })
 }
 
-/// Stable semantic rows may bypass global monotone alignment only when their full source agrees.
 fn unit_lines_are_source_equal(pair: &SyntaxPair<'_, '_>, unit: &UnitLineGeometry) -> bool {
     unit.before.len() == unit.after.len()
         && unit
@@ -1526,7 +1512,7 @@ fn increment_claims(claims: &mut [u16], lines: Range<usize>) {
     }
 }
 
-/// Equal blank separators may travel with their matched owner without becoming edit signal.
+/// Claim unchanged blank separators with their owners so moves do not create spurious edits.
 fn claim_paired_adjacent_layout(
     pair: &SyntaxPair<'_, '_>,
     tree: &TreeDiff,
@@ -1554,7 +1540,7 @@ fn claim_paired_adjacent_layout(
         let before_trailing = adjacent_blank_lines(&pair.before, before_lines.end, false);
         let after_trailing = adjacent_blank_lines(&pair.after, after_lines.end, false);
         if unit.placement == Placement::Reordered {
-            // A moved owner may carry its separator from one physical side to the other.
+            // Pairing both sides together; a move can turn a leading separator into a trailing one.
             let before_adjacent = before_leading
                 .iter()
                 .rev()
@@ -1701,7 +1687,8 @@ fn unclaimed_gap_fallbacks(
             .collect();
     }
 
-    // Ambiguous interleaving cannot be assigned locally without borrowing claimed payload.
+    // Falling back over the whole gap; unequal runs cannot be paired without consuming
+    // lines already claimed by syntax.
     vec![LineFallback { before, after }]
 }
 
@@ -1733,7 +1720,7 @@ fn empty_counterpart(
     } else if run.end == own_gap.end {
         other_gap.end
     } else {
-        // Internal unmatched layout has no trustworthy cross-revision coordinate.
+        // Interpolating within the gap; internal layout has no known position in the other revision.
         other_gap.start + other_gap.len().saturating_mul(run.start - own_gap.start) / own_gap.len()
     };
     boundary..boundary
@@ -1825,7 +1812,8 @@ fn normalize_line_fallbacks(mut fallbacks: Vec<LineFallback>) -> Vec<LineFallbac
     normalized
 }
 
-/// Close cross-revision interval components without comparing every fallback to every unit.
+/// Merge regions that overlap in either revision until their combined ranges stop growing.
+/// A union on one side can expose another overlap on the other.
 fn close_fallback_components(fallbacks: &[LineFallback], parents: &mut [usize]) {
     loop {
         let components = fallback_component_ranges(fallbacks, parents);
@@ -1848,7 +1836,6 @@ fn sort_line_fallbacks(fallbacks: &mut [LineFallback]) {
     });
 }
 
-/// Either revision may connect regions whose order is interleaved in the other revision.
 fn union_overlapping_fallbacks(
     components: &[(usize, LineFallback)],
     parents: &mut [usize],
@@ -1948,8 +1935,7 @@ fn unit_records<'source>(
             UnitRecord {
                 id,
                 kind: node.kind,
-                // Leaf units use ordered exact payload matching, even if the frontend exposes
-                // that payload as an identity for other graph consumers.
+                // Keeping leaf payload out of name matching; atomic units use local source order.
                 identity: node
                     .leaf
                     .is_none()
@@ -1999,7 +1985,7 @@ fn pair_units(
     (before_match, after_match)
 }
 
-/// Decorations pair only after their semantic owners have established correspondence.
+/// Pair decorations only within owners that have already matched.
 fn pair_decorated_units(
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
@@ -2153,8 +2139,7 @@ fn pair_keyed_units(
             continue;
         };
 
-        // Container identity is local: duplicate spellings retain source-order identity
-        // instead of borrowing descendant bodies to choose an occurrence.
+        // Pairing repeated names in source order so body edits cannot switch their identities.
         for (before_index, after_index) in before_group.into_iter().zip(after_group.iter().copied())
         {
             link_unit_indices(before_index, after_index, before_match, after_match);
@@ -2162,9 +2147,7 @@ fn pair_keyed_units(
     }
 }
 
-/// Pair exact leaf-like review units before positional unit alignment.
-///
-/// Atomic units have no descendant container whose payload could vote for a parent match.
+/// Pair atomic units by nearby exact content before attempting positional replacements.
 fn pair_atomic_units(
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
@@ -2211,7 +2194,7 @@ fn pair_atomic_units(
     }
 }
 
-/// Align unclaimed review units by local kind and comparison inside established anchor gaps.
+/// Pair remaining compatible units within gaps between established matches.
 fn pair_compatible_units(
     before: &[UnitRecord<'_>],
     after: &[UnitRecord<'_>],
@@ -2263,7 +2246,7 @@ fn pair_compatible_units(
     }
 }
 
-/// Retain reciprocal unique-best edges whose evidence clears one strict threshold.
+/// Accept a pair only when each endpoint uniquely prefers the other and exceeds the threshold.
 fn reciprocal_unique_matches(
     before_len: usize,
     after_len: usize,
@@ -2369,7 +2352,7 @@ fn stable_unit_matches(
         stable[before_index] = member;
     }
 
-    // Non-structural streams do not vote on movement among structural review units.
+    // Excluding non-structural units from the order comparison so they cannot imply syntax moves.
     for (before_index, after_index) in before_match.iter().enumerate() {
         let Some(after_index) = *after_index else {
             continue;
@@ -2383,7 +2366,7 @@ fn stable_unit_matches(
         }
     }
 
-    // A paired review root is the graph frame, not a movable child occurrence.
+    // Keeping the paired file root fixed; it provides the frame for child movement.
     if let Some(before_root) = before.iter().position(|unit| unit.id.index() == 0)
         && let Some(after_root) = before_match[before_root]
         && after[after_root].id.index() == 0
@@ -2401,8 +2384,7 @@ fn stable_unit_matches(
             continue;
         };
         let Some(owner) = before_by_id.get(&owner).copied() else {
-            // Root-owned inner documentation follows the stable graph frame,
-            // which is not itself necessarily promoted to a review unit.
+            // Root-owned documentation shares the fixed file frame even without a root review unit.
             if owner.index() == 0 && before_match[before_index].is_some() {
                 stable[before_index] = true;
             }
@@ -2415,7 +2397,7 @@ fn stable_unit_matches(
     stable
 }
 
-/// Non-crossing anchors used only to serialize the merged edit script.
+/// Select noncrossing unit matches as boundaries for alignment and script order.
 fn ordered_unit_anchors(before_match: &[Option<usize>], before: &[UnitRecord<'_>]) -> Vec<bool> {
     let matched = before_match
         .iter()
@@ -2443,8 +2425,8 @@ fn ordered_script_anchors(
     stable: &[bool],
 ) -> Vec<bool> {
     let mut anchors = ordered_unit_anchors(before_match, before);
-    // Stable decorations may serialize inside the semantic anchors' gaps, but
-    // never participate in choosing those anchors.
+    // Fitting stable decorations between established anchors so they cannot change the
+    // order chosen for their owners.
     for before_index in 0..before_match.len() {
         let Some(after_index) = before_match[before_index] else {
             continue;
@@ -2474,7 +2456,6 @@ fn ordered_script_anchors(
     anchors
 }
 
-/// Assemble the canonical tree edit script and its one-to-one node links.
 struct TreeDiffBuilder<'input, 'before, 'after> {
     pair: &'input SyntaxPair<'before, 'after>,
     before_units: &'input [UnitRecord<'before>],
@@ -2607,7 +2588,7 @@ enum DelimiterOwnerKey {
 }
 
 impl DelimiterOwnerKey {
-    /// Keep leaf atoms indivisible globally; composite wrappers may still change around them.
+    /// Keep delimiters tied to atomic owners; composite owners may acquire or lose wrappers.
     fn for_global_match(self) -> Self {
         match self {
             Self::Leaf(_) => self,
@@ -2643,7 +2624,6 @@ struct LeafShape {
     missing: bool,
 }
 
-/// One before-keyed context pair and its complete correspondence evidence.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ContextLink {
     after: NodeId,
@@ -2651,13 +2631,12 @@ struct ContextLink {
     reparenting: Option<Reparenting>,
 }
 
-/// Actual same-context composite pairing used to judge parent changes.
+/// Parent pairs established before matching leaves, indexed in both directions.
 struct ContextLinks {
     before: HashMap<NodeId, ContextLink>,
     after_to_before: HashMap<NodeId, NodeId>,
 }
 
-/// Parent correspondence inside one matched review unit.
 struct UnitContext<'input, 'before, 'after> {
     pair: &'input SyntaxPair<'before, 'after>,
     parents: &'input ContextLinks,
@@ -2832,9 +2811,8 @@ impl TreeDiffBuilder<'_, '_, '_> {
             self.after_fingerprints,
         );
 
-        // Recursive propagation chooses the authoritative non-overlapping cover. Repeated
-        // leaf-shaped composites can otherwise acquire plausible FIFO pairings that disagree
-        // with the larger exact subtrees containing them.
+        // Matching largest exact subtrees first; pairing their repeated descendants separately
+        // could give those descendants partners outside the subtree.
         let mut cover_candidates = exact_composites.clone();
         cover_candidates.sort_by(|left, right| {
             self.before_subtree_sizes[before_composites[right.before].index()]
@@ -2914,8 +2892,7 @@ impl TreeDiffBuilder<'_, '_, '_> {
             return;
         }
 
-        // Nested composite facts remain useful only when they agree with that exact cover.
-        // Recompute placement after discarding speculative duplicate-occurrence pairings.
+        // Discarding conflicting duplicate matches before they can affect movement.
         let exact_composites = exact_composites
             .into_iter()
             .filter(|edge| {
@@ -2963,8 +2940,8 @@ impl TreeDiffBuilder<'_, '_, '_> {
             .iter()
             .map(|link| (link.before, *link))
             .collect::<HashMap<_, _>>();
-        // The dense composite script is the placement authority. A sparse maximal cover can
-        // otherwise call an exact definition reordered because adjacent repeated syntax crossed.
+        // Using all surviving composite pairs to decide movement; considering only the
+        // outermost roots can mistake crossings in repeated syntax for a moved definition.
         for edge in maximal {
             let before = before_composites[edge.before];
             let after = after_composites[edge.after];
@@ -3074,8 +3051,8 @@ impl TreeDiffBuilder<'_, '_, '_> {
                         .is_none()
             })
             .collect::<Vec<_>>();
-        // Exact content may prove reparenting; shape-only edits need a parent pair
-        // established by the contextual composite walk above.
+        // Requiring matched parents for shape-only edits; matching syntax roles cannot
+        // establish that a leaf survived a wrapper change.
         let mut contextual_after = HashMap::<(ParentSlot, LeafShape), VecDeque<usize>>::new();
         for after_index in plain_after {
             let after = after_remaining[after_index];
@@ -3111,7 +3088,6 @@ impl TreeDiffBuilder<'_, '_, '_> {
     }
 }
 
-/// Exact composite pairs must agree with the recursive context walk.
 fn exact_composite_matches(
     context: &UnitContext<'_, '_, '_>,
     before: &[NodeId],
@@ -3175,7 +3151,7 @@ fn exact_leaf_matches(
         })
         .collect::<HashMap<_, _>>();
 
-    // Same-parent occurrences win before the remaining exact payloads pair globally.
+    // Claiming matches under the same parents first so wrapper recovery cannot steal them.
     let mut contextual_after = HashMap::<ContextualLeafKey, VecDeque<usize>>::new();
     for (after_index, after_id) in after.iter().copied().enumerate() {
         let Some(parent) = context.after_parent(after_id) else {
@@ -3338,7 +3314,7 @@ fn exact_leaf_matches(
         .collect()
 }
 
-/// Modified documentation leaves require both their semantic owner and direct parent to match.
+/// Pair edited documentation only when its owner and immediate parent both match.
 fn decorated_leaf_matches(
     context: &UnitContext<'_, '_, '_>,
     before: &[NodeId],
@@ -3442,7 +3418,7 @@ fn contextual_links(
         linked
     };
     let mut pending = VecDeque::from([(before_unit, after_unit)]);
-    // Deferring renamed-owner guesses; certified containment claims the occurrence first.
+    // Deferring rename guesses until wrapper recovery has claimed surviving inner nodes.
     let mut deferred_renames = Vec::new();
     loop {
         while let Some((before_parent, after_parent)) = pending.pop_front() {
@@ -3480,7 +3456,7 @@ fn contextual_links(
     links
 }
 
-/// Retain only context claims certified by the final owner graph and rebuild their provenance.
+/// Revalidate parent matches against the final graph and refresh their wrapper evidence.
 fn retain_valid_context_links(
     pair: &SyntaxPair<'_, '_>,
     before_unit: NodeId,
@@ -3521,7 +3497,8 @@ fn retain_valid_context_links(
     for link in links.before.values_mut() {
         link.reparenting = None;
     }
-    // Rebuilding in preorder; descendants inherit only a surviving parent's fresh proof.
+    // Recomputing wrapper evidence from parents to children so no descendant inherits
+    // a proof removed above.
     for (before, after) in retained {
         let context = UnitContext {
             pair,
@@ -3551,10 +3528,9 @@ enum ReparentedContextKey<'source> {
     Exact(SyntaxKind, FingerprintId),
 }
 
-/// Recover a changed or exact anonymous subtree along a uniquely certified containment spine.
-///
-/// The outermost confident roots win so their children can be aligned inside the recovered
-/// context.
+/// Recover subtrees carried through a unique wrapper path.
+/// Anonymous nodes need exact content; nodes with unchanged names may also use shared payload.
+/// Outermost matches win so descendants are paired inside their recovered context.
 fn confident_reparented_context_matches(
     pair: &SyntaxPair<'_, '_>,
     before_unit: NodeId,
@@ -3699,12 +3675,10 @@ fn unique_containment_reparenting(
     )
 }
 
-/// Prove that one paired occurrence is carried through an unmatched containment spine.
-///
-/// The first already-paired owner must agree on both revisions. Unmatched ancestors may be
-/// arbitrarily deep, but no sibling branch may carry another paired owner or review boundary.
-/// Exactly one revision must contribute the unmatched spine: replacing one wrapper hierarchy
-/// with another remains an ordinary structural edit rather than a one-sided wrap or unwrap.
+/// Prove a wrap or unwrap through a single chain of unmatched parents.
+/// The nearest matched ancestors must be partners. Along the chain, sibling branches
+/// cannot contain matched owners or review boundaries. Only one revision may add
+/// unmatched parents; replacing wrappers on both sides remains a structural edit.
 fn unique_containment_reparenting_with(
     pair: &SyntaxPair<'_, '_>,
     before: NodeId,
@@ -3730,7 +3704,8 @@ fn unique_containment_reparenting_with(
     }
 }
 
-/// Climb to one designated owner through a single correspondence-bearing child branch.
+/// Find an ancestor anchor without crossing a competing owner or sealed wrapper.
+/// The flag records whether the path includes unmatched parents.
 fn unique_containment_path(
     tree: &SyntaxTree<'_>,
     candidate: NodeId,
@@ -3741,7 +3716,7 @@ fn unique_containment_path(
     let mut candidate = tree.node(candidate).parent?;
     let mut crossed_unmatched_parent = false;
     loop {
-        // A paired owner is the breadth fence itself; its other children are outside this proof.
+        // Stopping at the matched owner; its other children need not satisfy the wrapper proof.
         if is_anchor(candidate) && is_fence(candidate) {
             return Some((candidate, crossed_unmatched_parent));
         }
@@ -3781,7 +3756,7 @@ fn subtree_contains_fence(
         })
 }
 
-/// Find exactly one matching descendant reachable along an unpaired containment spine.
+/// Check that exactly one descendant matches along an allowed wrapper path.
 fn unique_contained_descendant_matches(
     tree: &SyntaxTree<'_>,
     outer: NodeId,
@@ -3805,7 +3780,7 @@ fn unique_contained_descendant_matches(
     retained.is_some()
 }
 
-/// Collect exact non-delimiter payload below an identity-bearing context.
+/// Collect sorted payload evidence, excluding the context's name, comments, and delimiters.
 fn meaningful_payload_fingerprints(
     tree: &SyntaxTree<'_>,
     fingerprints: &[NodeFingerprints],
@@ -4061,7 +4036,7 @@ fn contextual_child_matches(
         .iter()
         .map(|index| context_identity(&pair.after, after[identified_after[*index]]))
         .collect::<Vec<_>>();
-    // Pairing exposed shell identities first; descendants get their own queued breadth layer.
+    // Pairing names at this level first; children are matched after their parents enter the queue.
     for edge in unordered_matches(&before_identities, &after_identities) {
         let before_index = identified_before[ordered_before[edge.before]];
         let after_index = identified_after[ordered_after[edge.after]];
@@ -4081,7 +4056,7 @@ fn contextual_child_matches(
         )
         .into_iter()
         .filter(|edge| {
-            // Preserving a certified inner owner; a later rename cannot consume its wrapper.
+            // Preserving recovered inner matches; renaming their wrapper would change ownership.
             !pair
                 .before
                 .descendants(before[edge.before])
@@ -4268,7 +4243,7 @@ struct ContextCandidates<'input> {
     fingerprints: &'input [NodeFingerprints],
 }
 
-/// Decorations are aligned only inside one already-linked semantic owner pair.
+/// Pair decorations within already matched semantic owners.
 fn decoration_matches(
     pair: &SyntaxPair<'_, '_>,
     context: &ContextLinks,
@@ -4417,7 +4392,8 @@ fn decoration_matches(
     matches
 }
 
-/// Pair renamed identity-bearing siblings by local order, never by descendant payload.
+/// Pair renamed siblings by syntax shape and local order.
+/// Descendant identities can veto a match but do not choose its partner.
 fn confident_renamed_context_matches(
     pair: &SyntaxPair<'_, '_>,
     before: &[NodeId],
@@ -4557,8 +4533,8 @@ fn context_shape(tree: &SyntaxTree<'_>, id: NodeId) -> ContextShape {
     }
 }
 
-/// Describe an anonymous sibling by identities exposed directly on its syntax shell.
-/// Nested composites form the next breadth layer after this occurrence is paired.
+/// Identify an anonymous node from its immediate children's names and identifier fields.
+/// Deeper composites are matched only after this node has a partner.
 fn anonymous_context_key<'source>(
     tree: &'source SyntaxTree<'source>,
     id: NodeId,
@@ -4612,7 +4588,7 @@ fn context_identity<'source>(
     }
 }
 
-/// Movement is decided by semantic siblings; each decoration inherits its owner's result.
+/// Decide movement from semantic sibling order, then give decorations their owner's placement.
 fn contextual_match_placements(
     pair: &SyntaxPair<'_, '_>,
     before: &[NodeId],
@@ -4660,7 +4636,7 @@ fn contextual_match_placements(
         .collect()
 }
 
-/// Claim one context pair, accepting exact repeats and rejecting conflicting partners.
+/// Claim a pair, accepting an existing link only if its placement and wrapper evidence also agree.
 fn link_context(
     before: NodeId,
     after: NodeId,
@@ -4684,7 +4660,7 @@ fn link_context(
     true
 }
 
-/// Concrete node pairs implied by one collision-checked recursive fingerprint match.
+/// Expand a verified full-fingerprint match into node pairs, omitting layout leaves.
 fn exact_subtree_nodes(
     pair: &SyntaxPair<'_, '_>,
     before: NodeId,
@@ -4768,7 +4744,7 @@ impl TreeDiffBuilder<'_, '_, '_> {
                             placement,
                             parent,
                         });
-                        // Descending only through an accepted parent-scope proof.
+                        // Exact text cannot override a conflicting scope match.
                         if !accepted {
                             continue;
                         }
@@ -4797,7 +4773,8 @@ impl TreeDiffBuilder<'_, '_, '_> {
         }
     }
 
-    /// Claim one leaf pair without replacing either endpoint's existing partner.
+    /// Claim a leaf pair, returning false if either node already has a different link.
+    /// Identical claims succeed without adding another link.
     fn push_leaf_link(&mut self, link: LeafLink) -> bool {
         let before = self.tree.leaves.before[link.before.index()];
         let after = self.tree.leaves.after[link.after.index()];
@@ -4815,7 +4792,8 @@ impl TreeDiffBuilder<'_, '_, '_> {
         true
     }
 
-    /// Claim one semantic-scope pair without replacing an existing proof.
+    /// Claim a scope pair, returning false if either node already has a different link.
+    /// Identical claims succeed without adding another link.
     fn push_scope_link(&mut self, link: ScopeLink) -> bool {
         let before = self.before_scope[link.before.index()];
         let after = self.after_scope[link.after.index()];
@@ -4846,19 +4824,16 @@ fn leaf_shape(tree: &SyntaxTree<'_>, id: NodeId) -> LeafShape {
     }
 }
 
-/// One equality-preserving edge in an ordered before/after correspondence.
+/// Occurrence indices; the matching algorithm determines whether these edges may cross.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct OrderedMatch {
     before: usize,
     after: usize,
 }
 
-/// Match equal values without crossing edges or allowing either occurrence to be reused.
-///
-/// Values unique on both sides become patience-style anchors. Their longest increasing
-/// subsequence partitions the remaining work into local gaps, where bounded LCS preserves
-/// repeated occurrences. An unusually large anchorless gap uses linear-memory greedy
-/// alignment so adversarial inputs cannot allocate a quadratic table.
+/// Match equal values once per occurrence while preserving order in both sequences.
+/// Noncrossing unique values anchor the alignment. Small gaps use a longest common
+/// subsequence; large gaps use greedy matching to cap memory use.
 fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut before_positions = HashMap::<&T, Vec<usize>>::new();
     for (index, value) in before.iter().enumerate() {
@@ -4919,7 +4894,7 @@ fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch>
     matches
 }
 
-/// Align atomic leaves by the nearest shared prefixes, never by a farther copied run.
+/// Align atomic units locally so copied runs do not pull surviving lines out of place.
 fn locality_first_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut before_start = 0;
     let mut after_start = 0;
@@ -4978,7 +4953,7 @@ fn locality_first_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<Ordere
     matches
 }
 
-/// Exact occurrence pairing independent of order; duplicates retain FIFO identity.
+/// Pair equal values regardless of order, matching repeated values by occurrence number.
 fn unordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut after_positions = HashMap::<&T, VecDeque<usize>>::new();
     for (index, value) in after.iter().enumerate() {
@@ -4995,7 +4970,8 @@ fn unordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatc
         .collect()
 }
 
-/// LIS placement facts for matches already ordered by their before occurrence.
+/// Mark a longest noncrossing sequence as stable and classify the remaining matches as moves.
+/// Input matches must be sorted by their before index.
 fn match_placements(matches: &[OrderedMatch]) -> Vec<Placement> {
     let after = matches.iter().map(|edge| edge.after).collect::<Vec<_>>();
     increasing_subsequence_members(&after)
@@ -5010,7 +4986,8 @@ fn match_placements(matches: &[OrderedMatch]) -> Vec<Placement> {
         .collect()
 }
 
-/// Membership mask for one deterministic longest strictly increasing subsequence.
+/// Mark one longest strictly increasing subsequence.
+/// Ties choose the latest occurrence of an equal tail value.
 fn increasing_subsequence_members(values: &[usize]) -> Vec<bool> {
     let mut tails = Vec::<usize>::new();
     let mut previous = vec![None; values.len()];
@@ -5052,7 +5029,7 @@ fn align_gap<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     lcs_matches(before, after)
 }
 
-/// Linear-memory alignment for one unusually large anchorless region.
+/// Align a large gap in linear memory; the result may retain fewer matches than LCS.
 fn greedy_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut after_positions = HashMap::<&T, VecDeque<usize>>::new();
     for (index, value) in after.iter().enumerate() {
@@ -5077,7 +5054,8 @@ fn greedy_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> 
     matches
 }
 
-/// Quadratic dynamic programming reserved for small gaps between exact anchors.
+/// Maximize equal-value matches, breaking ties by the smallest total positional drift.
+/// Callers must bound the gap size because the score table is quadratic.
 fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     #[derive(Clone, Copy, Default, Eq, PartialEq)]
     struct AlignmentScore {

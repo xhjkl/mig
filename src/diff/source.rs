@@ -1,14 +1,14 @@
 use std::ops::Range;
 
-/// Concrete source terminator; `Missing` keeps the final unterminated line observable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LineEnding {
+    /// Unterminated EOF, kept distinct so a missing newline remains a visible change.
     Missing,
     Lf,
     CrLf,
 }
 
-/// One physical source line with both content-only and terminator-inclusive geometry.
+/// Byte ranges for a one-based physical line; terminators belong to the preceding line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceLine {
     pub number: usize,
@@ -17,7 +17,7 @@ pub struct SourceLine {
     pub ending: LineEnding,
 }
 
-/// Borrowed source text and its exact one-based physical-line index.
+/// Borrowed source with a physical-line index shared by all language frontends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Source<'source> {
     text: &'source str,
@@ -25,7 +25,6 @@ pub struct Source<'source> {
 }
 
 impl<'source> Source<'source> {
-    /// Index source once so every frontend shares identical line and terminator geometry.
     pub fn new(text: &'source str) -> Self {
         let mut lines = Vec::new();
         let mut start = 0;
@@ -49,38 +48,37 @@ impl<'source> Source<'source> {
         Self { text, lines }
     }
 
-    /// Original source, without normalization or allocation.
     pub fn as_str(&self) -> &'source str {
         self.text
     }
 
-    /// Physical lines; a terminator does not synthesize an extra empty line after itself.
+    /// Return physical lines, without an extra empty line after a final terminator.
     pub fn lines(&self) -> &[SourceLine] {
         &self.lines
     }
 
-    /// One-based physical-line lookup.
+    /// Look up a physical line by its one-based number.
     pub fn line(&self, number: usize) -> Option<&SourceLine> {
         let index = number.checked_sub(1)?;
         self.lines.get(index)
     }
 
-    /// Content excluding LF/CRLF, borrowed from the original source.
+    /// Borrow a line's content, excluding its LF or CRLF terminator.
     pub fn text(&self, line: &SourceLine) -> &'source str {
         &self.text[line.content_bytes.clone()]
     }
 
-    /// Content and its original terminator, borrowed from the original source.
+    /// Borrow a line together with its original terminator.
     pub fn full_text(&self, line: &SourceLine) -> &'source str {
         &self.text[line.full_bytes.clone()]
     }
 
-    /// Exact source slice when the supplied byte range lies on UTF-8 boundaries.
+    /// Borrow a source range, rejecting invalid bounds or split UTF-8 characters.
     pub fn slice(&self, bytes: Range<usize>) -> Option<&'source str> {
         self.text.get(bytes)
     }
 
-    /// Physical line owning one concrete byte, including either byte of CRLF.
+    /// Locate the line owning a byte, assigning both bytes of CRLF to the preceding line.
     fn line_containing_byte(&self, byte: usize) -> Option<&SourceLine> {
         if byte >= self.text.len() {
             return None;
@@ -92,7 +90,7 @@ impl<'source> Source<'source> {
         self.lines.get(index)
     }
 
-    /// One-based logical line at a byte position, including the position at EOF.
+    /// Locate the one-based insertion line, including the line after a terminated EOF.
     fn position_line(&self, byte: usize) -> Option<usize> {
         if byte > self.text.len() {
             return None;
@@ -105,11 +103,9 @@ impl<'source> Source<'source> {
         Some(completed + 1)
     }
 
-    /// Smallest one-based half-open line range intersected by an exact byte range.
-    ///
-    /// Empty ranges retain their insertion line as an empty line range. For non-empty
-    /// ranges, using the last included byte means an exclusive end at the next line's
-    /// start does not accidentally claim that next line.
+    /// Find the smallest one-based, half-open line range covering the supplied bytes.
+    /// Empty byte ranges produce an empty range at the insertion line. A nonempty range
+    /// ending at the start of a line excludes that line.
     pub fn line_coverage(&self, bytes: Range<usize>) -> Option<Range<usize>> {
         if bytes.start > bytes.end || bytes.end > self.text.len() {
             return None;

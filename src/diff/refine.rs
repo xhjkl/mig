@@ -13,13 +13,12 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-/// One prioritized source-space hunk with final coverage and semantic changes.
 pub struct RefinedHunk {
     pub coverage: LineCoverage,
     pub changes: Vec<SourceChange>,
 }
 
-/// One source-located cluster with refinement-owned review geometry.
+/// A hunk's merge focus, kept separate from its wider breadcrumb context.
 struct ReviewCluster {
     nature: ChangeNature,
     groups: Vec<Vec<SourceFact>>,
@@ -28,7 +27,7 @@ struct ReviewCluster {
     merge_window: Range<usize>,
 }
 
-/// Sheaf nearby source changes, apply review priority, and complete context.
+/// Merge nearby changes, rank them for review, and complete their context.
 pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<RefinedHunk> {
     let RawSourceDiff {
         hunks,
@@ -40,10 +39,10 @@ pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<Refine
         .map(|hunk| place_hunk(hunk, &review_geometry))
         .collect::<Vec<_>>();
 
-    // Geometry is source-ordered so only neighboring context halos can merge.
+    // Merging in source order; only neighboring halos may form a shared hunk.
     hunks.sort_by_key(|hunk| (hunk.order, Reverse(review_priority(hunk.nature))));
     let mut hunks = coalesce_hunks(hunks);
-    // Review priority applies only after nearby auxiliary facts are attached.
+    // Ranking after merging; auxiliary changes inherit the nearby hunk's priority.
     hunks.sort_by_key(|hunk| (Reverse(review_priority(hunk.nature)), hunk.order));
     for hunk in &mut hunks {
         if !hunk.halo_lines.is_empty() {
@@ -69,7 +68,7 @@ pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<Refine
         .collect()
 }
 
-/// Split one complete source hunk into local review regions.
+/// Separate signals whose context halos would leave more than one row hidden.
 fn split_source_hunk(
     pair: &SyntaxPair<'_, '_>,
     geometry: &ReviewGeometry,
@@ -227,8 +226,8 @@ fn minimum_script_order<'fact>(
         .unwrap_or(fallback)
 }
 
-/// Order one display group by semantic position and current-world geometry.
-/// Before-only facts anchor the group only when it has no current-side coverage.
+/// Place groups by edit-script order, then by their current source position.
+/// A deletion sets the position only when the group has no current source.
 fn display_group_order(group: &[SourceFact]) -> (usize, SourceOrder) {
     let first = group.first().expect("display group owns a source fact");
     let script_order = minimum_script_order(group, first.script_order);
@@ -274,7 +273,7 @@ fn elision_fact(coverage: LineCoverage, fallback: SourceOrder, script_order: usi
     }
 }
 
-/// Find neutral ancestor starts that explain one local signal.
+/// Select ancestor opening lines as breadcrumbs for signals beneath `root`.
 fn structural_context_lines(
     tree: &SyntaxTree<'_>,
     root: NodeId,
@@ -321,7 +320,7 @@ fn structural_context_lines(
     context
 }
 
-/// Resolve one unranked hunk into current-world review geometry.
+/// Choose a merge window from the signal, excluding distant breadcrumbs.
 fn place_hunk(hunk: SourceHunk, geometry: &ReviewGeometry) -> ReviewCluster {
     let (before_lines, after_lines) = signal_lines(&hunk.facts);
     let mapped_before = before_lines
@@ -375,7 +374,7 @@ fn place_hunk(hunk: SourceHunk, geometry: &ReviewGeometry) -> ReviewCluster {
     }
 }
 
-/// Keep one producer's material interval together while retaining atomic replacements.
+/// Keep the full interval between signals together when groups are reordered.
 fn group_facts(facts: Vec<SourceFact>) -> Vec<Vec<SourceFact>> {
     let Some(first) = facts.iter().position(|fact| fact.change.has_signal()) else {
         return facts.into_iter().map(|fact| vec![fact]).collect();
@@ -402,7 +401,8 @@ fn review_priority(nature: ChangeNature) -> u8 {
     }
 }
 
-/// Give each uninterrupted current-world source occurrence one final display owner.
+/// Remove repeated context within each visible run, giving edited rows precedence.
+/// An elision starts a new run, so context may recur on its far side.
 fn deduplicate_context_rows(hunks: &mut Vec<ReviewCluster>) {
     let material = hunks
         .iter()
@@ -440,7 +440,6 @@ fn deduplicate_context_rows(hunks: &mut Vec<ReviewCluster>) {
     hunks.retain(|hunk| !hunk.groups.is_empty());
 }
 
-/// Retain one context owner until an explicit fold starts a new visible source run.
 fn claim_visible_context(fact: &SourceFact, visible: &mut HashSet<usize>) -> bool {
     if matches!(fact.change, SourceChange::Elision(_)) {
         visible.clear();
@@ -456,7 +455,7 @@ fn claim_visible_context(fact: &SourceFact, visible: &mut HashSet<usize>) -> boo
     true
 }
 
-/// Complete each signal's three-line context halo against the whole current file.
+/// Fill halos from the current file, including rows outside the producer's hunk.
 fn complete_context_halos(
     pair: &SyntaxPair<'_, '_>,
     geometry: &ReviewGeometry,
@@ -489,7 +488,8 @@ fn complete_context_halos(
     }
 }
 
-/// Fill or explicitly fold gaps introduced by sparse hierarchy context.
+/// Make every jump between displayed source lines explicit.
+/// Single missing rows remain visible; longer gaps receive an elision.
 fn complete_display_gaps(
     pair: &SyntaxPair<'_, '_>,
     geometry: &ReviewGeometry,
@@ -546,7 +546,6 @@ fn complete_display_gaps(
     }
 }
 
-/// Remove folded coordinates already made visible by context.
 fn trim_elisions_behind_context(
     groups: &mut Vec<Vec<SourceFact>>,
     before_displayed: &[usize],

@@ -1,17 +1,17 @@
-//! Render-neutral geometry for source context halos and hierarchy breadcrumbs.
+//! Context selection and range geometry shared across diff stages.
 
 use std::collections::HashSet;
 use std::ops::Range;
 
-/// Physical lines retained on either side of an ordinary signal.
+/// Base context radius in physical lines; merged halos and breadcrumbs may retain more.
 pub const CONTEXT_HALO_RADIUS: usize = 3;
 
-/// Whether two three-line halos touch or would hide only one physical row.
+/// Allow halos to meet across one extra context row, avoiding a one-line fold.
 pub fn context_gap_fits_halos(context_rows: usize) -> bool {
     context_rows <= CONTEXT_HALO_RADIUS * 2 + 1
 }
 
-/// Expand one non-empty signal range through adjacent context on both sides.
+/// Expand a nonempty signal range, stopping at another signal or the context limit.
 pub fn context_halo_range<T>(
     items: &[T],
     signal: Range<usize>,
@@ -40,7 +40,7 @@ pub fn context_halo_range<T>(
     start..end
 }
 
-/// Contiguous unchanged rows around each display-only hierarchy step.
+/// Select breadcrumbs and their contiguous context as sorted, unique row indices.
 pub fn breadcrumb_halo_indices(
     breadcrumbs: &HashSet<usize>,
     mut context_index: impl FnMut(usize) -> Option<usize>,
@@ -76,7 +76,7 @@ pub fn breadcrumb_halo_indices(
     indices
 }
 
-/// Merge signal and breadcrumb context halos without widening hunk merge focus.
+/// Join the signal halo and breadcrumb rows, filling any one-row context gaps.
 pub fn review_selection_ranges(
     context_halo: Range<usize>,
     breadcrumbs: impl IntoIterator<Item = usize>,
@@ -103,12 +103,11 @@ pub fn review_selection_ranges(
     merged
 }
 
-/// Whether two pre-expanded merge windows touch or would hide only one row.
+/// Treat a one-row gap as touching to avoid a one-row fold.
 pub fn merge_windows_touch(left: &Range<usize>, right: &Range<usize>) -> bool {
     right.start.saturating_sub(left.end) <= 1
 }
 
-/// Union optional source geometry while preserving absence.
 pub fn include_range(range: &mut Option<Range<usize>>, addition: Option<Range<usize>>) {
     let Some(addition) = addition else {
         return;
@@ -121,7 +120,6 @@ pub fn include_range(range: &mut Option<Range<usize>>, addition: Option<Range<us
     range.end = range.end.max(addition.end);
 }
 
-/// Whether two half-open source ranges share at least one coordinate.
 pub fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }

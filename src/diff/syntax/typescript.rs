@@ -205,7 +205,7 @@ fn is_member(kind: &str) -> bool {
     )
 }
 
-/// Anonymous structures whose child payload must not choose a sibling occurrence.
+/// Identify anonymous containers that must pair before their members provide matching evidence.
 fn is_local_container(kind: &str) -> bool {
     matches!(kind, "object" | "object_pattern" | "object_type")
 }

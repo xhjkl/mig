@@ -235,12 +235,10 @@ fn initialized_repository() -> TempDir {
     repository
 }
 
-/// Real filesystem input committed through Git's external contract.
 fn write(root: &Path, path: &str, source: &str) {
     write_bytes(root, path, source.as_bytes());
 }
 
-/// Real binary filesystem input committed through Git's external contract.
 fn write_bytes(root: &Path, path: &str, source: &[u8]) {
     let path = root.join(path);
     let Some(parent) = path.parent() else {

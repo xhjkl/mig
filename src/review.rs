@@ -1,10 +1,10 @@
 use crate::diff::{MAX_REVISION_LINES, PresentedFile, diff_file};
 use anyhow::Result;
 
-/// Largest source revision Mig will load and expand into review rows.
+/// Per-revision byte limit checked before loading source for review.
 pub const MAX_REVISION_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Turn acquired UTF-8 revisions into one bounded review item.
+/// Keep files over the line limit in navigation as notices; omit pairs with no visible changes.
 pub fn review_source_pair(
     path: &str,
     before: Option<&str>,
@@ -33,7 +33,6 @@ pub fn review_source_pair(
     Ok(Some(ReviewEntry::Diff(diff)))
 }
 
-/// One changed-path entry in the review ribbon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReviewEntry {
     Diff(PresentedFile),
@@ -49,7 +48,7 @@ impl ReviewEntry {
         }
     }
 
-    /// Generated ordering applies only after source was safe to inspect.
+    /// Classify only inspected diffs as generated; notices keep normal review priority.
     pub fn is_generated(&self) -> bool {
         match self {
             Self::Diff(diff) => diff.generated,
@@ -58,7 +57,8 @@ impl ReviewEntry {
     }
 }
 
-/// A changed path retained in navigation even though its content was not loaded.
+/// A changed path kept in navigation after a resource limit prevents diffing.
+/// Missing sizes or line counts denote an absent revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileNotice {
     TooLarge {

@@ -5,7 +5,7 @@ use super::{
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
 
-/// Lower source to a degenerate tree whose file root owns one exact leaf per physical line.
+/// Represent each physical line as an independent review unit, including its terminator.
 pub fn lower(source: Source<'_>) -> SyntaxTree<'_> {
     let root = NodeId::new(0);
     let root_lines = source

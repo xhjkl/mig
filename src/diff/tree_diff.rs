@@ -1,7 +1,6 @@
-//! Form source-coordinate changes from neutral syntax correspondence.
+//! Source-complete changes and their placement, derived from syntax correspondence.
 //!
-//! This storey owns source-complete change facts. It does not assign review priority,
-//! context halos, breadcrumbs, or presentation order.
+//! Review priority, context halos, and breadcrumbs belong to refinement.
 
 use super::context::{include_range, ranges_overlap};
 use super::correspondence::{
@@ -17,7 +16,7 @@ use super::{LineCoverage, LineEnding};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-/// Semantic nature of one source change before review priority is assigned.
+/// Change categories used by refinement to choose review priority.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ChangeNature {
     Reflow,
@@ -26,30 +25,29 @@ pub enum ChangeNature {
     Edit,
 }
 
-/// Revision selected by a source-space operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RevisionSide {
     Before,
     After,
 }
 
-/// One one-based source line plus the changed source-byte intervals it owns.
+/// A one-based source line with highlights in file-relative byte coordinates.
 #[derive(Clone, Debug)]
 pub struct SelectedLine {
     pub number: usize,
     pub changed_bytes: Vec<Range<usize>>,
 }
 
-/// One semantic move retained as a whole until the presentation boundary.
+/// A move kept whole so refinement cannot split its source from its destination.
+/// Line ranges are one-based and half-open.
 #[derive(Clone, Debug)]
 pub struct MoveBlock {
-    /// One-based, half-open source-line ranges.
     pub before: Range<usize>,
     pub after: Range<usize>,
     pub line_endings: Vec<LineEndingChange>,
 }
 
-/// A transient source event retained without allocating styled presentation text.
+/// Transient rows before removals and additions are grouped into atomic replacements.
 #[derive(Clone, Debug)]
 enum RowEvent {
     Context(usize),
@@ -62,10 +60,10 @@ enum RowEvent {
     Compact(CompactChange),
 }
 
-/// One indivisible source change handed to review refinement.
+/// A change that refinement must keep intact.
 ///
-/// Both revisions of a replacement remain in the same value until presentation,
-/// so ordering, coalescing, and context selection cannot separate their meanings.
+/// Replacements retain both revisions until presentation, preventing ordering
+/// and context selection from separating the removal from the addition.
 #[derive(Clone, Debug)]
 pub enum SourceChange {
     Context(usize),
@@ -98,7 +96,8 @@ impl SourceChange {
         }
     }
 
-    /// Current-world source rows physically emitted by this change.
+    /// Enumerate current rows claimed for context ownership, including move interiors.
+    /// Explicit elisions and terminator notices claim no rows.
     pub fn displayed_after(&self) -> impl Iterator<Item = usize> + '_ {
         let (lines, range) = match self {
             Self::Context(line) | Self::Reflow(line) => (&[][..], *line..line.saturating_add(1)),
@@ -118,16 +117,17 @@ impl SourceChange {
     }
 }
 
-/// A source-located change whose placement is fixed before refinement.
+/// A change with source coverage and placement fixed before refinement.
 #[derive(Clone, Debug)]
 pub struct SourceFact {
     pub change: SourceChange,
     pub coverage: LineCoverage,
     pub order: SourceOrder,
+    /// Edit-script group rank; physical order breaks ties within the group.
     pub script_order: usize,
 }
 
-/// One compact replacement retained solely as source coordinates until presentation.
+/// A replacement rendered inline, with byte ranges in each revision's source.
 #[derive(Clone, Debug)]
 pub struct CompactChange {
     pub before_line: Option<usize>,
@@ -136,21 +136,20 @@ pub struct CompactChange {
     pub after_bytes: Option<Range<usize>>,
 }
 
-/// One concrete line terminator and its one-based source row.
+/// A concrete line ending at a one-based source line.
 #[derive(Clone, Copy, Debug)]
 pub struct LineEndingEndpoint {
     pub line: usize,
     pub ending: LineEnding,
 }
 
-/// Before/after provenance for one changed line terminator.
 #[derive(Clone, Copy, Debug)]
 pub struct LineEndingChange {
     pub before: Option<LineEndingEndpoint>,
     pub after: Option<LineEndingEndpoint>,
 }
 
-/// Select changed byte intervals on one source line without allocating its text.
+/// Clip and merge highlights to a line's content, excluding its terminator.
 pub fn select_line(line: &SourceLine, changed: &[Range<usize>]) -> SelectedLine {
     let bytes = line.content_bytes.clone();
     let mut changed_ranges = Vec::<Range<usize>>::new();
@@ -177,23 +176,25 @@ pub fn select_line(line: &SourceLine, changed: &[Range<usize>]) -> SelectedLine 
     }
 }
 
-/// One producer fragment in its native before/after source coordinates.
+/// Producer output before replacement grouping and source placement.
 struct DraftFragment {
     nature: ChangeNature,
     rows: Vec<RowEvent>,
-    /// Semantic current-world anchor for a before-only fragment.
+    /// Placement of a deleted unit after the preceding surviving unit.
     context_anchor_order: Option<SourceOrder>,
     context_root: Option<NodeId>,
 }
 
-/// Current-world anchors and ordering shared by source formation and refinement.
+/// Mappings into the current file's physical and edit-script order.
 pub struct ReviewGeometry {
     before_order: Vec<SourceOrder>,
     after_to_before: Vec<Option<usize>>,
     after_script_order: Vec<usize>,
 }
 
-/// Unit-script ownership retained after nearby fragments meld into one visual hunk.
+/// Edit-script ownership preserved when source fragments share a review hunk.
+/// Shared lines keep their first owner. Even ranks belong to units; the odd
+/// ranks between them place separators without changing unit order.
 struct SourceSequence {
     before_owner: Vec<Option<usize>>,
     after_owner: Vec<Option<usize>>,
@@ -234,9 +235,6 @@ impl SourceSequence {
             let Some(owner) = self.before_owner.get_mut(line) else {
                 continue;
             };
-            // Adjacent review units can share a physical line. Changed overlaps are
-            // formed by a local line fallback; unchanged overlaps retain the first
-            // unit's edit-script position as their common presentation anchor.
             owner.get_or_insert(order);
         }
     }
@@ -246,8 +244,6 @@ impl SourceSequence {
             let Some(owner) = self.after_owner.get_mut(line) else {
                 continue;
             };
-            // Mirroring before-world ownership keeps shared-line context stable
-            // across revisions without inventing a second display row.
             owner.get_or_insert(order);
         }
         if !lines.is_empty() {
@@ -310,12 +306,12 @@ impl SourceSequence {
     }
 }
 
-/// Current-world gap plus ordering inside that gap.
+/// Physical display position, with deleted lines ordered inside a current-file gap.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SourceOrder {
-    /// Number of current-world lines preceding this source fact.
+    /// Number of current lines preceding this source fact.
     pub after_gap: usize,
-    /// Old source line for a deletion, or `usize::MAX` for current-world source.
+    /// Old line number for a deletion; `usize::MAX` places current source after it.
     pub tie_break: usize,
 }
 
@@ -335,17 +331,16 @@ impl SourceOrder {
     }
 }
 
-/// One atomic hunk with fixed source placement.
+/// Source changes grouped by a producer, ready to split into review regions.
 pub struct SourceHunk {
     pub nature: ChangeNature,
     pub facts: Vec<SourceFact>,
     pub order: SourceOrder,
-    /// Explicit current-world context anchor for a before-only producer.
+    /// Current line around which a deleted unit receives context.
     pub context_anchor: Option<usize>,
     pub context_root: Option<NodeId>,
 }
 
-/// Compiler-visible handoff from tree differencing to review refinement.
 pub struct RawSourceDiff {
     pub hunks: Vec<SourceHunk>,
     pub review_geometry: ReviewGeometry,
@@ -391,7 +386,7 @@ impl ReviewGeometry {
         }
     }
 
-    /// Unmatched old lines occupy an explicit gap; exact lines share current order.
+    /// Place an old line at its current match, or in the gap after the preceding match.
     pub fn before_order(&self, line: usize) -> SourceOrder {
         self.before_order
             .get(line)
@@ -433,7 +428,7 @@ impl ReviewGeometry {
     }
 }
 
-/// Form unranked source hunks from one neutral syntax correspondence graph.
+/// Form complete source changes and fix their placement before review refinement.
 pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> RawSourceDiff {
     if pair.before.source.as_str() == pair.after.source.as_str() {
         return RawSourceDiff {
@@ -456,9 +451,8 @@ pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> 
         before: syntax_anchor_facts(&pair.before),
         after: syntax_anchor_facts(&pair.after),
     };
-    // A one-sided file has no competing revision geometry or structural edit order.
-    // Treating its syntax units as independently buoyant can lift separators ahead of
-    // the declarations they separate, so retain the file as one physical line region.
+    // Keeping wholly added or removed files in one physical region; there is no
+    // competing revision order, and separators must stay with their declarations.
     let one_sided = pair.before.source.lines().is_empty() || pair.after.source.lines().is_empty();
     let source_ordered = only_ordinary_linewise || one_sided;
     let mut changes = if source_ordered {
@@ -483,8 +477,8 @@ pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> 
     } else {
         form_units(pair, correspondence, &anchor_facts)
     };
-    // Correspondence owns sameness and wrapper decisions. Resolve those facts before
-    // source placement, hunk coalescing, or halo expansion can depend on the row shape.
+    // Resolving moves and retained payload before placement; these decisions change
+    // which rows each fragment owns.
     classify_relocated_nodes(&mut changes, pair, correspondence);
     normalize_stable_revision_rows(&mut changes, correspondence);
     normalize_containment(&mut changes, pair, correspondence);
@@ -503,7 +497,7 @@ pub fn raw_hunks(pair: &SyntaxPair<'_, '_>, correspondence: &Correspondence) -> 
     }
 }
 
-/// Freeze transient producer rows into atomic, source-located facts.
+/// Fix source placement after grouping replacements into indivisible changes.
 fn form_source_hunk(
     hunk: DraftFragment,
     geometry: &ReviewGeometry,
@@ -540,7 +534,7 @@ fn form_source_hunk(
     }
 }
 
-/// Keep each contiguous before/after run together as one replacement fact.
+/// Keep adjacent removals, additions, and their terminator edits in one replacement.
 fn atomic_event_groups(rows: Vec<RowEvent>) -> Vec<Vec<RowEvent>> {
     let mut rows = rows.into_iter().peekable();
     let mut groups = Vec::new();
@@ -663,7 +657,7 @@ fn event_rows_order(events: &[RowEvent], geometry: &ReviewGeometry) -> Option<So
         })
 }
 
-/// Replace one exact cross-owner remove/add pair with the established move producer.
+/// Promote complete cross-owner relocations from remove/add rows to moves.
 fn classify_relocated_nodes(
     changes: &mut Vec<DraftFragment>,
     pair: &SyntaxPair<'_, '_>,
@@ -692,7 +686,6 @@ fn classify_relocated_nodes(
     changes.retain(|change| change.rows.iter().any(row_has_signal));
 }
 
-/// Remove the ordinary one-sided rows superseded by one semantic move.
 fn remove_relocation_rows(
     changes: &mut [DraftFragment],
     pair: &SyntaxPair<'_, '_>,
@@ -708,7 +701,7 @@ fn remove_relocation_rows(
     }
 }
 
-/// Promote only ranges currently owned once as ordinary one-sided source rows.
+/// Require exclusive remove/add ownership before replacing rows with a move.
 fn relocation_rows_are_available(
     changes: &[DraftFragment],
     pair: &SyntaxPair<'_, '_>,
@@ -760,8 +753,8 @@ enum IndentationShift {
     Removed(String),
 }
 
-/// Admit source-complete nodes changed by one shared, non-empty indentation shift.
-/// Unchanged indentation is ambiguous with parser-recovered ownership around stable source.
+/// Require complete lines and the same nonempty indentation shift on every payload line.
+/// Without a shift, parser-recovered ownership can look like relocation.
 fn relocation_has_uniform_source_shape(
     pair: &SyntaxPair<'_, '_>,
     relocation: RelocatedNode,
@@ -828,12 +821,11 @@ fn indentation_shift(before: &str, after: &str) -> Option<IndentationShift> {
     None
 }
 
-/// Present exact physical correspondence once, in the current revision.
+/// Show a physically unchanged line once, as current context.
 ///
-/// Independently formed structural units can claim the two sides of a stable line as if it
-/// were a removal and addition. The physical-line graph is the language-neutral authority for
-/// those rows: old ghosts disappear and one current owner remains as context. Explicit
-/// structural movement already uses atomic move blocks and remains outside this normalization.
+/// Separate structural units can claim the same unchanged line as a removal and
+/// an addition. Physical correspondence reunites those claims; explicit moves
+/// retain their own representation.
 fn normalize_stable_revision_rows(
     changes: &mut Vec<DraftFragment>,
     correspondence: &Correspondence,
@@ -891,9 +883,8 @@ fn normalize_stable_revision_rows(
         .iter()
         .map(|(_, after)| *after)
         .collect::<HashSet<_>>();
-    // A material current-side claim identifies the line's structural home more
-    // precisely than context borrowed by another producer. Rebuild that claim as
-    // context in place so extracted payload follows its new declaration.
+    // Retaining context where the addition was claimed; that producer owns the
+    // new declaration, while another producer may only have borrowed the line.
     let relocated_after = stable_after
         .intersection(&changed_after)
         .filter(|line| context_owners.contains(line) && !material_current_owners.contains(line))
@@ -926,11 +917,9 @@ fn normalize_stable_revision_rows(
     changes.retain(|change| change.rows.iter().any(row_has_signal));
 }
 
-/// Present a containment change around its exact retained payload.
-///
-/// One old physical row may spread across several current rows, or several old rows may collapse
-/// into one. Exact leaf correspondence remains the authority: retained ranges stay context while
-/// only the one-sided shell carries the change.
+/// Show wrapper changes around the payload they retain.
+/// Exact leaf links preserve content even when wrapping changes line breaks;
+/// only the surrounding shell receives change marks.
 fn normalize_containment(
     changes: &mut Vec<DraftFragment>,
     pair: &SyntaxPair<'_, '_>,
@@ -1080,7 +1069,7 @@ fn normalize_containment(
     changes.retain(|change| change.rows.iter().any(row_has_signal));
 }
 
-/// Expand retained wrapper payload through source-identical parser parents.
+/// Extend retained payload through identical parents without crossing wrapper barriers.
 fn widest_exact_node_pair(
     pair: &SyntaxPair<'_, '_>,
     mut before: NodeId,
@@ -1167,7 +1156,7 @@ fn line_has_material_change(tree: &SyntaxTree<'_>, line: &SelectedLine) -> bool 
     })
 }
 
-/// Join retained byte ranges across unchanged horizontal layout on one source line.
+/// Keep whitespace between retained tokens unmarked.
 fn bridge_retained_layout(tree: &SyntaxTree<'_>, ranges: &mut Vec<Range<usize>>) {
     ranges.sort_unstable_by_key(|range| range.start);
     let mut joined: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
@@ -1191,12 +1180,10 @@ fn bridge_retained_layout(tree: &SyntaxTree<'_>, ranges: &mut Vec<Range<usize>>)
     *ranges = joined;
 }
 
-/// Keep a draft alive for any event beyond retained context.
 fn row_has_signal(row: &RowEvent) -> bool {
     !matches!(row, RowEvent::Context(_))
 }
 
-/// Preserve whether one retained current row carries a material source edit.
 fn current_event(line: SelectedLine) -> RowEvent {
     if !line.changed_bytes.is_empty() {
         RowEvent::Edited(line)
@@ -1388,7 +1375,7 @@ fn form_matched_unit(
                 ));
                 return;
             }
-            // Root units own the complete edit order; nested units share it with sibling edits.
+            // Falling back for deletions in nested units; only the root owns the complete edit order.
             let owns_file_order = unit.before == pair.before.root && unit.after == pair.after.root;
             let needs_physical_plan = pair.before.identity_text(unit.before)
                 != pair.after.identity_text(unit.after)
@@ -1548,7 +1535,7 @@ fn form_moved_lines(
     )
 }
 
-/// Retain concrete terminator edits without expanding a semantic move into display rows.
+/// Collect terminator changes while keeping the move itself intact.
 fn move_line_ending_changes(
     pair: &SyntaxPair<'_, '_>,
     before: Range<usize>,
@@ -1581,8 +1568,8 @@ fn move_line_ending_changes(
         }
     }
 
-    // Unmatched layout cannot create a line pair. Cancel equal special endings as
-    // multisets, then retain only the concrete one-sided source facts that remain.
+    // Canceling equal unmatched endings by count; without line correspondence,
+    // pairing them would invent a before/after relationship.
     let mut before_only = Vec::new();
     for ending in [LineEnding::Missing, LineEnding::CrLf] {
         let before_offsets = before_indices
@@ -1854,7 +1841,7 @@ fn leaf_is_meaningful_payload(tree: &SyntaxTree<'_>, id: NodeId) -> bool {
             .is_some_and(|text| !text.trim().is_empty())
 }
 
-/// Detect edits whose physical rows cannot represent their smallest matched parser owner.
+/// Detect line edits that need their enclosing syntax boundary for review.
 fn payload_requires_node_snap(
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
@@ -1921,7 +1908,7 @@ fn payload_requires_node_snap(
         })
 }
 
-/// Whether a matched parser node occupies equivalent physical-line surroundings.
+/// Compare a node's line count and surrounding text, allowing blank margins to differ.
 fn parser_node_frames_match(pair: &SyntaxPair<'_, '_>, before: NodeId, after: NodeId) -> bool {
     let Some((before_prefix, before_suffix, before_lines)) = node_line_frame(&pair.before, before)
     else {
@@ -1957,7 +1944,7 @@ fn frame_fragment_matches(before: &str, after: &str) -> bool {
     before == after || horizontal_layout(before) && horizontal_layout(after)
 }
 
-/// One physical replacement row retained with both source revisions.
+/// A row edit and its terminator change, emitted together.
 struct LineEdit {
     before: Option<SelectedLine>,
     after: Option<SelectedLine>,
@@ -2046,7 +2033,7 @@ fn comment_edits(
     edits
 }
 
-/// Exact decorations presented with their semantic owner, never as independent signals.
+/// Unchanged decorations presented with their semantic owner, never as independent signals.
 #[derive(Default)]
 struct RetainedDecorations {
     before: HashSet<NodeId>,
@@ -2110,7 +2097,8 @@ fn physically_equal_isolated_nodes(
     physical_lines_equal(pair, &before, &after)
 }
 
-/// A decoration may own its newline, but never neighboring source content.
+/// Require a decoration to occupy otherwise blank physical lines.
+/// Its byte range may include the final newline, but no neighboring content.
 fn node_is_presentational_line_isolated(tree: &SyntaxTree<'_>, node: NodeId) -> bool {
     let node = tree.node(node);
     let Some(first) = tree.source.line(node.lines.start) else {
@@ -2278,7 +2266,7 @@ fn deduplicate_line_edits(edits: &mut Vec<LineEdit>) {
     });
 }
 
-/// Whole-line rendering cannot represent two semantic facts that claim the same source row.
+/// Detect competing claims that cannot share a whole-line representation.
 fn line_edits_compete_for_source_rows(edits: &[LineEdit]) -> bool {
     let mut before = HashSet::new();
     let mut after = HashSet::new();
@@ -2327,7 +2315,6 @@ fn append_changed_line_edits(
     }
 }
 
-/// Select one physical replacement and its concrete terminator change.
 fn changed_line_edit(
     before: &SyntaxTree<'_>,
     before_line: Option<&SourceLine>,
@@ -2378,7 +2365,8 @@ fn changed_line_edit(
     }
 }
 
-/// Expand one textual delta to the smallest complete syntax node made entirely of that delta.
+/// Expand a delta to its syntax envelope only when it touches every payload leaf.
+/// Owned punctuation and layout take precedence, so a removed field keeps its comma.
 fn snap_change_to_syntax_node(
     syntax: &SyntaxTree<'_>,
     line: &SourceLine,
@@ -2494,7 +2482,7 @@ fn append_line_edit_rows(rows: &mut Vec<RowEvent>, edit: LineEdit) {
     rows.extend(edit.line_ending.map(RowEvent::LineEnding));
 }
 
-/// Replace claimed current rows with their edits while preserving before-only source order.
+/// Keep deletions in old-source order while replacing current rows claimed by edits.
 fn interleave_line_edits(
     lines: impl Iterator<Item = RowEvent>,
     mut edits: Vec<LineEdit>,
@@ -2542,7 +2530,7 @@ struct RetainedRegion {
     retention: Retention,
 }
 
-/// SyntaxTree-wide subtree facts used to admit structural display anchors in constant time.
+/// Cached subtree properties for checking anchor eligibility without repeated walks.
 struct AnchorFacts {
     before: Vec<NodeAnchorFacts>,
     after: Vec<NodeAnchorFacts>,
@@ -2574,7 +2562,6 @@ fn syntax_anchor_facts(tree: &SyntaxTree<'_>) -> Vec<NodeAnchorFacts> {
     facts
 }
 
-/// Whether a structural region survived exactly or changed physical layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Retention {
     Exact,
@@ -2588,26 +2575,23 @@ enum LineCheckpoint {
     Retained(RetainedRegion),
 }
 
-/// How exact correspondence participates in one physical replacement.
+/// Rules for retaining exact physical lines within a replacement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AnchorBasis {
-    /// Exact physical rows are the only available structure for line-oriented content.
+    /// Every exact line may serve as context.
     Physical,
-    /// Closed subtrees anchor; remaining exact rows only guide display cadence.
     Structural {
-        /// Shared outer rows frame the same source owner instead of a renamed replacement.
+        /// Eligibility of shared outer lines as context, based on the enclosing identity.
         same_owner: bool,
     },
 }
 
-/// Structural evidence available while partitioning one physical line region.
 #[derive(Clone, Copy)]
 struct LineAnchors<'facts> {
     basis: AnchorBasis,
     facts: &'facts AnchorFacts,
 }
 
-/// Shared outer rows frame a definition only while its source identity survives.
 fn structural_anchor_basis(pair: &SyntaxPair<'_, '_>, unit: &MatchedUnit) -> AnchorBasis {
     let same_owner = match (
         pair.before.identity_text(unit.before),
@@ -2651,8 +2635,8 @@ fn retained_regions(
     before_region: &Range<usize>,
     after_region: &Range<usize>,
 ) -> Vec<RetainedRegion> {
-    // Only locally eligible anchors vote on global order. Decorations follow
-    // semantic owners, and reordered links cannot partition stable source.
+    // Excluding moved links and decorations before checking crossings; neither may
+    // disqualify an otherwise stable content anchor.
     let composites = composites
         .iter()
         .copied()
@@ -2691,7 +2675,7 @@ fn retained_regions(
     retained
 }
 
-/// Exact regions participating in an order inversion cannot partition presentation.
+/// Mark both sides of an order inversion so neither can anchor a stable region.
 fn structural_link_crossings(pair: &SyntaxPair<'_, '_>, composites: &[NodeLink]) -> Vec<bool> {
     let mut order = (0..composites.len()).collect::<Vec<_>>();
     order.sort_unstable_by_key(|index| {
@@ -2808,7 +2792,6 @@ fn retained_region(
     })
 }
 
-/// Decoration subtrees inherit presentation from their semantic owner.
 fn link_belongs_to_decoration(pair: &SyntaxPair<'_, '_>, link: NodeLink) -> bool {
     node_belongs_to_decoration(&pair.before, link.before)
         || node_belongs_to_decoration(&pair.after, link.after)
@@ -3032,7 +3015,8 @@ fn append_line_change_rows(
         return;
     }
 
-    // A gap has no line-level correspondence: keep each revision as one coherent run.
+    // Keeping each side of an unpaired gap contiguous; alternating rows would imply
+    // line correspondence that the graph does not establish.
     for index in before {
         let line = &pair.before.source.lines()[index];
         let edit = changed_line_edit(&pair.before, Some(line), &pair.after, None);

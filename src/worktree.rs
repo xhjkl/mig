@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// One side of a status candidate before its contents are decoded as text.
+/// A revision eligible for text review, absent, or excluded by its file type.
 enum Revision<T> {
     Absent,
     Present(T),
     Unsupported,
 }
 
-/// Git provenance ordered from least to most review-significant.
+/// Review priority in ascending order; a file with several statuses keeps the highest.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GitChange {
     Untracked,
@@ -25,7 +25,7 @@ enum GitChange {
     Dirty,
 }
 
-/// Present bounded text reviews with dirty files most buoyant and generated files least.
+/// Review worktree files against HEAD, with dirty files first and generated files last.
 pub fn diff_directory(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> {
     let repo = gix::discover(directory).with_context(|| {
         format!(
@@ -78,7 +78,7 @@ pub fn diff_directory(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> 
             continue;
         }
 
-        // Read the mutable side first so post-stat growth cannot force a HEAD allocation.
+        // Reading the mutable side first; growth past the limit also spares the HEAD allocation.
         let after = match after {
             None => None,
             Some(after) => {
@@ -142,7 +142,7 @@ pub fn diff_directory(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> 
     Ok(reviews.into_iter().map(|(_, review)| review).collect())
 }
 
-/// Status candidates from the pinned tree, index, and regular worktree scope.
+/// Collect changed paths within the directory, keeping each path's highest review priority.
 fn changed_paths(
     repo: &gix::Repository,
     directory: &Path,
@@ -184,7 +184,6 @@ fn changed_paths(
     Ok(paths)
 }
 
-/// Strongest visible status for one emitted tree/index/worktree fact.
 fn git_change(item: &gix::status::Item) -> Option<GitChange> {
     match item {
         gix::status::Item::TreeIndex(_) => Some(GitChange::Staged),
@@ -201,7 +200,7 @@ fn git_change(item: &gix::status::Item) -> Option<GitChange> {
     }
 }
 
-/// Root-anchored literal scope independent of the process current directory.
+/// Scope status to a literal directory path, resolved from the repository root.
 fn scope_patterns(repo: &gix::Repository, directory: &Path) -> Result<Vec<BString>> {
     let directory = gix::path::try_into_bstr(directory).with_context(|| {
         format!(
@@ -222,7 +221,7 @@ fn scope_patterns(repo: &gix::Repository, directory: &Path) -> Result<Vec<BStrin
     Ok(vec![BString::from(pattern)])
 }
 
-/// UI labels are UTF-8, so an undecodable Git path is outside this review.
+/// Omit paths that cannot be displayed losslessly in the UTF-8 review ribbon.
 fn decode_git_path(path: &BStr) -> Option<PathBuf> {
     let path = path.to_str().ok()?;
     Some(PathBuf::from(path))
@@ -257,7 +256,6 @@ fn head_revision(
     }))
 }
 
-/// Current regular-file handle, absence, or an unsupported filesystem entry.
 fn worktree_revision(root: &Path, path: &Path) -> Result<Revision<OpenFile>> {
     let full_path = root.join(path);
     let metadata = fs::symlink_metadata(&full_path);

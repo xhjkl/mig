@@ -1,4 +1,4 @@
-//! Terminal rendering of presentation-owned rows; no diff structure is inferred here.
+//! Render prepared review rows without inferring new diff structure.
 
 use crate::diff::{
     DiffMark, LineEnding, PresentedFile, ReviewRow, SourceRow, SyntaxClass, WordDiff,
@@ -22,11 +22,9 @@ use ratatui::{
 use std::io::{self, Stdout};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Smallest useful source viewport after the file-derived gutter.
 const MIN_SOURCE_COLUMNS: usize = 62;
-/// Path header plus its breathing row.
+/// File ribbon and the blank row beneath it.
 const HEADER_ROWS: u16 = 2;
-/// Smallest viewport that still makes scrolling useful.
 const MIN_BODY_ROWS: u16 = 16;
 const MIN_TERMINAL_HEIGHT: u16 = HEADER_ROWS + MIN_BODY_ROWS;
 const VERTICAL_ELLIPSIS: &str = "⋮";
@@ -34,16 +32,15 @@ const RIBBON_MARGIN: &str = "  ";
 const RIBBON_SEPARATOR: &str = " │ ";
 const RIBBON_OMISSION: &str = "…";
 const GENERATED_BADGE: &str = " @generated";
-/// Stable source-local tab geometry, independent of gutter width.
+/// Tab stops measured from the start of source text, independent of the gutter.
 const SOURCE_TAB_STOP: usize = 4;
 
-/// File-wide prefix geometry shared by every unified row style.
+/// One gutter width for the whole file, keeping source aligned while scrolling.
 #[derive(Clone, Copy, Debug, Default)]
 struct GutterLayout {
     label_columns: usize,
 }
 
-/// Source-row marker whose glyph and foreground must remain one semantic choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceMarker {
     Reflow,
@@ -125,7 +122,7 @@ fn moved_label(before: Option<usize>, after: usize) -> String {
     format!("{before} → {after}")
 }
 
-/// Open one or more presented file reviews or retained input notices.
+/// Run the terminal review and restore terminal modes on exit.
 pub fn run(reviews: Vec<ReviewEntry>) -> Result<()> {
     ensure!(!reviews.is_empty(), "cannot open an empty review");
     let mut session = TerminalSession::enter()?;
@@ -135,13 +132,13 @@ pub fn run(reviews: Vec<ReviewEntry>) -> Result<()> {
 
     let event_result = run_event_loop(&mut terminal, &mut app);
 
-    // All cleanup attempts run even when drawing or input failed.
+    // Restoring the terminal before propagating drawing or input errors.
     let session_result = session.restore();
     event_result?;
     session_result
 }
 
-/// Terminal modes that unwind independently after errors and panics.
+/// Terminal modes still owed restoration, including partially completed writes.
 struct TerminalSession {
     raw_mode: bool,
     alternate_screen: bool,
@@ -159,7 +156,7 @@ impl TerminalSession {
         enable_raw_mode().context("failed to enable raw mode")?;
         session.raw_mode = true;
 
-        // Mark first so Drop still attempts recovery after a partial terminal write.
+        // Marking before the write so Drop also recovers from partial terminal writes.
         session.alternate_screen = true;
         execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
 
@@ -210,7 +207,7 @@ impl Drop for TerminalSession {
     }
 }
 
-/// Viewport over one file inside a path-ordered review.
+/// Review navigation and scroll position for the active file.
 #[derive(Debug)]
 struct App {
     reviews: Vec<ReviewEntry>,
@@ -368,7 +365,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Paragraph::new(visible), body);
 }
 
-/// Contiguous ribbon run around the active review, with explicit hidden edges.
+/// Keep the active path visible in a contiguous run of neighboring paths.
 fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'static> {
     if items.is_empty() || active >= items.len() || width == 0 {
         return Line::from("");
@@ -379,12 +376,12 @@ fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'stat
     let mut start = active;
     let mut end = active + 1;
 
-    // Grow evenly from the active item. A contiguous run keeps ordering legible.
     loop {
         let mut candidates = [
             start.checked_sub(1).map(|start| (start, end)),
             (end < items.len()).then(|| (start, end + 1)),
         ];
+        // Favoring the less populated side keeps the active path near the middle.
         if active - start >= end - active {
             candidates.reverse();
         }
@@ -423,7 +420,7 @@ fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'stat
         if offset > 0 {
             spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
         }
-        // Clipping only the active-only fallback; every expanded run already fits.
+        // Clipping only a lone active path; runs with neighbors already fit in full.
         let budget = if end - start == 1 {
             items_width
         } else {
@@ -543,7 +540,6 @@ fn compose_review(diff: &PresentedFile, gutter: GutterLayout, width: usize) -> V
                     width,
                     false,
                 )),
-                // Historical rows stay ghosted without competing with current syntax.
                 ReviewRow::Removed(line) => rows.push(source_line(
                     line,
                     Some(SourceMarker::Removed),
@@ -743,7 +739,6 @@ fn moved_source_line(
     Line::from(spans)
 }
 
-/// Clip source at source-local tab stops and apply current or historical styling.
 fn append_source_spans(
     spans: &mut Vec<Span<'static>>,
     line: &SourceRow,
@@ -759,6 +754,7 @@ fn append_source_spans(
         if text_width == 0 {
             continue;
         }
+        // Muting historical syntax keeps attention on the current revision.
         let style = match (historical, span.mark) {
             (true, DiffMark::Added) => {
                 unreachable!("before-side ghost lines cannot contain added source")
@@ -792,7 +788,6 @@ fn elision_line(gutter: GutterLayout, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Aligned file boundary that becomes the final scrollable row of an EOF hunk.
 fn eof_guardian_line(gutter: GutterLayout) -> Line<'static> {
     Line::styled(
         format!("{} │", gutter.padding("")),
@@ -829,7 +824,7 @@ fn word_diff_line(diff: &WordDiff, gutter: GutterLayout, width: usize) -> Line<'
     clip_line(spans, width)
 }
 
-/// One emphasis palette for changed source across linewise, compact, and metadata rows.
+/// Give source edits and metadata changes the same visual emphasis.
 fn change_emphasis_style(mark: DiffMark) -> Style {
     let foreground = match mark {
         DiffMark::Removed => Palette::GHOST_EMPHASIS,
@@ -840,7 +835,7 @@ fn change_emphasis_style(mark: DiffMark) -> Style {
 }
 
 fn softened_syntax_style(class: SyntaxClass) -> Style {
-    // Two parts syntax color to one part neutral gray: recessed, but still legible.
+    // Blending toward neutral gray keeps unchanged syntax legible behind the edits.
     let foreground = syntax_foreground(class);
     let foreground = match (foreground, Palette::MUTED) {
         (Color::Rgb(red, green, blue), Color::Rgb(nr, ng, nb)) => {
@@ -882,7 +877,7 @@ fn clip_text(text: &str, width: usize) -> String {
     output
 }
 
-/// Display source tabs before clipping so Ratatui cannot discard their indentation.
+/// Expand tabs before clipping so Ratatui cannot discard their indentation.
 fn clip_source_text(text: &str, width: usize, start_column: usize) -> (String, usize) {
     let mut output = String::with_capacity(text.len());
     let mut used = 0;
@@ -910,7 +905,7 @@ fn clip_source_text(text: &str, width: usize, start_column: usize) -> (String, u
     (output, used)
 }
 
-/// Tail-preserving path clipping keeps the distinguishing file name on screen.
+/// Clip the start of a path to keep its distinguishing filename visible.
 fn clip_text_start(text: &str, width: usize) -> String {
     if UnicodeWidthStr::width(text) <= width {
         return text.to_owned();
@@ -960,7 +955,7 @@ fn surrounding_style() -> Style {
     softened_syntax_style(SyntaxClass::Plain)
 }
 
-/// Restrained foreground palette; the user's terminal owns every background.
+/// Foreground colors only; backgrounds come from the user's terminal.
 struct Palette;
 
 impl Palette {
@@ -972,7 +967,6 @@ impl Palette {
     const WARNING: Color = Color::Rgb(225, 174, 89);
     const MOVE: Color = Color::Rgb(101, 181, 190);
     const CURRENT: Color = Color::Rgb(100, 205, 144);
-    /// Restrained violet-gray family reserved for rendered before-side ghost lines.
     const GHOST: Color = Color::Rgb(127, 110, 149);
     const GHOST_EMPHASIS: Color = Color::Rgb(136, 106, 153);
 

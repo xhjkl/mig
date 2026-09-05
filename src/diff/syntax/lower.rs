@@ -12,37 +12,34 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
-/// Frontend instruction resolved to one concrete decoration-owner edge after lowering.
+/// Decoration relationship resolved after lowering, when all possible owners are known.
 #[derive(Clone, Copy, Default)]
 pub enum DecorationHint {
     #[default]
     None,
-    /// Decorates the next frontend-declared owner in this sibling scope.
+    /// Next sibling declared to accept decorations, allowing intervening layout and comments.
     FollowingSibling,
-    /// Decorates the nearest frontend-declared enclosing owner.
+    /// Nearest enclosing node declared to accept decorations.
     EnclosingOwner,
 }
 
-/// Language decision for one parser node before its parser handle is discarded.
+/// Language-specific decisions retained when parser nodes become neutral syntax.
 #[derive(Default)]
 pub struct NodeAnnotation {
     pub review: Option<ReviewUnit>,
     pub channel: Option<ContentChannel>,
-    /// Language-specific spelling used as a graph identity, independent of review units.
     pub identity: Option<Range<usize>>,
-    /// Source-language decoration relationship; resolved only after all siblings exist.
     pub decoration: DecorationHint,
-    /// Whether this semantic boundary may own decorations.
     pub owns_decorations: bool,
     pub sibling_matching: SiblingMatching,
     pub wrapper_boundary: WrapperBoundary,
-    /// Language-owned extent when the grammar stops before the semantic content does.
+    /// Extended range for constructs such as HTML plaintext, which consumes the rest of the file.
     pub extent: Option<Range<usize>>,
-    /// Treat the node's complete byte range as one payload and discard parser children.
+    /// Whole-node payload treatment, preserving the source while discarding parser children.
     pub prune_children: bool,
 }
 
-/// Official query sources and their one process-wide compilation for one grammar.
+/// Upstream highlight queries with a shared cache of either compiled queries or their error.
 pub struct HighlightQueries {
     sources: &'static [&'static str],
     compiled: OnceLock<Result<Box<[Query]>, String>>,
@@ -82,7 +79,8 @@ impl HighlightQueries {
     }
 }
 
-/// Lower parser-owned syntax into the internal language-neutral source arena.
+/// Lower parser nodes into neutral syntax while retaining source omitted by the grammar.
+/// Return `None` when parser recovery cannot be reconciled with the source.
 pub fn lower<'source>(parsed: ParsedFile<'source>) -> anyhow::Result<Option<SyntaxTree<'source>>> {
     let source = parsed.source;
     let grammar = parsed.grammar;
@@ -184,7 +182,6 @@ enum Pending<'tree> {
     },
 }
 
-/// Parser-level leaf meaning kept separate from its terminal palette category.
 #[derive(Clone, Copy)]
 struct LeafClassification {
     role: LeafRole,
@@ -274,7 +271,7 @@ fn lower_nodes(
         let parser_bytes = node.byte_range();
         let bytes = annotation.extent.clone().unwrap_or(parser_bytes.clone());
         if bytes.end > parser_bytes.end {
-            // Plaintext-style constructs absorb every parser sibling through their extent.
+            // Absorbing later parser siblings; plaintext treats their apparent tags as text.
             consumed_until = consumed_until.max(bytes.end);
             let mut ancestor = parent;
             while let Some(id) = ancestor {
@@ -301,7 +298,7 @@ fn lower_nodes(
                 role: classification.role,
                 syntax: classification.syntax,
                 channel: leaf_channel,
-                // Named leaves carry grammar meaning even when their spelling is punctuation.
+                // Preserving named punctuation as syntax; its grammar role takes precedence over spelling.
                 delimiter: if node.is_named() {
                     None
                 } else {
@@ -381,7 +378,7 @@ fn lower_nodes(
     Some(nodes)
 }
 
-/// Resolve frontend-declared decoration relationships without widening either source extent.
+/// Link decorations to their owners while keeping each source range independently reviewable.
 fn resolve_decoration_owners(nodes: &mut [SyntaxNode], hints: &[DecorationHint], owners: &[bool]) {
     debug_assert_eq!(nodes.len(), hints.len());
     debug_assert_eq!(nodes.len(), owners.len());
@@ -424,7 +421,7 @@ fn nearest_decoration_owner(
     }
 }
 
-/// Layout and independent commentary may separate a decoration from its semantic owner.
+/// Allow a decoration to reach its owner across punctuation, layout, and independent comments.
 fn decoration_transparent(node: &SyntaxNode) -> bool {
     !node.named
         || node.leaf.is_some_and(|leaf| {
@@ -435,7 +432,6 @@ fn decoration_transparent(node: &SyntaxNode) -> bool {
         })
 }
 
-/// Anonymous punctuation and spacing delimit syntax without carrying anchor payload.
 fn delimiter(spelling: &str) -> Option<Delimiter> {
     match spelling {
         "," | ";" => Some(Delimiter::Trailing(None)),

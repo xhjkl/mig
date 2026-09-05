@@ -1,4 +1,4 @@
-//! Parse source symmetrically, then lower it into neutral syntax trees.
+//! Language-neutral syntax for correspondence, with both revisions using the same frontend.
 
 mod c;
 mod css;
@@ -16,7 +16,7 @@ use std::num::NonZeroU16;
 use std::ops::Range;
 use std::path::Path;
 
-/// Stable arena handle; neutral syntax never exposes parser-owned node handles.
+/// Handle into one syntax arena, independent of the parser's node lifetimes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(usize);
 
@@ -25,13 +25,11 @@ impl NodeId {
         Self(index)
     }
 
-    /// Arena position, useful for dense correspondence tables.
     pub const fn index(self) -> usize {
         self.0
     }
 }
 
-/// Concrete grammar whose numeric symbols remain scoped inside one syntax tree.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Grammar {
     C,
@@ -44,24 +42,21 @@ pub enum Grammar {
     Jsx,
 }
 
-/// Whether leaf payload participates as syntax, commentary, or exact opaque text.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ContentChannel {
     Syntax,
     Comment,
     Opaque,
-    /// Parser-omitted formatting that must remain renderable but not semantic.
+    /// Formatting preserved for display but excluded from semantic matching.
     Layout,
 }
 
-/// Tree-sitter grammar symbol scoped by `SyntaxTree::grammar`.
-///
-/// The numeric identity is retained only for exact structural comparison; parser
-/// spellings remain confined to language lowering.
+/// Tree-sitter symbol whose numeric identity is meaningful only within `SyntaxTree::grammar`.
+/// Correspondence compares these IDs without interpreting language-specific symbol names.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GrammarSymbol(u16);
 
-/// Synthetic forms that have no parser grammar symbol.
+/// Grammar symbol or synthetic node for source that has no parser representation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SyntaxKind {
     Grammar(GrammarSymbol),
@@ -74,7 +69,7 @@ pub enum SyntaxKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GrammarField(NonZeroU16);
 
-/// Incoming position of one syntax occurrence beneath its parent.
+/// Parent-relative edge that distinguishes grammar fields from positional children.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ChildSlot {
     #[default]
@@ -82,12 +77,11 @@ pub enum ChildSlot {
     Field(GrammarField),
 }
 
-/// How one independently matched review unit is compared.
+/// Comparison policy for one independently matched review unit.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ComparisonStrategy {
-    /// Structure-aware content eligible for move and reflow detection.
+    /// Syntax comparison that permits move and reflow detection.
     Structural,
-    /// Content compared through physical lines.
     Linewise,
 }
 
@@ -96,7 +90,7 @@ impl ComparisonStrategy {
         matches!(self, Self::Structural)
     }
 
-    /// Preserve structural comparison only when both frontends certify it.
+    /// Require structural support from both revisions so comparison stays symmetric.
     pub const fn reconcile(before: Self, after: Self) -> Self {
         match (before, after) {
             (Self::Structural, Self::Structural) => Self::Structural,
@@ -105,7 +99,7 @@ impl ComparisonStrategy {
     }
 }
 
-/// Semantic source role carried independently of a unit's comparison strategy.
+/// Presentation role, independent of how the unit's contents are compared.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SourceRole {
     Content,
@@ -114,7 +108,6 @@ pub enum SourceRole {
 }
 
 impl SourceRole {
-    /// Keep wiring semantics only when both revisions agree on the role.
     pub const fn reconcile(before: Self, after: Self) -> Self {
         match (before, after) {
             (Self::Wiring, Self::Wiring) => Self::Wiring,
@@ -123,33 +116,31 @@ impl SourceRole {
     }
 }
 
-/// Parser-omitted layout that a unit owns for source-completeness certification.
+/// Permission to claim unchanged blank separators along with a matched review unit.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LayoutOwnership {
     None,
     AdjacentBlankLines,
 }
 
-/// How one syntax occurrence participates among siblings under its paired parent.
+/// Rules for pairing siblings after their parents have been matched.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum SiblingMatching {
-    /// Grammar scaffolding follows ordered structural correspondence.
     #[default]
     OrderedSyntax,
-    /// The occurrence establishes a local identity/shape domain before its contents pair.
+    /// A node paired by its own identity or shape before its contents can be compared.
     LocalIdentity,
 }
 
-/// Whether a unique wrap or unwrap proof may traverse one unmatched occurrence.
+/// Permission to cross an unmatched node while proving a unique wrap or unwrap.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 enum WrapperBoundary {
     #[default]
     Traversable,
-    /// Descendants cannot escape through this unmatched semantic boundary.
     Sealed,
 }
 
-/// Frontend-selected policies for one independently matched file-level unit.
+/// Policies for a file-level unit matched independently of its neighbors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReviewUnit {
     pub comparison: ComparisonStrategy,
@@ -183,29 +174,27 @@ impl ReviewUnit {
     }
 }
 
-/// Concrete CST leaf metadata; payload remains borrowed through `SyntaxTree::source`.
+/// Leaf metadata with payload borrowed from `SyntaxTree::source` through the node's byte range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Leaf {
-    /// Parser-level meaning used by correspondence, independent of terminal coloring.
     pub role: LeafRole,
     pub syntax: SyntaxClass,
     pub channel: ContentChannel,
-    /// Grammar delimiter status and its optional preceding syntax owner.
     pub delimiter: Option<Delimiter>,
 }
 
-/// Semantic contribution of one concrete leaf to neutral correspondence.
+/// Evidence a leaf contributes to correspondence, independent of its display color.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LeafRole {
     /// Name-like spelling that can identify a direct structural child.
     Identifier,
-    /// Source payload that contributes evidence of near-sameness.
+    /// Content whose overlap helps match edited nodes.
     Payload,
-    /// Grammar or commentary scaffolding that carries neither role.
+    /// Syntax or comments excluded from identifier and payload evidence.
     Scaffolding,
 }
 
-/// Punctuation classified independently of terminal highlighting.
+/// Punctuation ownership used to keep delimiters with their syntax during edits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Delimiter {
     /// Comma or semicolon, optionally attached to its preceding syntax occurrence.
@@ -213,27 +202,25 @@ pub enum Delimiter {
     Structural,
 }
 
-/// One neutral CST occurrence with exact source geometry and ordered containment.
+/// Language-neutral syntax occurrence with exact source ranges and ordered children.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyntaxNode {
-    /// Parser symbol identity or one explicitly synthetic source form.
     pub kind: SyntaxKind,
-    /// Grammar-owned identity of this node's incoming field edge.
     pub slot: ChildSlot,
     pub bytes: Range<usize>,
-    /// Complete source extent owned by this occurrence, including an attached trailing delimiter.
+    /// Source extent including any attached trailing delimiter, which lies outside `bytes`.
     pub source_envelope: Range<usize>,
     pub lines: Range<usize>,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
     pub leaf: Option<Leaf>,
-    /// Exact source spelling used to disambiguate same-shaped graph nodes.
+    /// Source spelling that distinguishes this node from siblings of the same shape.
     identity: Option<Range<usize>>,
-    /// Semantic syntax node decorated by this occurrence, independent of source extent.
+    /// Node decorated by this occurrence; the relationship does not merge their source ranges.
     pub decoration_owner: Option<NodeId>,
     pub sibling_matching: SiblingMatching,
     wrapper_boundary: WrapperBoundary,
-    /// Presence promotes this node to an independently matched file-level unit.
+    /// Independent review policy, allowed only on the root or its direct children.
     pub review: Option<ReviewUnit>,
     pub named: bool,
     pub extra: bool,
@@ -241,33 +228,33 @@ pub struct SyntaxNode {
 }
 
 impl SyntaxNode {
-    /// Whether this node stops a wrap or unwrap proof from crossing its semantic domain.
     pub const fn seals_wrappers(&self) -> bool {
         matches!(self.wrapper_boundary, WrapperBoundary::Sealed)
     }
 
-    /// Whether this node fences correspondence to its own matched parent pair.
+    /// Identify boundaries that keep source alignment inside a matched node pair.
     pub const fn is_scope_boundary(&self) -> bool {
         self.leaf.is_none() || self.review.is_some()
     }
 }
 
-/// Source plus a parser-independent arena suitable for graph correspondence.
+/// Source and a preorder arena whose node IDs remain stable through correspondence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyntaxTree<'source> {
     pub source: Source<'source>,
-    /// `None` denotes the universal exact-line fallback.
+    /// `None` for the line-based fallback, which has no grammar-specific symbols.
     pub grammar: Option<Grammar>,
     pub root: NodeId,
     pub nodes: Vec<SyntaxNode>,
-    /// Source-ordered leaves keep presentation and source certification linear.
+    /// Leaves in source order for range lookup without walking the syntax tree.
     leaves: Vec<NodeId>,
     /// Exclusive preorder end of each node's contiguous subtree.
     subtree_ends: Vec<usize>,
 }
 
 impl<'source> SyntaxTree<'source> {
-    /// Complete neutral arena plus its source-order acceleration index.
+    /// Index a preorder arena for source lookup and containment checks.
+    /// Review units must be either the file root alone or its direct children.
     fn from_nodes(
         source: Source<'source>,
         grammar: Option<Grammar>,
@@ -313,19 +300,17 @@ impl<'source> SyntaxTree<'source> {
         }
     }
 
-    /// Arena node for a stable syntax-local handle.
     pub fn node(&self, id: NodeId) -> &SyntaxNode {
         &self.nodes[id.index()]
     }
 
-    /// Original payload of a concrete leaf, including a zero-width missing token.
+    /// Borrow a leaf's exact spelling, including an empty slice for a missing token.
     pub fn leaf_text(&self, id: NodeId) -> Option<&'source str> {
         let node = self.node(id);
         node.leaf?;
         self.source.slice(node.bytes.clone())
     }
 
-    /// Syntax occurrence owning this trailing delimiter, if lowering attached one.
     pub fn delimiter_owner(&self, id: NodeId) -> Option<NodeId> {
         match self.node(id).leaf?.delimiter? {
             Delimiter::Trailing(owner) => owner,
@@ -333,13 +318,12 @@ impl<'source> SyntaxTree<'source> {
         }
     }
 
-    /// Source spelling selected by a graph node as its correspondence identity.
     pub fn identity_text(&self, id: NodeId) -> Option<&'source str> {
         let identity = self.node(id).identity.clone()?;
         self.source.slice(identity)
     }
 
-    /// Concrete leaf handles overlapping one byte range, in source order.
+    /// Yield leaves overlapping the byte range in source order.
     pub fn leaf_ids_in(&self, bytes: Range<usize>) -> impl Iterator<Item = NodeId> + '_ {
         let start = self
             .leaves
@@ -350,17 +334,17 @@ impl<'source> SyntaxTree<'source> {
             .take_while(move |id| self.node(*id).bytes.start < bytes.end)
     }
 
-    /// Arena descendants in source preorder, excluding the supplied root.
+    /// Yield descendants in source preorder, excluding the supplied root.
     pub fn descendants(&self, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         (root.index() + 1..self.subtree_ends[root.index()]).map(NodeId::new)
     }
 
-    /// Whether one arena node belongs to another node's preorder subtree.
+    /// Check containment, counting a node as contained in itself.
     pub fn contains(&self, outer: NodeId, inner: NodeId) -> bool {
         outer.index() <= inner.index() && inner.index() < self.subtree_ends[outer.index()]
     }
 
-    /// Independently matched file-level units in source preorder.
+    /// Yield independently matched review units in source preorder.
     pub fn review_units(&self) -> impl Iterator<Item = (NodeId, &SyntaxNode)> {
         self.nodes.iter().enumerate().filter_map(|(index, node)| {
             node.review.as_ref()?;
@@ -369,7 +353,7 @@ impl<'source> SyntaxTree<'source> {
     }
 }
 
-/// Attach comma and semicolon tokens to their preceding named syntax occurrence.
+/// Attach commas and semicolons to the preceding named node so edits include its delimiter.
 fn attach_trailing_delimiters(nodes: &mut [SyntaxNode]) {
     for parent_index in 0..nodes.len() {
         for position in 0..nodes[parent_index].children.len() {
@@ -404,7 +388,7 @@ fn attach_trailing_delimiters(nodes: &mut [SyntaxNode]) {
     }
 }
 
-/// Whether one syntax node owns complete physical rows apart from indentation.
+/// Check whether the node and its delimiter occupy whole lines apart from spaces and tabs.
 pub fn node_owns_complete_lines(syntax: &SyntaxTree<'_>, node: NodeId) -> bool {
     let node = syntax.node(node);
     let Some(lines) = syntax.source.line_coverage(node.source_envelope.clone()) else {
@@ -438,14 +422,15 @@ pub fn horizontal_layout(text: &str) -> bool {
     text.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
 }
 
-/// Symmetric before/after syntax selected as one atomic frontend decision.
+/// Revision pair using one grammar, or both using the exact-line fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyntaxPair<'before, 'after> {
     pub before: SyntaxTree<'before>,
     pub after: SyntaxTree<'after>,
 }
 
-/// Parse and lower both revisions with one grammar, falling both back if either is unsafe.
+/// Parse both revisions with one grammar, falling back to lines if either cannot be lowered.
+/// The shared frontend prevents differences in parser recovery from appearing as source edits.
 pub fn syntax_pair<'before, 'after>(
     path: &Path,
     before: &'before str,
@@ -483,7 +468,6 @@ pub fn syntax_pair<'before, 'after>(
     Ok(SyntaxPair { before, after })
 }
 
-/// Lower both revisions as exact line-leaf trees after a syntax certificate fails.
 fn line_pair<'before, 'after>(
     before: &'before str,
     after: &'after str,

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Immutable Git blob identity and inspected size before its body is requested.
+/// Blob identity and size obtained without loading its contents.
 #[derive(Clone, Copy)]
 pub struct GitBlob {
     pub object: ObjectId,
@@ -12,7 +12,7 @@ pub struct GitBlob {
 }
 
 impl GitBlob {
-    /// Read the inspected object while preserving its pinned-size invariant.
+    /// Load the blob, verifying the size callers used to admit it under their byte limit.
     pub fn read(self, repo: &gix::Repository) -> Result<Vec<u8>> {
         let blob = repo.find_blob(self.object);
         let mut blob = blob.context("failed to read Git blob")?;
@@ -28,7 +28,7 @@ impl GitBlob {
     }
 }
 
-/// Open file plus the size observed from its handle before any allocation.
+/// File handle and measured size, kept together so reads use the file that was inspected.
 pub struct OpenFile {
     file: File,
     path: PathBuf,
@@ -54,7 +54,7 @@ impl OpenFile {
         self.bytes
     }
 
-    /// Bounded read that catches a file growing after its initial `fstat`.
+    /// Enforce the byte limit even if the file has grown since it was opened.
     pub fn read(self, limit: u64) -> Result<BoundedBytes> {
         if self.bytes > limit {
             return Ok(BoundedBytes::TooLarge(self.bytes));
@@ -88,7 +88,7 @@ pub enum BoundedBytes {
     TooLarge(u64),
 }
 
-/// Decode terminal-review text while leaving binary content outside the review.
+/// Decode NUL-free UTF-8; callers omit other Git content from review.
 pub fn decode_text(source: Vec<u8>) -> Option<String> {
     if source.contains(&0) {
         return None;

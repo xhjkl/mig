@@ -142,7 +142,7 @@ fn doc_comment_decoration(kind: &str, text: &str) -> DecorationHint {
     }
 }
 
-/// Identify semantic owners that receive decorations and seal their unmatched descendants.
+/// Identify decoration owners that also block wrap/unwrap matching when unpaired.
 fn is_semantic_owner(kind: &str) -> bool {
     is_definition(kind)
         || matches!(
@@ -157,7 +157,7 @@ fn is_semantic_owner(kind: &str) -> bool {
         )
 }
 
-/// External module declarations are source wiring; inline modules remain definitions.
+/// Recognize external module declarations, which use wiring presentation.
 fn is_bodyless_module(node: ::tree_sitter::Node<'_>) -> bool {
     node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
 }

@@ -1849,7 +1849,7 @@ fn line_text(line: &SourceRow) -> String {
     line.spans.iter().map(|span| span.text.as_str()).collect()
 }
 
-/// Numbered source rows materially rendered by one public row.
+/// Identify visible source lines on each side, excluding folded ranges and metadata.
 fn materialized_source_rows(row: &ReviewRow) -> (Option<usize>, Option<usize>) {
     match row {
         ReviewRow::Current(line) | ReviewRow::Reflow(line) => (None, Some(line.number)),
@@ -1863,7 +1863,7 @@ fn materialized_source_rows(row: &ReviewRow) -> (Option<usize>, Option<usize>) {
     }
 }
 
-/// Current-world coverage represented by one public row; old-only ghosts have none.
+/// Include folded current-source ranges when checking that rows do not overlap.
 fn current_world_coverage(row: &ReviewRow) -> Option<Range<usize>> {
     match row {
         ReviewRow::Current(line)
@@ -1876,9 +1876,8 @@ fn current_world_coverage(row: &ReviewRow) -> Option<Range<usize>> {
     }
 }
 
-/// Public review rows remain ordered and singly owned inside each visual hunk.
-///
-/// Ownership is deliberately hunk-local: an ancestor breadcrumb may frame two distant hunks.
+/// Check current-source order and unique line ownership within each hunk.
+/// An ancestor breadcrumb may legitimately appear in two distant hunks.
 fn assert_source_space_invariants(path: &str, diff: &PresentedFile) {
     for (hunk_index, hunk) in diff.hunks.iter().enumerate() {
         let mut before_owners = HashSet::new();

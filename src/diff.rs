@@ -15,10 +15,10 @@ pub use presentation::{DiffMark, PresentedFile, ReviewRow, SourceRow, WordDiff};
 pub use presentation::{ReviewHunk, SourceSpan};
 pub use source::LineEnding;
 
-/// Largest physical-line arena expanded for one revision.
+/// Per-revision line limit, bounding syntax storage even for files of empty lines.
 pub const MAX_REVISION_LINES: usize = 100_000;
 
-/// Coarse language syntax category understood by the terminal palette.
+/// Language-neutral syntax categories for terminal coloring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyntaxClass {
     Plain,
@@ -38,7 +38,8 @@ pub struct LineCoverage {
     pub after: Option<Range<usize>>,
 }
 
-/// Parse, lower, reconcile, refine, and present one pair of source revisions.
+/// Build review hunks using the path's language and both revisions' syntax.
+/// Unchanged input produces no hunks; revisions without reliable syntax use exact lines.
 pub fn diff_file(path: &str, before: &str, after: &str) -> Result<PresentedFile> {
     let generated = has_generated_marker(before) || has_generated_marker(after);
     if before == after {
@@ -66,7 +67,7 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<PresentedFile>
     })
 }
 
-/// Conventional marker search is deliberately header-bounded and case-sensitive.
+/// Limit marker recognition to the header so body text does not classify the file.
 fn has_generated_marker(source: &str) -> bool {
     source.lines().take(20).any(is_generated_marker_line)
 }

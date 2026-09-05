@@ -44,7 +44,6 @@ pub fn diff_commit(directory: &Path, commitish: &Path, limit: u64) -> Result<Vec
     let before_tree = match parent_id {
         None => repo.empty_tree(),
         Some(parent_id) => {
-            // Mig has a two-revision model, so merge commits use Git's first-parent view.
             let parent = repo.find_commit(parent_id);
             let parent = parent.with_context(|| {
                 format!("failed to read the first parent of {}", commitish.display())
@@ -59,7 +58,7 @@ pub fn diff_commit(directory: &Path, commitish: &Path, limit: u64) -> Result<Vec
         }
     };
 
-    // Keep renames as an addition and deletion, matching worktree review semantics.
+    // Keeping renames as additions and deletions, consistent with worktree review.
     let options = gix::diff::Options::default().with_rewrites(None);
     let changes = repo.diff_tree_to_tree(&before_tree, &after_tree, Some(options));
     let changes = changes.with_context(|| {
@@ -86,7 +85,7 @@ pub fn diff_commit(directory: &Path, commitish: &Path, limit: u64) -> Result<Vec
     Ok(reviews)
 }
 
-/// Normalize one detached tree change and route its bounded blobs through review.
+/// Review a regular-file change, checking both blob sizes before loading either body.
 fn review_change(
     repo: &gix::Repository,
     change: ChangeDetached,
@@ -185,7 +184,7 @@ fn review_change(
     review_source_pair(&path, before.as_deref(), after.as_deref())
 }
 
-/// Header-only size check before either side of a pair is allocated.
+/// Read the blob's declared size without allocating its contents.
 fn inspect_blob(
     repo: &gix::Repository,
     object: ObjectId,
@@ -204,7 +203,7 @@ fn inspect_blob(
     })
 }
 
-/// UI labels are UTF-8, so an undecodable Git path is outside this review.
+/// Omit paths that cannot be displayed losslessly in the UTF-8 review ribbon.
 fn decode_git_path(path: &BStr) -> Option<String> {
     path.to_str().ok().map(ToOwned::to_owned)
 }
