@@ -28,39 +28,23 @@ struct ReviewCluster {
     merge_window: Range<usize>,
 }
 
-impl ReviewCluster {
-    fn meld(&mut self, mut later: Self) {
-        debug_assert!(self.order <= later.order);
-        if review_priority(later.nature) > review_priority(self.nature) {
-            self.nature = later.nature;
-        }
-        self.groups.append(&mut later.groups);
-        self.halo_lines.append(&mut later.halo_lines);
-        self.merge_window.start = self.merge_window.start.min(later.merge_window.start);
-        self.merge_window.end = self.merge_window.end.max(later.merge_window.end);
-    }
-}
-
 /// Sheaf nearby source changes, apply review priority, and complete context.
 pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<RefinedHunk> {
     let RawSourceDiff {
         hunks,
         review_geometry,
     } = raw;
-    let hunks = hunks
-        .into_iter()
-        .flat_map(|hunk| split_source_hunk(pair, &review_geometry, hunk))
-        .collect::<Vec<_>>();
     let mut hunks = hunks
         .into_iter()
+        .flat_map(|hunk| split_source_hunk(pair, &review_geometry, hunk))
         .map(|hunk| place_hunk(hunk, &review_geometry))
         .collect::<Vec<_>>();
 
     // Geometry is source-ordered so only neighboring context halos can merge.
-    hunks.sort_by_key(coalescing_order);
+    hunks.sort_by_key(|hunk| (hunk.order, Reverse(review_priority(hunk.nature))));
     let mut hunks = coalesce_hunks(hunks);
     // Review priority applies only after nearby auxiliary facts are attached.
-    hunks.sort_by_key(review_order);
+    hunks.sort_by_key(|hunk| (Reverse(review_priority(hunk.nature)), hunk.order));
     for hunk in &mut hunks {
         if !hunk.halo_lines.is_empty() {
             complete_context_halos(pair, &review_geometry, hunk);
@@ -365,7 +349,8 @@ fn place_hunk(hunk: SourceHunk, geometry: &ReviewGeometry) -> ReviewCluster {
             .expect("raw hunk owns current or before-side focus");
         first..last.saturating_add(1)
     };
-    let mut halo_lines = match (receives_context(hunk.nature), hunk.context_anchor) {
+    let receives_context = hunk.nature != ChangeNature::Move;
+    let mut halo_lines = match (receives_context, hunk.context_anchor) {
         (false, _) => Vec::new(),
         (true, Some(line)) => vec![line],
         (true, None) => {
@@ -376,12 +361,17 @@ fn place_hunk(hunk: SourceHunk, geometry: &ReviewGeometry) -> ReviewCluster {
     };
     halo_lines.sort_unstable();
     halo_lines.dedup();
+    let radius = if receives_context {
+        CONTEXT_HALO_RADIUS
+    } else {
+        0
+    };
     ReviewCluster {
         nature: hunk.nature,
         groups: group_facts(hunk.facts),
         halo_lines,
         order: hunk.order,
-        merge_window: merge_window(focus, hunk.nature),
+        merge_window: focus.start.saturating_sub(radius).max(1)..focus.end.saturating_add(radius),
     }
 }
 
@@ -410,19 +400,6 @@ fn review_priority(nature: ChangeNature) -> u8 {
         ChangeNature::Move => 2,
         ChangeNature::Edit => 3,
     }
-}
-
-fn receives_context(nature: ChangeNature) -> bool {
-    !matches!(nature, ChangeNature::Move)
-}
-
-fn merge_window(focus: Range<usize>, nature: ChangeNature) -> Range<usize> {
-    let radius = if receives_context(nature) {
-        CONTEXT_HALO_RADIUS
-    } else {
-        0
-    };
-    focus.start.saturating_sub(radius).max(1)..focus.end.saturating_add(radius)
 }
 
 /// Give each uninterrupted current-world source occurrence one final display owner.
@@ -454,11 +431,9 @@ fn deduplicate_context_rows(hunks: &mut Vec<ReviewCluster>) {
     let mut visible = HashSet::new();
     for hunk in hunks.iter_mut().rev() {
         for group in hunk.groups.iter_mut().rev() {
-            let mut rows = std::mem::take(group);
-            rows.reverse();
-            rows.retain(|row| claim_visible_context(row, &mut visible));
-            rows.reverse();
-            *group = rows;
+            group.reverse();
+            group.retain(|row| claim_visible_context(row, &mut visible));
+            group.reverse();
         }
         hunk.groups.retain(|group| !group.is_empty());
     }
@@ -492,9 +467,8 @@ fn complete_context_halos(
         return;
     }
 
-    let mut signals = hunk.halo_lines.clone();
-    signals.sort_unstable();
-    signals.dedup();
+    hunk.halo_lines.sort_unstable();
+    hunk.halo_lines.dedup();
 
     let mut shown = hunk
         .groups
@@ -502,7 +476,7 @@ fn complete_context_halos(
         .flatten()
         .flat_map(|fact| fact.change.displayed_after())
         .collect::<HashSet<_>>();
-    for signal in signals {
+    for &signal in &hunk.halo_lines {
         let start = signal.saturating_sub(CONTEXT_HALO_RADIUS).max(1);
         let end = signal.saturating_add(CONTEXT_HALO_RADIUS).min(line_count);
         for number in start..=end {
@@ -641,22 +615,6 @@ fn range_excluding_lines(range: Range<usize>, excluded: &[usize]) -> Vec<Range<u
     segments
 }
 
-fn coalescing_order(hunk: &ReviewCluster) -> (usize, usize, Reverse<u8>) {
-    (
-        hunk.order.after_gap,
-        hunk.order.tie_break,
-        Reverse(review_priority(hunk.nature)),
-    )
-}
-
-fn review_order(hunk: &ReviewCluster) -> (Reverse<u8>, usize, usize) {
-    (
-        Reverse(review_priority(hunk.nature)),
-        hunk.order.after_gap,
-        hunk.order.tie_break,
-    )
-}
-
 fn coalesce_hunks(hunks: Vec<ReviewCluster>) -> Vec<ReviewCluster> {
     let mut coalesced: Vec<ReviewCluster> = Vec::new();
     for hunk in hunks {
@@ -668,7 +626,14 @@ fn coalesce_hunks(hunks: Vec<ReviewCluster>) -> Vec<ReviewCluster> {
             coalesced.push(hunk);
             continue;
         }
-        previous.meld(hunk);
+        debug_assert!(previous.order <= hunk.order);
+        if review_priority(hunk.nature) > review_priority(previous.nature) {
+            previous.nature = hunk.nature;
+        }
+        previous.groups.extend(hunk.groups);
+        previous.halo_lines.extend(hunk.halo_lines);
+        previous.merge_window.start = previous.merge_window.start.min(hunk.merge_window.start);
+        previous.merge_window.end = previous.merge_window.end.max(hunk.merge_window.end);
     }
     coalesced
 }

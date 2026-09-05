@@ -71,7 +71,6 @@ pub fn annotate(node: Node<'_>, source: &str) -> NodeAnnotation {
         let identity = name.map(|name| name.byte_range());
         return NodeAnnotation {
             channel: Some(ContentChannel::Opaque),
-            descendant_channel: Some(ContentChannel::Opaque),
             identity,
             sibling_matching: SiblingMatching::LocalIdentity,
             extent: absorbs_rest.then(|| node.start_byte()..source.len()),
@@ -113,7 +112,6 @@ pub fn annotate(node: Node<'_>, source: &str) -> NodeAnnotation {
     if node.kind() == "comment" {
         return NodeAnnotation {
             channel: Some(ContentChannel::Comment),
-            descendant_channel: Some(ContentChannel::Comment),
             prune_children: true,
             ..NodeAnnotation::default()
         };

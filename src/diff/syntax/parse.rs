@@ -21,8 +21,7 @@ pub fn parse(
     let node_limit = node_limit.unwrap_or(MAX_SYNTAX_NODES);
     let mut parser = Parser::new();
     let language = tree_sitter_language(grammar);
-    let language_result = parser.set_language(&language);
-    language_result.map_err(|error| anyhow!(error))?;
+    parser.set_language(&language)?;
 
     let tree = parser.parse(source.as_str(), None);
     let Some(tree) = tree else {

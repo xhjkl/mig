@@ -28,7 +28,6 @@ pub enum DecorationHint {
 pub struct NodeAnnotation {
     pub review: Option<ReviewUnit>,
     pub channel: Option<ContentChannel>,
-    pub descendant_channel: Option<ContentChannel>,
     /// Language-specific spelling used as a graph identity, independent of review units.
     pub identity: Option<Range<usize>>,
     /// Source-language decoration relationship; resolved only after all siblings exist.
@@ -176,15 +175,12 @@ enum Pending<'tree> {
         node: Node<'tree>,
         parent: Option<NodeId>,
         slot: ChildSlot,
-        inherited_channel: Option<ContentChannel>,
         inherited_classification: Option<LeafClassification>,
     },
     Fragment {
         bytes: Range<usize>,
         parent: NodeId,
-        channel: ContentChannel,
-        classification: LeafClassification,
-        delimiter: Option<Delimiter>,
+        leaf: Leaf,
     },
 }
 
@@ -209,7 +205,6 @@ fn lower_nodes(
         node: root,
         parent: None,
         slot: ChildSlot::Positional,
-        inherited_channel: None,
         inherited_classification: None,
     }];
     let mut consumed_until = 0;
@@ -223,13 +218,11 @@ fn lower_nodes(
             continue;
         }
 
-        let (node, parent, slot, inherited_channel, inherited_classification) = match pending_item {
+        let (node, parent, slot, inherited_classification) = match pending_item {
             Pending::Fragment {
                 bytes,
                 parent,
-                channel,
-                classification,
-                delimiter,
+                leaf,
             } => {
                 let id = NodeId::new(nodes.len());
                 nodes[parent.index()].children.push(id);
@@ -244,12 +237,7 @@ fn lower_nodes(
                     lines,
                     parent: Some(parent),
                     children: Vec::new(),
-                    leaf: Some(Leaf {
-                        role: classification.role,
-                        syntax: classification.syntax,
-                        channel,
-                        delimiter,
-                    }),
+                    leaf: Some(leaf),
                     identity: None,
                     decoration_owner: None,
                     sibling_matching: SiblingMatching::OrderedSyntax,
@@ -267,24 +255,13 @@ fn lower_nodes(
                 node,
                 parent,
                 slot,
-                inherited_channel,
                 inherited_classification,
-            } => (
-                node,
-                parent,
-                slot,
-                inherited_channel,
-                inherited_classification,
-            ),
+            } => (node, parent, slot, inherited_classification),
         };
 
         let parent_kind = node.parent().map(|parent| parent.kind());
         let annotation = annotate_node(grammar, node, parent_kind, source.as_str());
-        let child_channel = annotation.descendant_channel.or(inherited_channel);
-        let leaf_channel = annotation
-            .channel
-            .or(inherited_channel)
-            .unwrap_or(ContentChannel::Syntax);
+        let leaf_channel = annotation.channel.unwrap_or(ContentChannel::Syntax);
         let inherited_classification = highlights
             .get(&node.id())
             .copied()
@@ -374,7 +351,6 @@ fn lower_nodes(
                     node,
                     cursor..child.start_byte(),
                     id,
-                    child_channel,
                     inherited_classification,
                 ));
             }
@@ -382,7 +358,6 @@ fn lower_nodes(
                 node: child,
                 parent: Some(id),
                 slot: child_slot(tree_sitter, node.field_name_for_child(index as u32)),
-                inherited_channel: child_channel,
                 inherited_classification,
             });
             cursor = cursor.max(child.end_byte());
@@ -394,7 +369,6 @@ fn lower_nodes(
                 node,
                 cursor..parser_bytes.end,
                 id,
-                child_channel,
                 inherited_classification,
             ));
         }
@@ -414,9 +388,9 @@ fn resolve_decoration_owners(nodes: &mut [SyntaxNode], hints: &[DecorationHint],
 
     for parent_index in 0..nodes.len() {
         let parent = NodeId::new(parent_index);
-        let children = nodes[parent_index].children.clone();
         let mut following_owner = None;
-        for child in children.into_iter().rev() {
+        for position in (0..nodes[parent_index].children.len()).rev() {
+            let child = nodes[parent_index].children[position];
             match hints[child.index()] {
                 DecorationHint::FollowingSibling => {
                     nodes[child.index()].decoration_owner = following_owner;
@@ -491,22 +465,22 @@ fn fragment_pending<'tree>(
     parent: Node<'tree>,
     bytes: Range<usize>,
     parent_id: NodeId,
-    inherited_channel: Option<ContentChannel>,
     inherited_classification: Option<LeafClassification>,
 ) -> Pending<'tree> {
     let spelling = source
         .slice(bytes.clone())
         .expect("source fragments remain inside source geometry");
-    let channel =
-        inherited_channel.unwrap_or_else(|| gap_channel(grammar, parent.kind(), spelling));
+    let channel = gap_channel(grammar, parent.kind(), spelling);
     let classification = leaf_classification(parent.kind(), channel, inherited_classification);
-    let delimiter = delimiter(spelling);
     Pending::Fragment {
         bytes,
         parent: parent_id,
-        channel,
-        classification,
-        delimiter,
+        leaf: Leaf {
+            role: classification.role,
+            syntax: classification.syntax,
+            channel,
+            delimiter: delimiter(spelling),
+        },
     }
 }
 
@@ -537,26 +511,15 @@ fn leaf_classification(
     channel: ContentChannel,
     inherited: Option<LeafClassification>,
 ) -> LeafClassification {
-    if channel == ContentChannel::Comment {
-        return LeafClassification {
-            role: LeafRole::Scaffolding,
-            syntax: SyntaxClass::Comment,
-        };
-    }
-    if channel == ContentChannel::Opaque {
-        return LeafClassification {
-            role: LeafRole::Payload,
-            syntax: SyntaxClass::Plain,
-        };
-    }
-    if channel == ContentChannel::Layout {
-        return LeafClassification {
-            role: LeafRole::Scaffolding,
-            syntax: SyntaxClass::Plain,
-        };
-    }
-
-    inherited.unwrap_or_else(|| classification_from_kind(kind))
+    let (role, syntax) = match channel {
+        ContentChannel::Comment => (LeafRole::Scaffolding, SyntaxClass::Comment),
+        ContentChannel::Opaque => (LeafRole::Payload, SyntaxClass::Plain),
+        ContentChannel::Layout => (LeafRole::Scaffolding, SyntaxClass::Plain),
+        ContentChannel::Syntax => {
+            return inherited.unwrap_or_else(|| classification_from_kind(kind));
+        }
+    };
+    LeafClassification { role, syntax }
 }
 
 fn capture_classification(capture: &str) -> Option<LeafClassification> {
@@ -580,51 +543,27 @@ fn capture_classification(capture: &str) -> Option<LeafClassification> {
 }
 
 fn classification_from_kind(kind: &str) -> LeafClassification {
-    if kind.contains("comment") {
-        return LeafClassification {
-            role: LeafRole::Scaffolding,
-            syntax: SyntaxClass::Comment,
-        };
-    }
-    if kind.contains("string") || kind.contains("char") {
-        return LeafClassification {
-            role: LeafRole::Payload,
-            syntax: SyntaxClass::String,
-        };
-    }
-    if kind.contains("number")
+    let (role, syntax) = if kind.contains("comment") {
+        (LeafRole::Scaffolding, SyntaxClass::Comment)
+    } else if kind.contains("string") || kind.contains("char") {
+        (LeafRole::Payload, SyntaxClass::String)
+    } else if kind.contains("number")
         || kind.contains("integer")
         || kind.contains("float")
         || matches!(kind, "true" | "false" | "null" | "undefined")
     {
-        return LeafClassification {
-            role: LeafRole::Payload,
-            syntax: SyntaxClass::Literal,
-        };
-    }
-    if kind.contains("type") {
-        return LeafClassification {
-            role: LeafRole::Scaffolding,
-            syntax: SyntaxClass::Type,
-        };
-    }
-    if kind.contains("identifier") || kind.ends_with("_name") {
-        return LeafClassification {
-            role: LeafRole::Identifier,
-            syntax: SyntaxClass::Identifier,
-        };
-    }
-    if kind
+        (LeafRole::Payload, SyntaxClass::Literal)
+    } else if kind.contains("type") {
+        (LeafRole::Scaffolding, SyntaxClass::Type)
+    } else if kind.contains("identifier") || kind.ends_with("_name") {
+        (LeafRole::Identifier, SyntaxClass::Identifier)
+    } else if kind
         .chars()
         .any(|character| character.is_ascii_punctuation())
     {
-        return LeafClassification {
-            role: LeafRole::Scaffolding,
-            syntax: SyntaxClass::Punctuation,
-        };
-    }
-    LeafClassification {
-        role: LeafRole::Payload,
-        syntax: SyntaxClass::Plain,
-    }
+        (LeafRole::Scaffolding, SyntaxClass::Punctuation)
+    } else {
+        (LeafRole::Payload, SyntaxClass::Plain)
+    };
+    LeafClassification { role, syntax }
 }

@@ -264,9 +264,9 @@ struct NodeAtom {
     missing: bool,
 }
 
-/// Recursive edge retained inside a collision-free structural fingerprint.
+/// Incoming child slot and collision-free fingerprint, shared by recursive and leaf matching.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct FingerprintChild {
+struct FingerprintEdge {
     slot: ChildSlot,
     fingerprint: FingerprintId,
 }
@@ -276,7 +276,7 @@ struct FingerprintChild {
 struct FingerprintKey<'source> {
     atom: NodeAtom,
     payload: Option<&'source str>,
-    children: Vec<FingerprintChild>,
+    children: Vec<FingerprintEdge>,
 }
 
 /// Shared before/after interner whose equality check resolves all hash collisions.
@@ -321,33 +321,32 @@ fn fingerprints<'source>(
             extra: node.extra,
             missing: node.missing,
         };
-        let full_children = node
-            .children
-            .iter()
-            .filter(|child| !is_layout_leaf(tree, **child))
-            .map(|child| FingerprintChild {
-                slot: tree.node(*child).slot,
-                fingerprint: fingerprints[child.index()]
-                    .expect("children follow parents in tree preorder")
-                    .full,
-            })
-            .collect();
+        let mut full_children = Vec::new();
+        let mut shape_children = Vec::new();
+        let mut payload_children = Vec::new();
+        for child in &node.children {
+            let slot = tree.node(*child).slot;
+            let fingerprint: NodeFingerprints =
+                fingerprints[child.index()].expect("children follow parents in tree preorder");
+            if !is_layout_leaf(tree, *child) {
+                full_children.push(FingerprintEdge {
+                    slot,
+                    fingerprint: fingerprint.full,
+                });
+                shape_children.push(FingerprintEdge {
+                    slot,
+                    fingerprint: fingerprint.shape,
+                });
+            }
+            if let Some(fingerprint) = fingerprint.payload {
+                payload_children.push(FingerprintEdge { slot, fingerprint });
+            }
+        }
         let full = interner.intern(FingerprintKey {
             atom,
             payload,
             children: full_children,
         });
-        let shape_children = node
-            .children
-            .iter()
-            .filter(|child| !is_layout_leaf(tree, **child))
-            .map(|child| FingerprintChild {
-                slot: tree.node(*child).slot,
-                fingerprint: fingerprints[child.index()]
-                    .expect("children follow parents in tree preorder")
-                    .shape,
-            })
-            .collect();
         let shape = interner.intern(FingerprintKey {
             atom,
             payload: None,
@@ -363,22 +362,10 @@ fn fingerprints<'source>(
         let payload_fingerprint = if excluded_from_payload {
             None
         } else {
-            let children = node
-                .children
-                .iter()
-                .filter_map(|child| {
-                    let child_fingerprint: NodeFingerprints = fingerprints[child.index()]
-                        .expect("children follow parents in tree preorder");
-                    Some(FingerprintChild {
-                        slot: tree.node(*child).slot,
-                        fingerprint: child_fingerprint.payload?,
-                    })
-                })
-                .collect();
             Some(interner.intern(FingerprintKey {
                 atom,
                 payload,
-                children,
+                children: payload_children,
             }))
         };
         fingerprints[index] = Some(NodeFingerprints {
@@ -410,12 +397,6 @@ struct UnitRecord<'source> {
     fingerprint: NodeFingerprints,
     comparison: ComparisonStrategy,
     role: SourceRole,
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct UnitKey<'source> {
-    kind: SyntaxKind,
-    identity: &'source str,
 }
 
 /// Build the neutral tree diff, then project it onto physical source.
@@ -757,24 +738,12 @@ fn scope_correspondence_is_valid(
         return false;
     }
 
-    let line_is_scoped = |link| scope_proof.line_has_scoped_cover(link, false);
-    if source
+    source
         .lines
         .iter()
+        .chain(&source.line_endings)
         .copied()
-        .any(|link| !line_is_scoped(link))
-    {
-        return false;
-    }
-    if source
-        .line_endings
-        .iter()
-        .copied()
-        .any(|link| !line_is_scoped(link))
-    {
-        return false;
-    }
-    true
+        .all(|link| scope_proof.line_has_scoped_cover(link, false))
 }
 
 fn parent_correspondence_is_valid(
@@ -873,26 +842,22 @@ impl ScopeProof {
     fn new(pair: &SyntaxPair<'_, '_>, scopes: &[ScopeLink]) -> Self {
         let mut links = vec![None; pair.before.nodes.len()];
         let mut reverse_links = vec![None; pair.after.nodes.len()];
-        let mut before_claimed = vec![false; pair.before.nodes.len()];
-        let mut after_claimed = vec![false; pair.after.nodes.len()];
         let mut one_to_one = true;
         for link in scopes {
-            let Some(before_claimed) = before_claimed.get_mut(link.before.index()) else {
+            let Some(before) = links.get_mut(link.before.index()) else {
                 one_to_one = false;
                 continue;
             };
-            let Some(after_claimed) = after_claimed.get_mut(link.after.index()) else {
+            let Some(after) = reverse_links.get_mut(link.after.index()) else {
                 one_to_one = false;
                 continue;
             };
-            if *before_claimed || *after_claimed {
+            if before.is_some() || after.is_some() {
                 one_to_one = false;
                 continue;
             }
-            *before_claimed = true;
-            *after_claimed = true;
-            links[link.before.index()] = Some(*link);
-            reverse_links[link.after.index()] = Some(*link);
+            *before = Some(*link);
+            *after = Some(*link);
         }
         Self {
             before_lines: scope_lines(&pair.before),
@@ -982,16 +947,13 @@ impl ScopeProof {
         if scopes.is_empty() {
             return None;
         }
-        let mut scopes = scopes.to_vec();
         if scopes.iter().any(|after| {
             self.reverse_link(*after)
                 .is_none_or(|link| link.placement != Placement::Stable)
         }) {
             return None;
         }
-        scopes.sort_unstable();
-        scopes.dedup();
-        Some(scopes)
+        Some(scopes.to_vec())
     }
 }
 
@@ -2158,7 +2120,7 @@ fn pair_keyed_units(
     before_match: &mut [Option<usize>],
     after_match: &mut [Option<usize>],
 ) {
-    let mut before_groups = HashMap::<UnitKey<'_>, Vec<usize>>::new();
+    let mut before_groups = HashMap::<(SyntaxKind, &str), Vec<usize>>::new();
     for (index, unit) in before.iter().enumerate() {
         if before_match[index].is_some() || unit.decoration_owner.is_some() {
             continue;
@@ -2167,15 +2129,12 @@ fn pair_keyed_units(
             continue;
         };
         before_groups
-            .entry(UnitKey {
-                kind: unit.kind,
-                identity,
-            })
+            .entry((unit.kind, identity))
             .or_default()
             .push(index);
     }
 
-    let mut after_groups = HashMap::<UnitKey<'_>, Vec<usize>>::new();
+    let mut after_groups = HashMap::<(SyntaxKind, &str), Vec<usize>>::new();
     for (index, unit) in after.iter().enumerate() {
         if after_match[index].is_some() || unit.decoration_owner.is_some() {
             continue;
@@ -2184,10 +2143,7 @@ fn pair_keyed_units(
             continue;
         };
         after_groups
-            .entry(UnitKey {
-                kind: unit.kind,
-                identity,
-            })
+            .entry((unit.kind, identity))
             .or_default()
             .push(index);
     }
@@ -2286,7 +2242,15 @@ fn pair_compatible_units(
                 after_match[*index].is_none() && after[*index].decoration_owner.is_none()
             })
             .collect::<Vec<_>>();
-        for edge in compatible_unit_matches(before, after, &before_indices, &after_indices) {
+        let before_values = before_indices
+            .iter()
+            .map(|index| (before[*index].kind, before[*index].comparison))
+            .collect::<Vec<_>>();
+        let after_values = after_indices
+            .iter()
+            .map(|index| (after[*index].kind, after[*index].comparison))
+            .collect::<Vec<_>>();
+        for edge in ordered_matches(&before_values, &after_values) {
             link_unit_indices(
                 before_indices[edge.before],
                 after_indices[edge.after],
@@ -2297,23 +2261,6 @@ fn pair_compatible_units(
         before_start = before_end.saturating_add(1);
         after_start = after_end.saturating_add(1);
     }
-}
-
-fn compatible_unit_matches(
-    before: &[UnitRecord<'_>],
-    after: &[UnitRecord<'_>],
-    before_indices: &[usize],
-    after_indices: &[usize],
-) -> Vec<OrderedMatch> {
-    let before_values = before_indices
-        .iter()
-        .map(|index| (before[*index].kind, before[*index].comparison))
-        .collect::<Vec<_>>();
-    let after_values = after_indices
-        .iter()
-        .map(|index| (after[*index].kind, after[*index].comparison))
-        .collect::<Vec<_>>();
-    ordered_matches(&before_values, &after_values)
 }
 
 /// Retain reciprocal unique-best edges whose evidence clears one strict threshold.
@@ -2570,7 +2517,13 @@ impl TreeDiffBuilder<'_, '_, '_> {
                 }
             }
             for after_index in after_start..after_anchor {
-                self.push_after_unit(&mut edits, after_index);
+                let Some(before_index) = self.after_match[after_index] else {
+                    edits.push(UnitEdit::Added {
+                        after: self.after_units[after_index].id,
+                    });
+                    continue;
+                };
+                self.push_matched_unit(&mut edits, before_index, after_index);
             }
 
             if before_anchor < self.before_units.len() && after_anchor < self.after_units.len() {
@@ -2580,17 +2533,6 @@ impl TreeDiffBuilder<'_, '_, '_> {
             after_start = after_anchor.saturating_add(1);
         }
         edits
-    }
-
-    fn push_after_unit(&mut self, edits: &mut Vec<UnitEdit>, after_index: usize) {
-        let Some(before_index) = self.after_match[after_index] else {
-            edits.push(UnitEdit::Added {
-                after: self.after_units[after_index].id,
-            });
-            return;
-        };
-
-        self.push_matched_unit(edits, before_index, after_index);
     }
 
     fn push_matched_unit(
@@ -2656,16 +2598,10 @@ impl TreeDiffBuilder<'_, '_, '_> {
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct ExactLeafKey {
-    slot: ChildSlot,
-    fingerprint: FingerprintId,
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum DelimiterOwnerKey {
     Absent,
     Composite(NodeId),
-    Leaf(ExactLeafKey),
+    Leaf(FingerprintEdge),
     UnmatchedBefore,
     UnmatchedAfter,
 }
@@ -2690,7 +2626,7 @@ enum ParentSlot {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct ContextualLeafKey {
-    leaf: ExactLeafKey,
+    leaf: FingerprintEdge,
     parent: ParentSlot,
     trailing_delimiter_owner: DelimiterOwnerKey,
     decorated: bool,
@@ -2771,7 +2707,7 @@ impl UnitContext<'_, '_, '_> {
     fn desired_after_trailing_delimiter_owner(
         &self,
         before: NodeId,
-        leaf_keys: &HashMap<NodeId, ExactLeafKey>,
+        leaf_keys: &HashMap<NodeId, FingerprintEdge>,
     ) -> DelimiterOwnerKey {
         let Some(owner) = self.pair.before.delimiter_owner(before) else {
             return DelimiterOwnerKey::Absent;
@@ -2793,7 +2729,7 @@ impl UnitContext<'_, '_, '_> {
     fn after_trailing_delimiter_owner(
         &self,
         after: NodeId,
-        leaf_keys: &HashMap<NodeId, ExactLeafKey>,
+        leaf_keys: &HashMap<NodeId, FingerprintEdge>,
     ) -> DelimiterOwnerKey {
         let Some(owner) = self.pair.after.delimiter_owner(after) else {
             return DelimiterOwnerKey::Absent;
@@ -2812,18 +2748,7 @@ impl UnitContext<'_, '_, '_> {
         if self.parents_are_linked(before, after) {
             return Some(ParentCorrespondence::Direct);
         }
-        self.parents
-            .before
-            .get(&before)
-            .and_then(|link| link.reparenting)
-            .or_else(|| {
-                let parent = self.pair.before.node(before).parent?;
-                self.parents
-                    .before
-                    .get(&parent)
-                    .and_then(|link| link.reparenting)
-            })
-            .or_else(|| unique_containment_reparenting(self.pair, self.parents, before, after))
+        self.enclosing_wrapper(before, after)
             .map(ParentCorrespondence::Reparented)
     }
 
@@ -2926,8 +2851,8 @@ impl TreeDiffBuilder<'_, '_, '_> {
             if covered_before.contains(&before) || covered_after.contains(&after) {
                 continue;
             }
-            mark_subtree(&pair.before, before, &mut covered_before);
-            mark_subtree(&pair.after, after, &mut covered_after);
+            covered_before.extend(std::iter::once(before).chain(pair.before.descendants(before)));
+            covered_after.extend(std::iter::once(after).chain(pair.after.descendants(after)));
             maximal.push(edge);
         }
         maximal.sort_by_key(|edge| edge.before);
@@ -3200,29 +3125,17 @@ fn exact_composite_matches(
         .enumerate()
         .map(|(index, id)| (id, index))
         .collect::<HashMap<_, _>>();
-    let mut before_match = vec![None; before.len()];
-    let mut after_match = vec![None; after.len()];
-    for (before_index, before_id) in before.iter().copied().enumerate() {
-        let Some(link) = context.parents.before.get(&before_id) else {
-            continue;
-        };
-        let after_id = link.after;
-        let Some(after_index) = after_indices.get(&after_id).copied() else {
-            continue;
-        };
-        if before_fingerprints[before_id.index()].full != after_fingerprints[after_id.index()].full
-        {
-            continue;
-        }
-        debug_assert!(after_match[after_index].is_none());
-        before_match[before_index] = Some(after_index);
-        after_match[after_index] = Some(before_index);
-    }
-
-    before_match
-        .into_iter()
+    before
+        .iter()
+        .copied()
         .enumerate()
-        .filter_map(|(before, after)| after.map(|after| OrderedMatch { before, after }))
+        .filter_map(|(before, before_id)| {
+            let link = context.parents.before.get(&before_id)?;
+            let after = *after_indices.get(&link.after)?;
+            (before_fingerprints[before_id.index()].full
+                == after_fingerprints[link.after.index()].full)
+                .then_some(OrderedMatch { before, after })
+        })
         .collect()
 }
 
@@ -3241,7 +3154,7 @@ fn exact_leaf_matches(
         .map(|id| {
             (
                 id,
-                ExactLeafKey {
+                FingerprintEdge {
                     slot: context.pair.before.node(id).slot,
                     fingerprint: before_fingerprints[id.index()].full,
                 },
@@ -3254,7 +3167,7 @@ fn exact_leaf_matches(
         .map(|id| {
             (
                 id,
-                ExactLeafKey {
+                FingerprintEdge {
                     slot: context.pair.after.node(id).slot,
                     fingerprint: after_fingerprints[id.index()].full,
                 },
@@ -4161,14 +4074,10 @@ fn contextual_child_matches(
             pair,
             before,
             after,
-            ContextClaims {
-                matched: &before_match,
-                reserved: &before_direct_reserved,
-            },
-            ContextClaims {
-                matched: &after_match,
-                reserved: &after_direct_reserved,
-            },
+            &before_match,
+            &after_match,
+            &before_direct_reserved,
+            &after_direct_reserved,
         )
         .into_iter()
         .filter(|edge| {
@@ -4359,12 +4268,6 @@ struct ContextCandidates<'input> {
     fingerprints: &'input [NodeFingerprints],
 }
 
-#[derive(Clone, Copy)]
-struct ContextClaims<'input> {
-    matched: &'input [Option<usize>],
-    reserved: &'input [bool],
-}
-
 /// Decorations are aligned only inside one already-linked semantic owner pair.
 fn decoration_matches(
     pair: &SyntaxPair<'_, '_>,
@@ -4519,48 +4422,34 @@ fn confident_renamed_context_matches(
     pair: &SyntaxPair<'_, '_>,
     before: &[NodeId],
     after: &[NodeId],
-    before_claims: ContextClaims<'_>,
-    after_claims: ContextClaims<'_>,
+    before_match: &[Option<usize>],
+    after_match: &[Option<usize>],
+    before_reserved: &[bool],
+    after_reserved: &[bool],
 ) -> Vec<OrderedMatch> {
     let before_candidates = (0..before.len())
         .filter(|index| {
-            before_claims.matched[*index].is_none()
-                && !before_claims.reserved[*index]
+            before_match[*index].is_none()
+                && !before_reserved[*index]
                 && pair.before.identity_text(before[*index]).is_some()
                 && pair.before.node(before[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let after_candidates = (0..after.len())
         .filter(|index| {
-            after_claims.matched[*index].is_none()
-                && !after_claims.reserved[*index]
+            after_match[*index].is_none()
+                && !after_reserved[*index]
                 && pair.after.identity_text(after[*index]).is_some()
                 && pair.after.node(after[*index]).decoration_owner.is_none()
         })
         .collect::<Vec<_>>();
     let before_keys = before_candidates
         .iter()
-        .map(|index| {
-            let id = before[*index];
-            (
-                pair.before.node(id).kind,
-                pair.before
-                    .identity_text(id)
-                    .expect("rename candidates carry an identity"),
-            )
-        })
+        .map(|index| identity_key(&pair.before, before[*index]))
         .collect::<HashSet<_>>();
     let after_keys = after_candidates
         .iter()
-        .map(|index| {
-            let id = after[*index];
-            (
-                pair.after.node(id).kind,
-                pair.after
-                    .identity_text(id)
-                    .expect("rename candidates carry an identity"),
-            )
-        })
+        .map(|index| identity_key(&pair.after, after[*index]))
         .collect::<HashSet<_>>();
     let before_candidates = before_candidates
         .iter()
@@ -4795,10 +4684,6 @@ fn link_context(
     true
 }
 
-fn mark_subtree(tree: &SyntaxTree<'_>, root: NodeId, marked: &mut HashSet<NodeId>) {
-    marked.extend(std::iter::once(root).chain(tree.descendants(root)));
-}
-
 /// Concrete node pairs implied by one collision-checked recursive fingerprint match.
 fn exact_subtree_nodes(
     pair: &SyntaxPair<'_, '_>,
@@ -4825,11 +4710,7 @@ fn exact_subtree_nodes(
                     .filter(|child| !is_layout_leaf(&pair.after, **child));
                 let after_children = after_children.copied().collect::<Vec<_>>();
                 debug_assert_eq!(before_children.len(), after_children.len());
-                let children = before_children
-                    .into_iter()
-                    .zip(after_children)
-                    .collect::<Vec<_>>();
-                pending.extend(children.into_iter().rev());
+                pending.extend(before_children.into_iter().zip(after_children).rev());
             }
             _ => unreachable!("equal recursive fingerprints retain leaf shape"),
         }

@@ -1350,6 +1350,49 @@ fn changed_chain_marks_the_inserted_link_and_keeps_outer_context() {
 }
 
 #[test]
+fn adjacent_removed_definitions_keep_intervening_layout_in_source_order() {
+    let before = concat!(
+        "fn alpha() {}\n",
+        "\n",
+        "fn beta() {\n",
+        "    gamma();\n",
+        "}\n",
+        "\n",
+        "fn delta() {\n",
+        "    epsilon();\n",
+        "}\n",
+        "\n",
+        "fn zeta() {}\n",
+    );
+    let after = "fn alpha() {}\n\nfn zeta() {}\n";
+
+    for (before, after, removed_lines) in [
+        (before, after, 3..10),
+        (
+            "\nfn alpha() {}\n\nfn beta() {}\n\nfn gamma() {}\n",
+            "fn gamma() {}\n",
+            1..6,
+        ),
+        (
+            "fn alpha() {}\n\nfn beta() {}\n\nfn gamma() {}\n",
+            "fn alpha() {}\n",
+            2..6,
+        ),
+    ] {
+        let diff = diff_file("alpha.rs", before, after).expect("Rust must diff");
+        let removed = source_lines(&diff)
+            .filter_map(|(line, current)| (!current).then_some(line.number))
+            .collect::<Vec<_>>();
+
+        assert_eq!(removed, removed_lines.collect::<Vec<_>>(), "{diff:#?}");
+        for line in after.lines().filter(|line| !line.is_empty()) {
+            assert_context_payload(&diff, line);
+        }
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
 fn one_sided_structural_files_keep_physical_source_order() {
     let source = concat!(
         "fn alpha() {\n",

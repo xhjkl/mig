@@ -104,21 +104,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn exact_limit_is_read_and_one_byte_over_is_deferred() {
-        let directory = TempDir::new().expect("temporary directory");
-        let exact = directory.path().join("exact.txt");
-        let over = directory.path().join("over.txt");
-        fs::write(&exact, b"1234").expect("write exact input");
-        fs::write(&over, b"12345").expect("write oversized input");
-
-        let exact = OpenFile::open(&exact).expect("open exact input");
-        let over = OpenFile::open(&over).expect("open oversized input");
-
-        assert!(matches!(exact.read(4), Ok(BoundedBytes::Contents(source)) if source == b"1234"));
-        assert!(matches!(over.read(4), Ok(BoundedBytes::TooLarge(5))));
-    }
-
-    #[test]
     fn read_limit_catches_growth_after_the_handle_was_measured() {
         let directory = TempDir::new().expect("temporary directory");
         let path = directory.path().join("growing.txt");

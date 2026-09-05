@@ -40,12 +40,6 @@ pub struct SelectedLine {
     pub changed_bytes: Vec<Range<usize>>,
 }
 
-impl SelectedLine {
-    pub fn has_changes(&self) -> bool {
-        !self.changed_bytes.is_empty()
-    }
-}
-
 /// One semantic move retained as a whole until the presentation boundary.
 #[derive(Clone, Debug)]
 pub struct MoveBlock {
@@ -94,7 +88,7 @@ impl SourceChange {
     }
 
     pub fn has_signal(&self) -> bool {
-        !self.is_context() && !matches!(self, Self::Elision(_))
+        !matches!(self, Self::Context(_) | Self::Elision(_))
     }
 
     pub fn context_line(&self) -> Option<usize> {
@@ -261,7 +255,7 @@ impl SourceSequence {
         }
     }
 
-    fn group_rank(&self, group: &[RowEvent], geometry: &ReviewGeometry) -> usize {
+    fn group_rank(&self, group: &[RowEvent]) -> usize {
         let mut owners = group.iter().flat_map(|row| {
             let after = row_after_source_line(row)
                 .and_then(|line| self.after_owner.get(line).copied().flatten());
@@ -275,19 +269,26 @@ impl SourceSequence {
             return owner.saturating_mul(2).saturating_add(2);
         }
 
-        let after_line = group
+        if let Some(line) = group.iter().filter_map(row_after_source_line).min() {
+            return self.unowned_after_rank(line);
+        }
+
+        // Ranking deleted separators in their original revision; current anchors
+        // collapse the gaps between consecutive removed units onto one position.
+        let line = group
             .iter()
-            .filter_map(row_after_source_line)
+            .filter_map(row_before_source_line)
             .min()
-            .or_else(|| {
-                group
-                    .iter()
-                    .filter_map(row_before_source_line)
-                    .filter_map(|line| geometry.current_anchor(line))
-                    .min()
-            })
             .unwrap_or(1);
-        self.unowned_after_rank(after_line)
+        let (preceding, following) = self.before_owner.split_at(line);
+        if let Some(order) = preceding.iter().rev().flatten().next() {
+            return order.saturating_mul(2).saturating_add(3);
+        }
+        following
+            .iter()
+            .flatten()
+            .next()
+            .map_or(1, |order| order.saturating_mul(2).saturating_add(1))
     }
 
     fn unowned_after_rank(&self, line: usize) -> usize {
@@ -520,7 +521,7 @@ fn form_source_hunk(
         .into_iter()
         .map(|events| {
             let script_order = sequence
-                .map(|sequence| sequence.group_rank(&events, geometry))
+                .map(|sequence| sequence.group_rank(&events))
                 .unwrap_or_else(|| {
                     event_rows_order(&events, geometry)
                         .unwrap_or(order)
@@ -1190,22 +1191,14 @@ fn bridge_retained_layout(tree: &SyntaxTree<'_>, ranges: &mut Vec<Range<usize>>)
     *ranges = joined;
 }
 
+/// Keep a draft alive for any event beyond retained context.
 fn row_has_signal(row: &RowEvent) -> bool {
-    match row {
-        RowEvent::Context(_) => false,
-        RowEvent::Edited(_)
-        | RowEvent::Reflow(_)
-        | RowEvent::Removed(_)
-        | RowEvent::Added(_)
-        | RowEvent::LineEnding(_)
-        | RowEvent::Move(_)
-        | RowEvent::Compact(_) => true,
-    }
+    !matches!(row, RowEvent::Context(_))
 }
 
 /// Preserve whether one retained current row carries a material source edit.
 fn current_event(line: SelectedLine) -> RowEvent {
-    if line.has_changes() {
+    if !line.changed_bytes.is_empty() {
         RowEvent::Edited(line)
     } else {
         RowEvent::Context(line.number)
@@ -1669,55 +1662,32 @@ fn form_reflow_with_comments(
     pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
     unit: &MatchedUnit,
-    mut edits: Vec<LineEdit>,
+    edits: Vec<LineEdit>,
 ) -> Option<DraftFragment> {
     let before = pair.before.node(unit.before);
     let after = pair.after.node(unit.after);
-    let changed_lines = edits
-        .iter()
-        .filter_map(|edit| edit.after.as_ref().map(|line| line.number))
-        .collect::<HashSet<_>>();
     let before_comment_lines = comment_lines(&pair.before, unit.before);
     let before_lines = line_indices(Some(before.lines.clone()), pair.before.source.lines().len());
     let after_lines = line_indices(Some(after.lines.clone()), pair.after.source.lines().len());
     let exact_after = correspondence
         .source
         .line_links_in(before_lines, after_lines)
-        .filter(|link| {
-            !before_comment_lines.contains(&(link.before + 1))
-                && !changed_lines.contains(&(link.after + 1))
-        })
+        .filter(|link| !before_comment_lines.contains(&(link.before + 1)))
         .map(|link| link.after + 1)
         .collect::<HashSet<_>>();
 
-    edits.sort_by_key(line_edit_order);
-    let mut edits = edits.into_iter().peekable();
-    let mut rows = Vec::new();
-    for line in after
+    let lines = after
         .lines
         .clone()
         .filter_map(|number| pair.after.source.line(number))
-    {
-        while edits
-            .peek()
-            .is_some_and(|edit| line_edit_order(edit) < line.number)
-        {
-            append_line_edit_rows(&mut rows, edits.next().expect("peeked line edit"));
-        }
-        if changed_lines.contains(&line.number) {
-            continue;
-        }
-        let row = if exact_after.contains(&line.number) {
-            RowEvent::Context(line.number)
-        } else {
-            RowEvent::Reflow(line.number)
-        };
-        rows.push(row);
-    }
-    for edit in edits {
-        append_line_edit_rows(&mut rows, edit);
-    }
-
+        .map(|line| {
+            if exact_after.contains(&line.number) {
+                RowEvent::Context(line.number)
+            } else {
+                RowEvent::Reflow(line.number)
+            }
+        });
+    let rows = interleave_line_edits(lines, edits);
     draft_fragment(ChangeNature::Edit, rows, Some(unit.after))
 }
 
@@ -1816,7 +1786,7 @@ fn form_payload(
         .filter_map(|number| pair.before.source.line(number))
         .filter(|line| !claimed_before.contains(&line.number))
         .map(|line| select_line(line, &before_marked))
-        .any(|line| line.has_changes() && !line_is_fully_changed(&pair.before, &line));
+        .any(|line| !line.changed_bytes.is_empty() && !line_is_fully_changed(&pair.before, &line));
     if partial_removal {
         return form_line_region(
             pair,
@@ -1859,34 +1829,12 @@ fn form_payload(
             ChangeNature::Edit,
         );
     }
-    let changed_lines = edits
-        .iter()
-        .filter_map(|edit| edit.after.as_ref().map(|line| line.number))
-        .collect::<HashSet<_>>();
     let lines = after
         .lines
         .clone()
         .filter_map(|number| pair.after.source.line(number))
-        .map(|line| select_line(line, &after_marked))
-        .collect::<Vec<_>>();
-    edits.sort_by_key(line_edit_order);
-    let mut edits = edits.into_iter().peekable();
-    let mut rows = Vec::new();
-    for line in lines {
-        while edits
-            .peek()
-            .is_some_and(|edit| line_edit_order(edit) < line.number)
-        {
-            append_line_edit_rows(&mut rows, edits.next().expect("peeked line edit"));
-        }
-        if changed_lines.contains(&line.number) {
-            continue;
-        }
-        rows.push(current_event(line));
-    }
-    for edit in edits {
-        append_line_edit_rows(&mut rows, edit);
-    }
+        .map(|line| current_event(select_line(line, &after_marked)));
+    let rows = interleave_line_edits(lines, edits);
 
     draft_fragment(ChangeNature::Edit, rows, Some(unit.after))
 }
@@ -2379,34 +2327,38 @@ fn append_changed_line_edits(
     }
 }
 
-/// Materialize one raw-diff-classified line edit with byte-exact marks.
-fn changed_source_rows(
+/// Select one physical replacement and its concrete terminator change.
+fn changed_line_edit(
     before: &SyntaxTree<'_>,
     before_line: Option<&SourceLine>,
     after: &SyntaxTree<'_>,
     after_line: Option<&SourceLine>,
-) -> (Option<SelectedLine>, Option<SelectedLine>) {
+) -> LineEdit {
+    let line_ending = visible_line_ending_change(before_line, after_line);
     let (Some(before_line), Some(after_line)) = (before_line, after_line) else {
-        let before =
-            before_line.map(|line| select_line(line, std::slice::from_ref(&line.content_bytes)));
-        let after =
-            after_line.map(|line| select_line(line, std::slice::from_ref(&line.content_bytes)));
-        return (before, after);
+        return LineEdit {
+            before: before_line
+                .map(|line| select_line(line, std::slice::from_ref(&line.content_bytes))),
+            after: after_line
+                .map(|line| select_line(line, std::slice::from_ref(&line.content_bytes))),
+            line_ending,
+        };
     };
 
     let before_text = before.source.text(before_line);
     let after_text = after.source.text(after_line);
     if before_text == after_text {
-        return (
-            Some(select_line(
+        return LineEdit {
+            before: Some(select_line(
                 before_line,
                 std::slice::from_ref(&before_line.content_bytes),
             )),
-            Some(select_line(
+            after: Some(select_line(
                 after_line,
                 std::slice::from_ref(&after_line.content_bytes),
             )),
-        );
+            line_ending,
+        };
     }
 
     let (before_changed, after_changed) = changed_byte_ranges(
@@ -2417,12 +2369,13 @@ fn changed_source_rows(
     );
     let before_changed = snap_change_to_syntax_node(before, before_line, before_changed);
     let after_changed = snap_change_to_syntax_node(after, after_line, after_changed);
-    let before_mark = (!before_changed.is_empty()).then_some(before_changed);
-    let after_mark = (!after_changed.is_empty()).then_some(after_changed);
-    (
-        Some(select_line(before_line, before_mark.as_slice())),
-        Some(select_line(after_line, after_mark.as_slice())),
-    )
+    let before_changed = (!before_changed.is_empty()).then_some(before_changed);
+    let after_changed = (!after_changed.is_empty()).then_some(after_changed);
+    LineEdit {
+        before: Some(select_line(before_line, before_changed.as_slice())),
+        after: Some(select_line(after_line, after_changed.as_slice())),
+        line_ending,
+    }
 }
 
 /// Expand one textual delta to the smallest complete syntax node made entirely of that delta.
@@ -2494,32 +2447,16 @@ pub fn changed_sequence_ranges<T: Eq>(before: &[T], after: &[T]) -> (Range<usize
         .zip(after)
         .take_while(|(before, after)| before == after)
         .count();
-    let suffix_budget = before.len().min(after.len()).saturating_sub(prefix);
     let suffix = before[prefix..]
         .iter()
         .rev()
         .zip(after[prefix..].iter().rev())
-        .take(suffix_budget)
         .take_while(|(before, after)| before == after)
         .count();
     (
         prefix..before.len().saturating_sub(suffix),
         prefix..after.len().saturating_sub(suffix),
     )
-}
-
-fn changed_line_edit(
-    before: &SyntaxTree<'_>,
-    before_line: Option<&SourceLine>,
-    after: &SyntaxTree<'_>,
-    after_line: Option<&SourceLine>,
-) -> LineEdit {
-    let (before_row, after_row) = changed_source_rows(before, before_line, after, after_line);
-    LineEdit {
-        before: before_row,
-        after: after_row,
-        line_ending: visible_line_ending_change(before_line, after_line),
-    }
 }
 
 fn visible_line_ending_change(
@@ -2557,6 +2494,38 @@ fn append_line_edit_rows(rows: &mut Vec<RowEvent>, edit: LineEdit) {
     rows.extend(edit.line_ending.map(RowEvent::LineEnding));
 }
 
+/// Replace claimed current rows with their edits while preserving before-only source order.
+fn interleave_line_edits(
+    lines: impl Iterator<Item = RowEvent>,
+    mut edits: Vec<LineEdit>,
+) -> Vec<RowEvent> {
+    let changed_lines = edits
+        .iter()
+        .filter_map(|edit| edit.after.as_ref().map(|line| line.number))
+        .collect::<HashSet<_>>();
+    edits.sort_by_key(line_edit_order);
+    let mut edits = edits.into_iter().peekable();
+    let mut rows = Vec::new();
+    for line in lines {
+        let number = row_after_source_line(&line).expect("interleaved rows own current source");
+        while edits
+            .peek()
+            .is_some_and(|edit| line_edit_order(edit) < number)
+        {
+            let edit = edits.next().expect("peeked line edit");
+            append_line_edit_rows(&mut rows, edit);
+        }
+        if changed_lines.contains(&number) {
+            continue;
+        }
+        rows.push(line);
+    }
+    for edit in edits {
+        append_line_edit_rows(&mut rows, edit);
+    }
+    rows
+}
+
 fn descendant_leaves<'tree>(
     tree: &'tree SyntaxTree<'_>,
     root: NodeId,
@@ -2564,22 +2533,6 @@ fn descendant_leaves<'tree>(
     std::iter::once(root)
         .chain(tree.descendants(root))
         .filter(|id| tree.node(*id).leaf.is_some())
-}
-
-/// Monotone physical-line fact retained before rows are selected or abbreviated.
-#[derive(Clone, Debug)]
-enum LineFact {
-    Context {
-        after: usize,
-    },
-    Edit {
-        before: Range<usize>,
-        after: Range<usize>,
-    },
-    Reflow {
-        after: Range<usize>,
-        unchanged_after: HashSet<usize>,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -2678,11 +2631,7 @@ fn form_line_region(
     let before = line_indices(coverage.before, pair.before.source.lines().len());
     let after = line_indices(coverage.after, pair.after.source.lines().len());
     let retained = retained_regions(pair, anchors.facts, composites, &before, &after);
-    let facts = line_facts(correspondence, before, after, retained, anchors.basis);
-    let mut rows = Vec::new();
-    for fact in &facts {
-        append_line_fact_rows(&mut rows, pair, fact);
-    }
+    let rows = line_region_rows(pair, correspondence, before, after, retained, anchors.basis);
     draft_fragment(nature, rows, after_root)
 }
 
@@ -2903,13 +2852,14 @@ fn physical_lines_equal(
     })
 }
 
-fn line_facts(
+fn line_region_rows(
+    pair: &SyntaxPair<'_, '_>,
     correspondence: &Correspondence,
     before: Range<usize>,
     after: Range<usize>,
     retained: Vec<RetainedRegion>,
     anchor_basis: AnchorBasis,
-) -> Vec<LineFact> {
+) -> Vec<RowEvent> {
     let before_bounds = before.clone();
     let after_bounds = after.clone();
     let mut checkpoints = Vec::new();
@@ -2937,33 +2887,30 @@ fn line_facts(
         anchor_basis,
     ));
 
-    let mut facts = Vec::new();
+    let mut rows = Vec::new();
     let mut before_start = before.start;
     let mut after_start = after.start;
     for checkpoint in checkpoints {
         let (before_end, after_end) = match &checkpoint {
-            LineCheckpoint::Exact { before, after } => (*before, *after),
-            LineCheckpoint::TerminatorEdit { before, after } => (*before, *after),
+            LineCheckpoint::Exact { before, after }
+            | LineCheckpoint::TerminatorEdit { before, after } => (*before, *after),
             LineCheckpoint::Retained(region) => (region.before.start, region.after.start),
         };
-        if before_start < before_end || after_start < after_end {
-            facts.push(LineFact::Edit {
-                before: before_start..before_end,
-                after: after_start..after_end,
-            });
-        }
+        append_line_change_rows(
+            &mut rows,
+            pair,
+            before_start..before_end,
+            after_start..after_end,
+        );
 
         match checkpoint {
             LineCheckpoint::Exact { before, after } => {
-                facts.push(LineFact::Context { after });
+                rows.push(RowEvent::Context(pair.after.source.lines()[after].number));
                 before_start = before + 1;
                 after_start = after + 1;
             }
             LineCheckpoint::TerminatorEdit { before, after } => {
-                facts.push(LineFact::Edit {
-                    before: before..before + 1,
-                    after: after..after + 1,
-                });
+                append_line_change_rows(&mut rows, pair, before..before + 1, after..after + 1);
                 before_start = before + 1;
                 after_start = after + 1;
             }
@@ -2973,35 +2920,37 @@ fn line_facts(
                 match region.retention {
                     Retention::Exact => {
                         debug_assert_eq!(region.before.len(), region.after.len());
-                        facts.extend(
-                            region
-                                .before
-                                .zip(region.after)
-                                .map(|(_, after)| LineFact::Context { after }),
-                        );
+                        rows.extend(region.before.zip(region.after).map(|(_, after)| {
+                            RowEvent::Context(pair.after.source.lines()[after].number)
+                        }));
                     }
                     Retention::Reflow => {
                         let unchanged_after = correspondence
                             .source
-                            .line_links_in(region.before.clone(), region.after.clone())
+                            .line_links_in(region.before, region.after.clone())
                             .map(|link| link.after)
-                            .collect();
-                        facts.push(LineFact::Reflow {
-                            after: region.after,
-                            unchanged_after,
-                        });
+                            .collect::<HashSet<_>>();
+                        for index in region.after {
+                            let line = pair.after.source.lines()[index].number;
+                            let row = if unchanged_after.contains(&index) {
+                                RowEvent::Context(line)
+                            } else {
+                                RowEvent::Reflow(line)
+                            };
+                            rows.push(row);
+                        }
                     }
                 }
             }
         }
     }
-    if before_start < before.end || after_start < after.end {
-        facts.push(LineFact::Edit {
-            before: before_start..before.end,
-            after: after_start..after.end,
-        });
-    }
-    facts
+    append_line_change_rows(
+        &mut rows,
+        pair,
+        before_start..before.end,
+        after_start..after.end,
+    );
+    rows
 }
 
 fn display_line_checkpoints(
@@ -3064,23 +3013,6 @@ fn physical_line_checkpoints(
     checkpoints
 }
 
-fn append_line_fact_rows(rows: &mut Vec<RowEvent>, pair: &SyntaxPair<'_, '_>, fact: &LineFact) {
-    match fact {
-        LineFact::Context { after } => {
-            rows.push(RowEvent::Context(pair.after.source.lines()[*after].number));
-        }
-        LineFact::Edit { before, after } => {
-            append_line_change_rows(rows, pair, before.clone(), after.clone());
-        }
-        LineFact::Reflow {
-            after,
-            unchanged_after,
-        } => {
-            append_retained_region_rows(rows, pair, after, unchanged_after);
-        }
-    }
-}
-
 fn append_line_change_rows(
     rows: &mut Vec<RowEvent>,
     pair: &SyntaxPair<'_, '_>,
@@ -3090,78 +3022,33 @@ fn append_line_change_rows(
     if before.len() == 1 && after.len() == 1 {
         let before_line = &pair.before.source.lines()[before.start];
         let after_line = &pair.after.source.lines()[after.start];
-        let (before_row, after_row) = changed_source_rows(
+        let edit = changed_line_edit(
             &pair.before,
             Some(before_line),
             &pair.after,
             Some(after_line),
         );
-        rows.extend(before_row.map(RowEvent::Removed));
-        rows.extend(after_row.map(RowEvent::Added));
-        rows.extend(
-            visible_line_ending_change(Some(before_line), Some(after_line))
-                .map(RowEvent::LineEnding),
-        );
+        append_line_edit_rows(rows, edit);
         return;
     }
 
     // A gap has no line-level correspondence: keep each revision as one coherent run.
     for index in before {
         let line = &pair.before.source.lines()[index];
-        rows.push(RowEvent::Removed(select_line(
-            line,
-            std::slice::from_ref(&line.content_bytes),
-        )));
-        if line.ending == LineEnding::Missing {
-            rows.push(RowEvent::LineEnding(LineEndingChange {
-                before: Some(LineEndingEndpoint {
-                    line: line.number,
-                    ending: line.ending,
-                }),
-                after: None,
-            }));
-        }
+        let edit = changed_line_edit(&pair.before, Some(line), &pair.after, None);
+        append_line_edit_rows(rows, edit);
     }
     for index in after {
         let line = &pair.after.source.lines()[index];
-        rows.push(RowEvent::Added(select_line(
-            line,
-            std::slice::from_ref(&line.content_bytes),
-        )));
-        if line.ending == LineEnding::Missing {
-            rows.push(RowEvent::LineEnding(LineEndingChange {
-                before: None,
-                after: Some(LineEndingEndpoint {
-                    line: line.number,
-                    ending: line.ending,
-                }),
-            }));
-        }
-    }
-}
-
-fn append_retained_region_rows(
-    rows: &mut Vec<RowEvent>,
-    pair: &SyntaxPair<'_, '_>,
-    after: &Range<usize>,
-    unchanged_after: &HashSet<usize>,
-) {
-    for index in after.clone() {
-        let line = pair.after.source.lines()[index].number;
-        let row = if unchanged_after.contains(&index) {
-            RowEvent::Context(line)
-        } else {
-            RowEvent::Reflow(line)
-        };
-        rows.push(row);
+        let edit = changed_line_edit(&pair.before, None, &pair.after, Some(line));
+        append_line_edit_rows(rows, edit);
     }
 }
 
 fn row_after_source_line(row: &RowEvent) -> Option<usize> {
     match row {
         RowEvent::Context(line) | RowEvent::Reflow(line) => Some(*line),
-        RowEvent::Edited(line) => Some(line.number),
-        RowEvent::Added(line) => Some(line.number),
+        RowEvent::Edited(line) | RowEvent::Added(line) => Some(line.number),
         RowEvent::Move(change) => Some(change.after.start),
         RowEvent::Compact(word) => word.after_line,
         RowEvent::LineEnding(change) => change.after.map(|endpoint| endpoint.line),

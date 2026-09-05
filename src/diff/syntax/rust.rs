@@ -22,7 +22,6 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>, source: &str) -> Node
         return NodeAnnotation {
             review,
             channel: Some(ContentChannel::Comment),
-            descendant_channel: Some(ContentChannel::Comment),
             decoration: doc_comment_decoration(node.kind(), text),
             prune_children: true,
             ..NodeAnnotation::default()

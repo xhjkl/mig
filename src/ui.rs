@@ -22,7 +22,6 @@ use ratatui::{
 use std::io::{self, Stdout};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Practical source viewport; gutter geometry is measured separately from content.
 /// Smallest useful source viewport after the file-derived gutter.
 const MIN_SOURCE_COLUMNS: usize = 62;
 /// Path header plus its breathing row.
@@ -95,31 +94,21 @@ impl GutterLayout {
 }
 
 fn row_label_columns(row: &ReviewRow) -> usize {
-    match row {
-        ReviewRow::Current(line) => {
-            UnicodeWidthStr::width(source_label(line.number, None).as_str())
-        }
-        ReviewRow::Reflow(line) => {
-            UnicodeWidthStr::width(source_label(line.number, Some(SourceMarker::Reflow)).as_str())
-        }
-        ReviewRow::Removed(line) => {
-            UnicodeWidthStr::width(source_label(line.number, Some(SourceMarker::Removed)).as_str())
-        }
-        ReviewRow::Added(line) => {
-            UnicodeWidthStr::width(source_label(line.number, Some(SourceMarker::Added)).as_str())
-        }
-        ReviewRow::LineEnding { .. } | ReviewRow::FileBoundary => 0,
-        ReviewRow::Moved { before, after } => {
-            UnicodeWidthStr::width(moved_label(*before, after.number).as_str())
-        }
+    let label = match row {
+        ReviewRow::LineEnding { .. } | ReviewRow::FileBoundary => return 0,
+        ReviewRow::Elision(_) => return UnicodeWidthStr::width(VERTICAL_ELLIPSIS),
+        ReviewRow::Current(line) => source_label(line.number, None),
+        ReviewRow::Reflow(line) => source_label(line.number, Some(SourceMarker::Reflow)),
+        ReviewRow::Removed(line) => source_label(line.number, Some(SourceMarker::Removed)),
+        ReviewRow::Added(line) => source_label(line.number, Some(SourceMarker::Added)),
+        ReviewRow::Moved { before, after } => moved_label(*before, after.number),
         ReviewRow::Wordwise(word) => word
             .after_line
             .or(word.before_line)
             .map(|number| source_label(number, None))
-            .map(|label| UnicodeWidthStr::width(label.as_str()))
-            .unwrap_or(0),
-        ReviewRow::Elision(_) => UnicodeWidthStr::width(VERTICAL_ELLIPSIS),
-    }
+            .unwrap_or_default(),
+    };
+    UnicodeWidthStr::width(label.as_str())
 }
 
 fn source_label(number: usize, marker: Option<SourceMarker>) -> String {
@@ -263,10 +252,6 @@ impl App {
         self.scroll = self.scroll.saturating_add(amount).min(self.max_scroll());
     }
 
-    fn page_size(&self) -> usize {
-        self.viewport_rows.max(1)
-    }
-
     fn previous_file(&mut self) {
         if self.file_index == 0 {
             return;
@@ -333,8 +318,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyOutcome {
         KeyCode::Right | KeyCode::Char('l' | ']') => app.next_file(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
-        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_up(app.page_size()),
-        KeyCode::PageDown | KeyCode::Char(' ' | 'd') => app.scroll_down(app.page_size()),
+        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_up(app.viewport_rows.max(1)),
+        KeyCode::PageDown | KeyCode::Char(' ' | 'd') => app.scroll_down(app.viewport_rows.max(1)),
         KeyCode::Home => app.scroll = 0,
         KeyCode::End => app.scroll = app.max_scroll(),
         _ => {}
@@ -396,22 +381,15 @@ fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'stat
 
     // Grow evenly from the active item. A contiguous run keeps ordering legible.
     loop {
-        let left_first = active - start < end - active;
-        let sides = if left_first {
-            [RibbonSide::Left, RibbonSide::Right]
-        } else {
-            [RibbonSide::Right, RibbonSide::Left]
-        };
+        let mut candidates = [
+            start.checked_sub(1).map(|start| (start, end)),
+            (end < items.len()).then(|| (start, end + 1)),
+        ];
+        if active - start >= end - active {
+            candidates.reverse();
+        }
         let mut grew = false;
-        for side in sides {
-            let candidate = match side {
-                RibbonSide::Left if start > 0 => Some((start - 1, end)),
-                RibbonSide::Right if end < items.len() => Some((start, end + 1)),
-                RibbonSide::Left | RibbonSide::Right => None,
-            };
-            let Some((candidate_start, candidate_end)) = candidate else {
-                continue;
-            };
+        for (candidate_start, candidate_end) in candidates.into_iter().flatten() {
             let candidate_width = ribbon_run_width(items, candidate_start, candidate_end);
             if candidate_width > available {
                 continue;
@@ -437,25 +415,21 @@ fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'stat
 
     let edge = UnicodeWidthStr::width(RIBBON_OMISSION) + UnicodeWidthStr::width(RIBBON_SEPARATOR);
     let edge_width = (usize::from(hidden_left) + usize::from(hidden_right)) * edge;
-    let item_widths = (start..end)
-        .map(|index| ribbon_item_width(&items[index]))
-        .collect::<Vec<_>>();
     let separator_width = UnicodeWidthStr::width(RIBBON_SEPARATOR);
-    let separators_width = separator_width * item_widths.len().saturating_sub(1);
+    let separators_width = separator_width * (end - start - 1);
     let items_width = available.saturating_sub(edge_width + separators_width);
-    let full_items_width = item_widths.iter().sum::<usize>();
 
-    for (offset, index) in (start..end).enumerate() {
+    for (offset, item) in items[start..end].iter().enumerate() {
         if offset > 0 {
             spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
         }
-        let budget = if full_items_width <= items_width || index != active {
-            item_widths[offset]
-        } else {
-            // Only the active-only fallback can overflow: keep its tail and badge visible.
+        // Clipping only the active-only fallback; every expanded run already fits.
+        let budget = if end - start == 1 {
             items_width
+        } else {
+            ribbon_item_width(item)
         };
-        spans.extend(ribbon_item_spans(&items[index], index == active, budget));
+        spans.extend(ribbon_item_spans(item, start + offset == active, budget));
     }
 
     if hidden_right {
@@ -463,12 +437,6 @@ fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'stat
         spans.push(Span::styled(RIBBON_OMISSION, muted()));
     }
     clip_line(spans, width)
-}
-
-#[derive(Clone, Copy)]
-enum RibbonSide {
-    Left,
-    Right,
 }
 
 fn ribbon_run_width(items: &[ReviewEntry], start: usize, end: usize) -> usize {
@@ -606,70 +574,51 @@ fn compose_review(diff: &PresentedFile, gutter: GutterLayout, width: usize) -> V
 }
 
 fn compose_notice(notice: &FileNotice, width: usize) -> Vec<Line<'static>> {
-    match notice {
+    let (limit, before, after) = match notice {
         FileNotice::TooLarge {
             before_bytes,
             after_bytes,
             limit_bytes,
             ..
-        } => {
-            let heading = format!(
-                "  file not shown — exceeds the {} per-revision limit",
-                format_bytes(*limit_bytes)
-            );
-            let mut details = vec![Span::raw("  ")];
-            if let Some(bytes) = before_bytes {
-                details.push(Span::styled("before ", muted()));
-                details.push(Span::styled(format_bytes(*bytes), surrounding_style()));
-            }
-            if let Some(bytes) = after_bytes {
-                if before_bytes.is_some() {
-                    details.push(Span::styled("  ·  ", muted()));
-                }
-                details.push(Span::styled("current ", muted()));
-                details.push(Span::styled(format_bytes(*bytes), surrounding_style()));
-            }
-
-            vec![
-                Line::from(""),
-                clip_line(
-                    vec![Span::styled(heading, Style::default().fg(Palette::WARNING))],
-                    width,
-                ),
-                clip_line(details, width),
-            ]
-        }
+        } => (
+            format_bytes(*limit_bytes),
+            before_bytes.map(format_bytes),
+            after_bytes.map(format_bytes),
+        ),
         FileNotice::TooManyLines {
             before_lines,
             after_lines,
             limit_lines,
             ..
-        } => {
-            let heading =
-                format!("  file not shown — exceeds the {limit_lines}-line per-revision limit");
-            let mut details = vec![Span::raw("  ")];
-            if let Some(lines) = before_lines {
-                details.push(Span::styled("before ", muted()));
-                details.push(Span::styled(format!("{lines} lines"), surrounding_style()));
-            }
-            if let Some(lines) = after_lines {
-                if before_lines.is_some() {
-                    details.push(Span::styled("  ·  ", muted()));
-                }
-                details.push(Span::styled("current ", muted()));
-                details.push(Span::styled(format!("{lines} lines"), surrounding_style()));
-            }
-
-            vec![
-                Line::from(""),
-                clip_line(
-                    vec![Span::styled(heading, Style::default().fg(Palette::WARNING))],
-                    width,
-                ),
-                clip_line(details, width),
-            ]
-        }
+        } => (
+            format!("{limit_lines}-line"),
+            before_lines.map(|lines| format!("{lines} lines")),
+            after_lines.map(|lines| format!("{lines} lines")),
+        ),
+    };
+    let heading = format!("  file not shown — exceeds the {limit} per-revision limit");
+    let mut details = vec![Span::raw("  ")];
+    let has_before = before.is_some();
+    if let Some(before) = before {
+        details.push(Span::styled("before ", muted()));
+        details.push(Span::styled(before, surrounding_style()));
     }
+    if let Some(after) = after {
+        if has_before {
+            details.push(Span::styled("  ·  ", muted()));
+        }
+        details.push(Span::styled("current ", muted()));
+        details.push(Span::styled(after, surrounding_style()));
+    }
+
+    vec![
+        Line::from(""),
+        clip_line(
+            vec![Span::styled(heading, Style::default().fg(Palette::WARNING))],
+            width,
+        ),
+        clip_line(details, width),
+    ]
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -754,41 +703,22 @@ fn source_line(
             Style::default().fg(marker.foreground()),
         ));
     }
-    let (gutter_color, dim_gutter) = if row_is_context {
-        (Palette::FAINT, true)
+    let gutter_style = if row_is_context {
+        Style::default()
+            .fg(Palette::FAINT)
+            .add_modifier(Modifier::DIM)
     } else if row_is_ghost {
-        (Palette::GHOST, false)
+        Style::default().fg(Palette::GHOST)
     } else {
-        (Palette::GUTTER, false)
-    };
-    let gutter_style = Style::default().fg(gutter_color);
-    let gutter_style = if dim_gutter {
-        gutter_style.add_modifier(Modifier::DIM)
-    } else {
-        gutter_style
+        Style::default().fg(Palette::GUTTER)
     };
     spans.push(Span::styled(format!("{} │ ", line.number), gutter_style));
-    let mut used = gutter.width();
-    let mut source_column = 0;
-    for span in &line.spans {
-        if used >= width {
-            break;
-        }
-        let (text, text_width) = clip_source_text(&span.text, width - used, source_column);
-        if text_width == 0 {
-            continue;
-        }
-        let style = if row_is_ghost {
-            ghost_line_style(span.mark)
-        } else if span.mark == DiffMark::Context {
-            softened_syntax_style(span.syntax)
-        } else {
-            change_emphasis_style(span.mark)
-        };
-        spans.push(Span::styled(text, style));
-        used += text_width;
-        source_column += text_width;
-    }
+    append_source_spans(
+        &mut spans,
+        line,
+        width.saturating_sub(gutter.width()),
+        row_is_ghost,
+    );
     Line::from(spans)
 }
 
@@ -804,23 +734,42 @@ fn moved_source_line(
         gutter_text,
         Style::default().fg(Palette::MOVE),
     )];
-    let mut used = gutter.width();
-    let mut source_column = 0;
+    append_source_spans(
+        &mut spans,
+        line,
+        width.saturating_sub(gutter.width()),
+        false,
+    );
+    Line::from(spans)
+}
+
+/// Clip source at source-local tab stops and apply current or historical styling.
+fn append_source_spans(
+    spans: &mut Vec<Span<'static>>,
+    line: &SourceRow,
+    width: usize,
+    historical: bool,
+) {
+    let mut column = 0;
     for span in &line.spans {
-        if used >= width {
+        if column >= width {
             break;
         }
-        let (text, text_width) = clip_source_text(&span.text, width - used, source_column);
-        used += text_width;
-        source_column += text_width;
-        let style = if span.mark == DiffMark::Context {
-            softened_syntax_style(span.syntax)
-        } else {
-            change_emphasis_style(span.mark)
+        let (text, text_width) = clip_source_text(&span.text, width - column, column);
+        if text_width == 0 {
+            continue;
+        }
+        let style = match (historical, span.mark) {
+            (true, DiffMark::Added) => {
+                unreachable!("before-side ghost lines cannot contain added source")
+            }
+            (true, DiffMark::Context) => Style::default().fg(Palette::GHOST),
+            (false, DiffMark::Context) => softened_syntax_style(span.syntax),
+            (_, mark) => change_emphasis_style(mark),
         };
         spans.push(Span::styled(text, style));
+        column += text_width;
     }
-    Line::from(spans)
 }
 
 fn elision_line(gutter: GutterLayout, width: usize) -> Line<'static> {
@@ -903,15 +852,6 @@ fn softened_syntax_style(class: SyntaxClass) -> Style {
         _ => foreground,
     };
     Style::default().fg(foreground)
-}
-
-/// Monochrome body style for a rendered before-side `-` ghost line.
-fn ghost_line_style(mark: DiffMark) -> Style {
-    match mark {
-        DiffMark::Removed => change_emphasis_style(mark),
-        DiffMark::Context => Style::default().fg(Palette::GHOST),
-        DiffMark::Added => unreachable!("before-side ghost lines cannot contain added source"),
-    }
 }
 
 fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {

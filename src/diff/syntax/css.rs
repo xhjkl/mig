@@ -20,7 +20,6 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>, source: &str) -> Node
         return NodeAnnotation {
             review,
             channel: Some(ContentChannel::Comment),
-            descendant_channel: Some(ContentChannel::Comment),
             prune_children: true,
             ..NodeAnnotation::default()
         };
@@ -102,8 +101,7 @@ fn statement_identity(node: Node<'_>, source: &str) -> Option<std::ops::Range<us
     }
 
     let block = named_child_of_kind(node, "block");
-    let end = block.map_or(node.end_byte(), |block| block.start_byte());
-    let mut end = end;
+    let mut end = block.map_or(node.end_byte(), |block| block.start_byte());
     while end > node.start_byte() && source.as_bytes()[end - 1].is_ascii_whitespace() {
         end -= 1;
     }

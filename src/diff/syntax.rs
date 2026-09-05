@@ -372,8 +372,8 @@ impl<'source> SyntaxTree<'source> {
 /// Attach comma and semicolon tokens to their preceding named syntax occurrence.
 fn attach_trailing_delimiters(nodes: &mut [SyntaxNode]) {
     for parent_index in 0..nodes.len() {
-        let children = nodes[parent_index].children.clone();
-        for (position, delimiter) in children.iter().copied().enumerate() {
+        for position in 0..nodes[parent_index].children.len() {
+            let delimiter = nodes[parent_index].children[position];
             let trailing = nodes[delimiter.index()]
                 .leaf
                 .and_then(|leaf| leaf.delimiter)
@@ -381,7 +381,7 @@ fn attach_trailing_delimiters(nodes: &mut [SyntaxNode]) {
             if !trailing {
                 continue;
             }
-            let owner = children[..position]
+            let owner = nodes[parent_index].children[..position]
                 .iter()
                 .rev()
                 .copied()

@@ -27,42 +27,23 @@ pub struct Source<'source> {
 impl<'source> Source<'source> {
     /// Index source once so every frontend shares identical line and terminator geometry.
     pub fn new(text: &'source str) -> Self {
-        if text.is_empty() {
-            return Self {
-                text,
-                lines: Vec::new(),
-            };
-        }
-
         let mut lines = Vec::new();
         let mut start = 0;
-        for (newline, byte) in text.bytes().enumerate() {
-            if byte != b'\n' {
-                continue;
-            }
-
-            let has_carriage_return = newline > start && text.as_bytes()[newline - 1] == b'\r';
-            let (content_end, ending) = if has_carriage_return {
-                (newline - 1, LineEnding::CrLf)
+        for line in text.split_inclusive('\n') {
+            let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
+                (content, LineEnding::CrLf)
+            } else if let Some(content) = line.strip_suffix('\n') {
+                (content, LineEnding::Lf)
             } else {
-                (newline, LineEnding::Lf)
+                (line, LineEnding::Missing)
             };
             lines.push(SourceLine {
                 number: lines.len() + 1,
-                content_bytes: start..content_end,
-                full_bytes: start..newline + 1,
+                content_bytes: start..start + content.len(),
+                full_bytes: start..start + line.len(),
                 ending,
             });
-            start = newline + 1;
-        }
-
-        if start < text.len() {
-            lines.push(SourceLine {
-                number: lines.len() + 1,
-                content_bytes: start..text.len(),
-                full_bytes: start..text.len(),
-                ending: LineEnding::Missing,
-            });
+            start += line.len();
         }
 
         Self { text, lines }

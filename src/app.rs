@@ -127,7 +127,7 @@ fn display_pair_path(before: &Path, after: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::MAX_REVISION_LINES;
+    use crate::diff::{MAX_REVISION_LINES, ReviewRow};
     use std::fs;
     use tempfile::TempDir;
 
@@ -195,10 +195,25 @@ mod tests {
             .expect("diff exact-limit pair")
             .expect("changed pair stays visible");
 
-        assert!(matches!(
-            review,
-            ReviewEntry::Diff(diff) if diff.path == "alpha.txt" && !diff.hunks.is_empty()
-        ));
+        let ReviewEntry::Diff(diff) = review else {
+            panic!("an exact-limit text pair must remain a diff");
+        };
+        assert_eq!(diff.path, "alpha.txt");
+        let rows = diff.hunks.iter().flat_map(|hunk| &hunk.rows);
+        for (before, expected) in [(true, "1234"), (false, "5678")] {
+            assert!(rows.clone().any(|row| {
+                let line = match (before, row) {
+                    (true, ReviewRow::Removed(line)) | (false, ReviewRow::Added(line)) => line,
+                    _ => return false,
+                };
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>();
+                line.number == 1 && text == expected
+            }));
+        }
     }
 
     #[test]
