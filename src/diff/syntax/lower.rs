@@ -2,7 +2,7 @@ use super::parse::{ParsedFile, tree_sitter_language};
 use super::{
     ChildSlot, ContentChannel, Delimiter, Grammar, GrammarField, GrammarSymbol, Leaf, LeafRole,
     NodeId, ReviewUnit, SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree, WrapperBoundary, c,
-    css, html, rust, typescript,
+    cpp, css, go, html, json, nix, python, rust, toml, typescript,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -63,9 +63,7 @@ impl HighlightQueries {
                 .iter()
                 .map(|source| {
                     let query = Query::new(language, source);
-                    query.with_context(|| {
-                        format!("invalid official highlight query for {grammar:?}")
-                    })
+                    query.with_context(|| format!("invalid highlight query for {grammar:?}"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
                 .map(Vec::into_boxed_slice)
@@ -102,7 +100,13 @@ pub fn lower<'source>(parsed: ParsedFile<'source>) -> anyhow::Result<Option<Synt
 fn highlight_queries(grammar: Grammar) -> &'static HighlightQueries {
     match grammar {
         Grammar::C => &c::HIGHLIGHT_QUERIES,
+        Grammar::Cpp => &cpp::HIGHLIGHT_QUERIES,
         Grammar::Rust => &rust::HIGHLIGHT_QUERIES,
+        Grammar::Python => &python::HIGHLIGHT_QUERIES,
+        Grammar::Go => &go::HIGHLIGHT_QUERIES,
+        Grammar::Json => &json::HIGHLIGHT_QUERIES,
+        Grammar::Toml => &toml::HIGHLIGHT_QUERIES,
+        Grammar::Nix => &nix::HIGHLIGHT_QUERIES,
         Grammar::Html => &html::HIGHLIGHT_QUERIES,
         Grammar::Css => &css::HIGHLIGHT_QUERIES,
         Grammar::TypeScript => &typescript::TYPESCRIPT_HIGHLIGHTS,
@@ -120,7 +124,13 @@ fn annotate_node(
 ) -> NodeAnnotation {
     match grammar {
         Grammar::C => c::annotate(node, parent_kind),
+        Grammar::Cpp => cpp::annotate(node, parent_kind),
         Grammar::Rust => rust::annotate(node, parent_kind, source),
+        Grammar::Python => python::annotate(node, parent_kind),
+        Grammar::Go => go::annotate(node, parent_kind),
+        Grammar::Json => json::annotate(node),
+        Grammar::Toml => toml::annotate(node, parent_kind),
+        Grammar::Nix => nix::annotate(node),
         Grammar::Html => html::annotate(node, source),
         Grammar::Css => css::annotate(node, parent_kind, source),
         Grammar::TypeScript | Grammar::Tsx | Grammar::JavaScript | Grammar::Jsx => {
@@ -154,7 +164,16 @@ fn gap_channel(grammar: Grammar, parent_kind: &str, spelling: &str) -> ContentCh
     }
     let syntactic = match grammar {
         Grammar::C => c::whitespace_is_syntax(parent_kind),
+        Grammar::Cpp => cpp::whitespace_is_syntax(parent_kind),
         Grammar::Rust => rust::whitespace_is_syntax(parent_kind),
+        Grammar::Python => python::whitespace_is_syntax(parent_kind),
+        Grammar::Go => go::whitespace_is_syntax(parent_kind),
+        Grammar::Json => matches!(parent_kind, "string" | "string_content"),
+        Grammar::Toml => matches!(parent_kind, "string" | "quoted_key"),
+        Grammar::Nix => matches!(
+            parent_kind,
+            "string_expression" | "indented_string_expression" | "string_fragment"
+        ),
         Grammar::Html => html::whitespace_is_syntax(parent_kind, spelling),
         Grammar::Css => css::whitespace_is_syntax(parent_kind),
         Grammar::TypeScript | Grammar::Tsx | Grammar::JavaScript | Grammar::Jsx => {

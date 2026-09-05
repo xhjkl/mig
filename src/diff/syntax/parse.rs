@@ -45,7 +45,13 @@ pub fn parse(
 pub fn tree_sitter_language(grammar: Grammar) -> TreeSitterLanguage {
     match grammar {
         Grammar::C => tree_sitter_c::LANGUAGE.into(),
+        Grammar::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Grammar::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Grammar::Python => tree_sitter_python::LANGUAGE.into(),
+        Grammar::Go => tree_sitter_go::LANGUAGE.into(),
+        Grammar::Json => tree_sitter_json::LANGUAGE.into(),
+        Grammar::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+        Grammar::Nix => tree_sitter_nix::LANGUAGE.into(),
         Grammar::Html => tree_sitter_html::LANGUAGE.into(),
         Grammar::Css => tree_sitter_css::LANGUAGE.into(),
         Grammar::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),

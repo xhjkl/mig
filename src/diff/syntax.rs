@@ -1,12 +1,18 @@
 //! Language-neutral syntax for correspondence, with both revisions using the same frontend.
 
 mod c;
+mod cpp;
 mod css;
+mod go;
 mod html;
+mod json;
 mod line;
 mod lower;
+mod nix;
 mod parse;
+mod python;
 mod rust;
+mod toml;
 mod typescript;
 
 use super::SyntaxClass;
@@ -33,7 +39,13 @@ impl NodeId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Grammar {
     C,
+    Cpp,
     Rust,
+    Python,
+    Go,
+    Json,
+    Toml,
+    Nix,
     Html,
     Css,
     TypeScript,
@@ -479,10 +491,21 @@ fn line_pair<'before, 'after>(
 }
 
 fn grammar_for_path(path: &Path) -> Option<Grammar> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let extension = path.extension()?.to_str()?;
+    if extension == "C" {
+        return Some(Grammar::Cpp);
+    }
+    let extension = extension.to_ascii_lowercase();
     match extension.as_str() {
         "rs" => Some(Grammar::Rust),
-        "c" | "h" => Some(Grammar::C),
+        "py" | "pyi" | "pyw" => Some(Grammar::Python),
+        "go" => Some(Grammar::Go),
+        "json" => Some(Grammar::Json),
+        "toml" => Some(Grammar::Toml),
+        "nix" => Some(Grammar::Nix),
+        "c" => Some(Grammar::C),
+        "cc" | "cpp" | "cxx" | "c++" | "h" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "tpp"
+        | "ixx" | "cppm" => Some(Grammar::Cpp),
         "html" | "htm" => Some(Grammar::Html),
         "css" => Some(Grammar::Css),
         "ts" | "mts" | "cts" => Some(Grammar::TypeScript),

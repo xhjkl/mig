@@ -1,6 +1,349 @@
 use super::*;
 
 #[test]
+fn insignificant_layout_reflows_without_changing_payload() {
+    for (path, before, after) in [
+        (
+            "alpha.nix",
+            "{alpha=[1 2];}\n",
+            "{\n  alpha = [\n    1\n    2\n  ];\n}\n",
+        ),
+        ("alpha.nix", "\"a ${beta} b\"\n", "\"a ${ beta } b\"\n"),
+        (
+            "alpha.toml",
+            "[alpha]\nbeta=[1,2]\n",
+            "[ alpha ]\nbeta = [\n  1,\n  2\n]\n",
+        ),
+        (
+            "alpha.json",
+            "{\"alpha\":[1,2]}\n",
+            "{\n  \"alpha\": [1, 2]\n}\n",
+        ),
+        (
+            "alpha.cpp",
+            "template<class T> T alpha(T beta) { return beta; }\n",
+            "template<class T>\nT alpha(T beta) {\n\treturn beta;\n}\n",
+        ),
+        (
+            "alpha.rs",
+            "fn alpha() { beta(); }\n",
+            "fn alpha() {\n\tbeta();\n}\n",
+        ),
+        (
+            "alpha.c",
+            "int alpha() { return 1; }\n",
+            "int alpha() {\n\treturn 1;\n}\n",
+        ),
+        (
+            "alpha.js",
+            "function alpha() { beta(); }\n",
+            "function alpha() {\n\tbeta();\n}\n",
+        ),
+        (
+            "alpha.go",
+            "package alpha\nfunc beta() int { return 1 }\n",
+            "package alpha\nfunc beta() int {\n\treturn 1\n}\n",
+        ),
+    ] {
+        let diff = diff_file(path, before, after).expect("source must diff");
+        let rows = diff.hunks.iter().flat_map(|hunk| &hunk.rows);
+        assert!(
+            rows.clone().any(|row| matches!(row, ReviewRow::Reflow(_))),
+            "{diff:#?}"
+        );
+        assert!(
+            rows.clone().all(|row| match row {
+                ReviewRow::Current(line) | ReviewRow::Reflow(line) => !line.has_changes(),
+                ReviewRow::Elision(_) | ReviewRow::FileBoundary => true,
+                _ => false,
+            }),
+            "layout changed payload: {diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
+fn literal_whitespace_is_not_layout() {
+    for (path, before, after) in [
+        ("alpha.nix", "\"a ${beta} b\"\n", "\"a  ${beta} b\"\n"),
+        ("alpha.nix", "''\n  a\n  b\n''\n", "''\n  a\n    b\n''\n"),
+        ("alpha.toml", "alpha = '''a b'''\n", "alpha = '''a  b'''\n"),
+        ("alpha.toml", "\"a b\" = 1\n", "\"a  b\" = 1\n"),
+        (
+            "alpha.json",
+            "{\"alpha\":\"a b\"}\n",
+            "{\"alpha\":\"a  b\"}\n",
+        ),
+        (
+            "alpha.cpp",
+            "const char* alpha = R\"(a b)\";\n",
+            "const char* alpha = R\"(a  b)\";\n",
+        ),
+        (
+            "alpha.go",
+            "package alpha\nvar beta = `a b`\n",
+            "package alpha\nvar beta = `a  b`\n",
+        ),
+    ] {
+        let diff = diff_file(path, before, after).expect("source must diff");
+        assert!(
+            source_lines(&diff).any(|(line, _)| line.has_changes()),
+            "literal edit disappeared: {diff:#?}"
+        );
+        assert!(
+            !diff
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.rows)
+                .any(|row| matches!(row, ReviewRow::Reflow(_))),
+            "literal edit became reflow: {diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
+fn configuration_values_stay_with_their_named_owner() {
+    for (path, before, after) in [
+        (
+            "alpha.nix",
+            "{\n  alpha = { value = 1; };\n  beta = { value = 2; };\n}\n",
+            "{\n  beta = { value = 3; };\n  alpha = { value = 1; };\n}\n",
+        ),
+        (
+            "alpha.nix",
+            "let\n  alpha = 1;\n  beta = 2;\nin alpha + beta\n",
+            "let\n  beta = 3;\n  alpha = 1;\nin alpha + beta\n",
+        ),
+        (
+            "alpha.json",
+            "{\n  \"alpha\": {\"value\": 1},\n  \"beta\": {\"value\": 2}\n}\n",
+            "{\n  \"beta\": {\"value\": 3},\n  \"alpha\": {\"value\": 1}\n}\n",
+        ),
+        (
+            "alpha.toml",
+            "[alpha]\nvalue = 1\n\n[beta]\nvalue = 2\n",
+            "[beta]\nvalue = 3\n\n[alpha]\nvalue = 1\n",
+        ),
+    ] {
+        let diff = diff_file(path, before, after).expect("configuration must diff");
+        assert_removed_payload(&diff, "2");
+        assert_added_payload(&diff, "3");
+        assert_no_removed_payload(&diff, "1");
+        assert_context_payload(&diff, "1");
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
+fn configuration_list_order_remains_a_material_change() {
+    for (path, before, after) in [
+        ("alpha.nix", "[1 2 3]\n", "[2 1 3]\n"),
+        ("alpha.json", "[1, 2, 3]\n", "[2, 1, 3]\n"),
+        ("alpha.toml", "alpha = [1, 2, 3]\n", "alpha = [2, 1, 3]\n"),
+        (
+            "alpha.toml",
+            "[[alpha]]\nvalue = 1\n[[alpha]]\nvalue = 2\n",
+            "[[alpha]]\nvalue = 2\n[[alpha]]\nvalue = 1\n",
+        ),
+    ] {
+        let diff = diff_file(path, before, after).expect("configuration must diff");
+        assert!(
+            source_lines(&diff).any(|(line, _)| line.has_changes())
+                || diff
+                    .hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.rows)
+                    .any(|row| matches!(row, ReviewRow::Moved { .. })),
+            "list order disappeared: {diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
+fn cpp_overloads_keep_their_signatures_when_reordered_and_edited() {
+    let before = "int alpha(int beta) { return 1; }\n\nint alpha(double beta) { return 2; }\n";
+    let after = "int alpha(double beta) { return 3; }\n\nint alpha(int beta) { return 1; }\n";
+    for path in ["alpha.cpp", "alpha.h"] {
+        let diff = diff_file(path, before, after).expect("C++ must diff");
+        assert_removed_payload(&diff, "2");
+        assert_added_payload(&diff, "3");
+        assert_no_removed_payload(&diff, "1");
+        assert!(
+            diff.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.rows)
+                .any(|row| matches!(row,
+                    ReviewRow::Moved { before: Some(1), after } if line_text(after).contains("int beta")
+                )),
+            "{diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
+fn go_methods_keep_receiver_identity_when_reordered_and_edited() {
+    let before = "package alpha\n\nfunc (b Beta) Value() int { return 1 }\n\nfunc (g Gamma) Value() int { return 2 }\n";
+    let after = "package alpha\n\nfunc (g Gamma) Value() int { return 3 }\n\nfunc (b Beta) Value() int { return 1 }\n";
+    let diff = diff_file("alpha.go", before, after).expect("Go must diff");
+    assert_removed_payload(&diff, "2");
+    assert_added_payload(&diff, "3");
+    assert_no_removed_payload(&diff, "1");
+    assert!(
+        diff.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .any(|row| matches!(row,
+                ReviewRow::Moved { before: Some(3), after } if line_text(after).contains("Beta")
+            )),
+        "{diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn python_layout_changes_preserve_the_same_block_structure() {
+    for (before, after) in [
+        ("def alpha(): pass\n", "def alpha():\n\tpass\n"),
+        (
+            "def alpha(): return f'{beta+gamma}'\n",
+            "def alpha(): return f'{ beta + gamma }'\n",
+        ),
+        ("def alpha():\n    return 1\n", "def alpha():\n\treturn 1\n"),
+        (
+            "def alpha():\n    if beta:\n        gamma()\n    delta()\n",
+            "def alpha():\n  if beta:\n    gamma()\n  delta()\n",
+        ),
+        (
+            "def alpha():\n    return (1 + 2)\n",
+            "def alpha():\n    return (1\n      + 2)\n",
+        ),
+        (
+            "def alpha():\n    return 1 + 2\n",
+            "def alpha():\n    return 1 + \\\n        2\n",
+        ),
+    ] {
+        for (before, after) in [(before, after), (after, before)] {
+            let diff = diff_file("alpha.py", before, after).expect("Python must diff");
+            let rows = diff.hunks.iter().flat_map(|hunk| &hunk.rows);
+            assert!(
+                rows.clone().any(|row| matches!(row, ReviewRow::Reflow(_))),
+                "{diff:#?}"
+            );
+            assert!(
+                rows.clone().all(|row| match row {
+                    ReviewRow::Current(line) | ReviewRow::Reflow(line) => !line.has_changes(),
+                    ReviewRow::Elision(_) | ReviewRow::FileBoundary => true,
+                    _ => false,
+                }),
+                "layout changed payload: {diff:#?}"
+            );
+            assert_source_ownership(&diff);
+        }
+    }
+}
+
+#[test]
+fn python_indentation_that_changes_scope_is_a_material_edit() {
+    for (before, after, affected) in [
+        (
+            "def alpha():\n    if beta:\n        gamma()\n    delta()\n",
+            "def alpha():\n    if beta:\n        gamma()\n        delta()\n",
+            "delta()",
+        ),
+        (
+            "def alpha():\n    for beta in gamma:\n        delta()\n    epsilon()\n",
+            "def alpha():\n    for beta in gamma:\n        delta()\n        epsilon()\n",
+            "epsilon()",
+        ),
+        (
+            "def alpha():\n    beta()\ngamma()\n",
+            "def alpha():\n    beta()\n    gamma()\n",
+            "gamma()",
+        ),
+    ] {
+        for (before, after) in [(before, after), (after, before)] {
+            let diff = diff_file("alpha.py", before, after).expect("Python must diff");
+            assert!(
+                diff.hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.rows)
+                    .any(|row| match row {
+                        ReviewRow::Current(line) =>
+                            line_text(line).contains(affected) && line.has_changes(),
+                        ReviewRow::Removed(line)
+                        | ReviewRow::Added(line)
+                        | ReviewRow::Moved { after: line, .. } =>
+                            line_text(line).contains(affected),
+                        _ => false,
+                    }),
+                "scope change disappeared into reflow: {diff:#?}"
+            );
+            assert_source_ownership(&diff);
+        }
+    }
+}
+
+#[test]
+fn python_decorated_definitions_move_with_their_decorators() {
+    let alpha = "@beta\ndef alpha():\n    return 1\n";
+    let gamma = "@delta\ndef gamma():\n    return 2\n";
+    let before = format!("{alpha}\n{gamma}");
+    let after = format!("{gamma}\n{alpha}");
+    let diff = diff_file("alpha.py", &before, &after).expect("Python must diff");
+    assert!(
+        diff.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .any(|row| matches!(row,
+                ReviewRow::Moved { before: Some(_), after } if line_text(after).starts_with('@')
+            )),
+        "{diff:#?}"
+    );
+    assert!(
+        !source_lines(&diff).any(|(line, _)| line.has_changes()),
+        "movement changed payload: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn python_literal_and_debug_fstring_whitespace_remains_material() {
+    for (before, after) in [
+        (
+            "def alpha(): return 'a b'\n",
+            "def alpha(): return 'a  b'\n",
+        ),
+        (
+            "def alpha():\n    return '''a\n    b'''\n",
+            "def alpha():\n    return '''a\n        b'''\n",
+        ),
+        (
+            "def alpha(): return f'{beta=}'\n",
+            "def alpha(): return f'{ beta = }'\n",
+        ),
+    ] {
+        let diff = diff_file("alpha.py", before, after).expect("Python must diff");
+        assert!(
+            source_lines(&diff).any(|(line, _)| line.has_changes()),
+            "literal edit disappeared: {diff:#?}"
+        );
+        assert!(
+            !diff
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.rows)
+                .any(|row| matches!(row, ReviewRow::Reflow(_))),
+            "literal edit became reflow: {diff:#?}"
+        );
+        assert_source_ownership(&diff);
+    }
+}
+
+#[test]
 fn overlapping_syntax_on_one_line_has_one_review_owner() {
     let before = "#![allow(alpha)]// beta\nconst ALPHA: u8 = 1;\n";
     let after = "#![allow(alpha)]// beta\nconst ALPHA: u8 = 2;\n";

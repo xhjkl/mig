@@ -20,10 +20,6 @@ struct Cli {
 
     /// Current file paired with BEFORE.
     after: Option<PathBuf>,
-
-    /// Display path and syntax hint to use when the inputs are temporary files.
-    #[arg(long, requires = "after")]
-    path: Option<PathBuf>,
 }
 
 /// Run Mig from the process arguments and current directory.
@@ -43,7 +39,7 @@ pub fn run() -> Result<()> {
             commit::diff_commit(&directory, &commitish, MAX_REVISION_BYTES)?
         }
         (Some(before), Some(after)) => {
-            let review = load_file_pair(&before, &after, cli.path.as_deref(), MAX_REVISION_BYTES)?;
+            let review = load_file_pair(&before, &after, MAX_REVISION_BYTES)?;
             review.into_iter().collect()
         }
     };
@@ -54,19 +50,12 @@ pub fn run() -> Result<()> {
     ui::run(reviews)
 }
 
-fn load_file_pair(
-    before: &Path,
-    after: &Path,
-    path: Option<&Path>,
-    limit: u64,
-) -> Result<Option<ReviewEntry>> {
+fn load_file_pair(before: &Path, after: &Path, limit: u64) -> Result<Option<ReviewEntry>> {
     let before_file = OpenFile::open(before)?;
     let after_file = OpenFile::open(after)?;
     let before_bytes = before_file.bytes();
     let after_bytes = after_file.bytes();
-    let path = path
-        .map(Path::to_owned)
-        .unwrap_or_else(|| display_pair_path(before, after));
+    let path = display_pair_path(before, after);
     let path = path.to_string_lossy().into_owned();
 
     if before_bytes > limit || after_bytes > limit {
@@ -135,14 +124,10 @@ mod tests {
         let scan = Cli::try_parse_from(["m"]);
         let commit = Cli::try_parse_from(["m", "HEAD~2"]);
         let pair = Cli::try_parse_from(["m", "old.rs", "current.rs"]);
-        let path_without_pair = Cli::try_parse_from(["m", "--path", "src/lib.rs"]);
-        let path_with_commit = Cli::try_parse_from(["m", "HEAD", "--path", "src/lib.rs"]);
 
         assert!(scan.is_ok());
         assert!(commit.is_ok());
         assert!(pair.is_ok());
-        assert!(path_without_pair.is_err());
-        assert!(path_with_commit.is_err());
     }
 
     #[test]
@@ -167,7 +152,7 @@ mod tests {
         fs::write(&before, [0xff]).expect("write invalid UTF-8 before input");
         fs::write(&after, b"12345").expect("write oversized after input");
 
-        let review = load_file_pair(&before, &after, Some(Path::new("alpha.txt")), 4)
+        let review = load_file_pair(&before, &after, 4)
             .expect("inspect oversized pair")
             .expect("oversized pair stays visible");
 
@@ -178,7 +163,7 @@ mod tests {
                 before_bytes: Some(1),
                 after_bytes: Some(5),
                 limit_bytes: 4,
-            }) if path == "alpha.txt"
+            }) if Path::new(&path) == after
         ));
     }
 
@@ -190,14 +175,14 @@ mod tests {
         fs::write(&before, b"1234").expect("write before input");
         fs::write(&after, b"5678").expect("write after input");
 
-        let review = load_file_pair(&before, &after, Some(Path::new("alpha.txt")), 4)
+        let review = load_file_pair(&before, &after, 4)
             .expect("diff exact-limit pair")
             .expect("changed pair stays visible");
 
         let ReviewEntry::Diff(diff) = review else {
             panic!("an exact-limit text pair must remain a diff");
         };
-        assert_eq!(diff.path, "alpha.txt");
+        assert_eq!(Path::new(&diff.path), after);
         let rows = diff.hunks.iter().flat_map(|hunk| &hunk.rows);
         for (before, expected) in [(true, "1234"), (false, "5678")] {
             assert!(rows.clone().any(|row| {
@@ -224,14 +209,9 @@ mod tests {
         fs::write(&after, "\n".repeat(MAX_REVISION_LINES + 1))
             .expect("write line-dense after input");
 
-        let review = load_file_pair(
-            &before,
-            &after,
-            Some(Path::new("alpha.txt")),
-            MAX_REVISION_BYTES,
-        )
-        .expect("inspect line-dense pair")
-        .expect("line-dense pair stays visible");
+        let review = load_file_pair(&before, &after, MAX_REVISION_BYTES)
+            .expect("inspect line-dense pair")
+            .expect("line-dense pair stays visible");
 
         assert!(matches!(
             review,
@@ -240,7 +220,7 @@ mod tests {
                 before_lines: Some(1),
                 after_lines: Some(lines),
                 limit_lines: MAX_REVISION_LINES,
-            }) if path == "alpha.txt" && lines == MAX_REVISION_LINES + 1
+            }) if Path::new(&path) == after && lines == MAX_REVISION_LINES + 1
         ));
     }
 }
