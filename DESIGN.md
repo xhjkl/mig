@@ -38,6 +38,10 @@ provenance, parentage, identity, and delimiter ownership. If either parse is
 unsafe, both revisions become exact `Line` leaves in the same pipeline; syntax
 coloring remains presentation metadata.
 
+Frontends distinguish formatting from whitespace carried by literals. Python
+retains suite nesting as sealed syntax boundaries, so equivalent indentation
+can reflow while a statement changing scope remains a structural edit.
+
 Correspondence pairs flat file-level units and recursively matches descendants
 only beneath paired parents; lowering rejects nested unit promotion. Unique
 payloads may cross transparent wrappers at any depth, sealed owners prevent
