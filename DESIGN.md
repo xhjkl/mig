@@ -1,61 +1,70 @@
 # Design
 
-Mig presents source changes as focused structural hunks with the context needed
-to review them. Its staged pipeline carries each change from source text to
-typed terminal rows.
+Mig (`m`) reviews code changes in a terminal as focused structural hunks with
+the context needed to understand them.
 
-```text
-worktree, commit, or explicit file pair
-                    │
-                    ▼
-             bounded source text
-                    │
-                    ▼
-       parse concrete syntax or exact lines
-                    │
-                    ▼
-       lower to internal neutral syntax trees
-                    │
-                    ▼
-    correspond trees → form atomic raw hunks
-                    │
-                    ▼
-       refine priority, order, and context
-                    │
-                    ▼
-        present typed rows → terminal UI
+## Inputs
+
+```sh
+m                 # HEAD → disk, under the current directory
+m HEAD~2          # HEAD~3 → HEAD~2
+m old.rs new.rs   # old → new; no Git required
 ```
 
-Every review starts with a before/after text pair: worktree mode reads pinned
-`HEAD` and disk, commit mode reads the first parent—or an empty tree for a root
-commit—and the selected commit, and file-pair mode reads the two paths directly.
-Binary or unsupported Git entries are skipped; oversized files remain visible
-as size or line-count notices.
+Every review starts with a before/after text pair. With no arguments, `m` scans
+staged, unstaged, and untracked paths under the current directory. It resolves
+`HEAD` once and compares it with disk contents, including any edits made after
+staging.
 
-`syntax::parse` binds concrete parser trees to exact sources; `syntax::lower`
-discards parser handles and produces typed, language-neutral arenas with
-provenance, parentage, identity, and delimiter ownership. If either parse is
-unsafe, both revisions become exact `Line` leaves in the same pipeline; syntax
+`m <commitish>` shows the changes introduced by the selected commit, using its
+first parent as the baseline, or an empty tree for a root commit.
+`m <before> <after>` reads the two file paths directly, without requiring Git.
+
+Git input skips non-text files, symlinks, and submodules. Either revision
+exceeding 16 MiB or 100,000 lines produces a notice instead of a diff.
+
+## From text to screen
+
+`syntax::parse` binds parser trees to the original text. `syntax::lower`
+discards parser handles and produces Mig-owned, language-neutral nodes with
+source ranges, parentage, identity, and delimiter ownership. Trailing commas
+and semicolons stay attached to preceding items. Unknown languages, an
+`@generated` header in either revision, or a parse that cannot be safely lowered
+send both revisions through the same pipeline as exact `Line` leaves. Syntax
 coloring remains presentation metadata.
 
-Frontends distinguish formatting from whitespace carried by literals. Python
-retains suite nesting as sealed syntax boundaries, so equivalent indentation
-can reflow while a statement changing scope remains a structural edit.
+`correspondence` matches enclosing constructs before their contents. Independent
+review units are the file itself or its direct children; nested constructs are
+never promoted into independent units. Descendants match beneath paired
+parents, and line matching respects the same boundaries.
 
-Correspondence pairs flat file-level units and recursively matches descendants
-only beneath paired parents; lowering rejects nested unit promotion. Unique
-payloads may cross transparent wrappers at any depth, sealed owners prevent
-tunneling, and owner-local anchors partition line fallback before changes snap
-to source-complete syntax owners.
+Wrapper recovery requires a unique surviving containment path through
+transparent wrappers and cannot cross sealed boundaries. For `x → Some(x)`,
+retain `x` and mark the wrapper added; for `x → (x, x)`, the match is ambiguous.
+A new function body is not a wrapper around an old statement. A separate pass
+recognizes constrained moves of unique exact subtrees inward or outward between
+surviving nested owners within the same matched review unit.
 
-`tree_diff::RawSourceDiff` couples atomic `SourceHunk`s with the source layout
-needed to place them. Refinement ranks and coalesces those hunks, adds
-breadcrumbs, halos, and elisions, then emits `RefinedHunk`s containing only
-final coverage and semantic changes.
+Formatting differs from content: changing the string literal `"a b"` to
+`"a  b"` is an edit. Python indentation changes are formatting only when block
+nesting stays unchanged. Moving a statement into an `if` body is an edit.
 
-`presentation` alone slices source text into styled, typed rows. The terminal UI
-only lays out, clips, styles, and navigates those rows; tests stop at presentation
-facts and terminal rendering is checked visually.
+`tree_diff` forms source ranges for changes, expanding them to complete syntax
+owners and including their punctuation. Replacements keep their old and new
+sides in one change; moves keep their origin and destination together. This
+keeps later sorting and context selection from splitting either pair.
+`RawSourceDiff` also carries the source layout needed to order changes and
+attach context.
 
-The executable enters through `run`; acquisition, differencing, presentation,
-and rendering remain private implementation modules.
+`refine` splits distant changes, merges nearby changes, and ranks hunks: edits,
+moves, imports/directives, then formatting. It adds enclosing constructs'
+opening lines and nearby unchanged lines, marking omitted ranges.
+`RefinedHunk` retains only final coverage and changes.
+
+`presentation` converts those ranges to typed `ReviewRow`s with text, line
+numbers, and highlighting. `ui` draws and navigates them; it does not decide
+what changed. Test diff behavior through these rows; check terminal appearance
+visually.
+
+`run` selects inputs; `diff::diff_file` runs the pipeline. Acquisition,
+differencing, presentation, and rendering remain private implementation modules.
