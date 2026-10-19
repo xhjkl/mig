@@ -59,12 +59,38 @@ attach context.
 `refine` splits distant changes, merges nearby changes, and ranks hunks: edits,
 moves, imports/directives, then formatting. It adds enclosing constructs'
 opening lines and nearby unchanged lines, marking omitted ranges.
-`RefinedHunk` retains only final coverage and changes.
+`RefinedHunk` retains final coverage, changes, and the change nature.
+
+`impact` attributes each hunk to the declarations it touches. Lowering marks
+nodes as definitions (types, functions, constants, modules, macros) or members
+(fields, variants, signatures, trait-impl methods). A hunk's symbols are the
+definitions enclosing its changed lines, innermost first; a member credits its
+owner. A hunk is a contract change when it edits a heading: the lines before a
+body, which hold signatures and fields. The file also records every definition
+and every identifier or type name it spells.
 
 `presentation` converts those ranges to typed `ReviewRow`s with text, line
 numbers, and highlighting. `ui` draws and navigates them; it does not decide
 what changed. Test diff behavior through these rows; check terminal appearance
 visually.
+
+## Review order
+
+`review::rank_reviews` orders files so the changes other changes depend on come
+first. A reviewed file consumes a name when it spells the name, spells the
+owner of a nested definition, and does not define the name itself. A name is
+attributed only when exactly one non-test reviewed file defines it; conventional
+names such as `new`, mocks in tests, and names several files define stay
+unattributed. Sources precede tests, then documentation, then generated files.
+Within a tier, files with more consumers come first, then files with a contract
+change, then the caller's tie-break (dirtier worktree files first), then path.
+
+Within a file, edits keep precedence over moves, wiring, and formatting; among
+edits, hunks whose definitions have more consumers lead, then contract changes,
+then source order. The ordering only reads names already in the reviewed
+revisions: it never resolves imports or inspects unchanged files, so a change to
+a widely used name with callers outside the change set ranks on its heading
+change alone.
 
 `run` selects inputs; `diff::diff_file` runs the pipeline. Acquisition,
 differencing, presentation, and rendering remain private implementation modules.
