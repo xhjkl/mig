@@ -1,5 +1,7 @@
 use super::lower::{HighlightQueries, NodeAnnotation};
-use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use super::{
+    ContentChannel, Declares, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary,
+};
 use ::tree_sitter::Node;
 
 pub static HIGHLIGHT_QUERIES: HighlightQueries =
@@ -84,9 +86,27 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
             ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines)
         }
     });
+    // Module and class attributes are declarations; the same statement inside a
+    // function body is a local.
+    let declares = match kind {
+        "decorated_definition" | "function_definition" | "class_definition" => Declares::Definition,
+        "assignment" | "type_alias_statement" if parent_kind == Some("module") => {
+            Declares::Definition
+        }
+        "assignment" | "type_alias_statement"
+            if node
+                .parent()
+                .and_then(|block| block.parent())
+                .is_some_and(|owner| owner.kind() == "class_definition") =>
+        {
+            Declares::Member
+        }
+        _ => Declares::Nothing,
+    };
     NodeAnnotation {
         review,
         identity,
+        declares,
         sibling_matching: if owner || wiring {
             SiblingMatching::LocalIdentity
         } else {

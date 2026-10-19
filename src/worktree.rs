@@ -1,12 +1,11 @@
 use crate::{
     input::{BoundedBytes, GitBlob, OpenFile, decode_text},
-    review::{FileNotice, ReviewEntry, review_source_pair},
+    review::{FileNotice, ReviewEntry, rank_reviews, review_source_pair},
 };
 use anyhow::{Context, Result};
 use gix::ObjectId;
 use gix::bstr::{BStr, BString, ByteSlice};
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -127,19 +126,21 @@ pub fn diff_directory(directory: &Path, limit: u64) -> Result<Vec<ReviewEntry>> 
         reviews.push((change, review));
     }
 
-    reviews.sort_by(|(left_change, left), (right_change, right)| {
-        left.is_generated()
-            .cmp(&right.is_generated())
-            .then_with(|| {
-                if left.is_generated() {
-                    Ordering::Equal
-                } else {
-                    right_change.cmp(left_change)
-                }
-            })
-            .then_with(|| left.path().cmp(right.path()))
+    // Among equally ranked files, dirtier files come first.
+    let change_by_path = reviews
+        .iter()
+        .map(|(change, review)| (review.path().to_owned(), *change))
+        .collect::<HashMap<_, _>>();
+    let mut reviews = reviews
+        .into_iter()
+        .map(|(_, review)| review)
+        .collect::<Vec<_>>();
+    rank_reviews(&mut reviews, |review| {
+        change_by_path
+            .get(review.path())
+            .map_or(usize::MAX, |change| usize::MAX - *change as usize)
     });
-    Ok(reviews.into_iter().map(|(_, review)| review).collect())
+    Ok(reviews)
 }
 
 /// Collect changed paths within the directory, keeping each path's highest review priority.

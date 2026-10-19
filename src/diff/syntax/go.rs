@@ -1,5 +1,7 @@
 use super::lower::{HighlightQueries, NodeAnnotation};
-use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use super::{
+    ContentChannel, Declares, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary,
+};
 use ::tree_sitter::Node;
 
 pub static HIGHLIGHT_QUERIES: HighlightQueries =
@@ -81,6 +83,20 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
             }
         }),
         identity,
+        declares: if matches!(kind, "field_declaration" | "method_elem") {
+            Declares::Member
+        } else if matches!(kind, "function_declaration" | "method_declaration")
+            || (matches!(kind, "type_spec" | "type_alias" | "const_spec" | "var_spec")
+                // Specs inside a function body are locals.
+                && node
+                    .parent()
+                    .and_then(|group| group.parent())
+                    .is_some_and(|scope| scope.kind() == "source_file"))
+        {
+            Declares::Definition
+        } else {
+            Declares::Nothing
+        },
         sibling_matching: if owner {
             SiblingMatching::LocalIdentity
         } else {

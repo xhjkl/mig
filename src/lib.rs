@@ -1,6 +1,8 @@
 mod app;
 mod commit;
 mod diff;
+#[cfg(feature = "fixture-bins")]
+mod dump;
 #[cfg(any(test, feature = "fixture-bins"))]
 mod fixture;
 mod input;
@@ -27,4 +29,11 @@ pub fn run_web_fixture() -> anyhow::Result<()> {
     }
 
     ui::run(reviews)
+}
+
+/// Print the review as plain text instead of opening the terminal interface.
+#[cfg(feature = "fixture-bins")]
+pub fn run_dump() -> anyhow::Result<()> {
+    let reviews = app::collect_reviews()?;
+    dump::print(&reviews)
 }

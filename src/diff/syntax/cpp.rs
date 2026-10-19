@@ -1,6 +1,6 @@
 use super::c;
 use super::lower::{HighlightQueries, NodeAnnotation};
-use super::{LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use super::{Declares, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
 use ::tree_sitter::Node;
 
 pub static HIGHLIGHT_QUERIES: HighlightQueries = HighlightQueries::new(&[
@@ -32,6 +32,15 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
     }
 
     annotation.identity = declaration_identity(node).map(|identity| identity.byte_range());
+    annotation.declares = match node.kind() {
+        _ if annotation.identity.is_none() => Declares::Nothing,
+        "using_declaration" | "namespace_alias_definition" | "friend_declaration" => {
+            Declares::Nothing
+        }
+        "field_declaration" => Declares::Member,
+        "declaration" if !c::declares_at_scope(parent_kind) => Declares::Nothing,
+        _ => Declares::Definition,
+    };
     annotation.sibling_matching = SiblingMatching::LocalIdentity;
     annotation.wrapper_boundary = WrapperBoundary::Sealed;
     annotation.review = (parent_kind == Some("translation_unit")).then(|| {

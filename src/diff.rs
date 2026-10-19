@@ -1,5 +1,6 @@
 mod context;
 mod correspondence;
+mod impact;
 mod presentation;
 mod refine;
 mod source;
@@ -10,10 +11,14 @@ use anyhow::{Result, bail};
 use std::ops::Range;
 use std::path::Path;
 
+#[cfg(test)]
+pub use impact::HunkImpact;
+pub use impact::{FileImpact, TouchedSymbol};
 pub use presentation::{DiffMark, PresentedFile, ReviewRow, SourceRow, WordDiff};
 #[cfg(test)]
 pub use presentation::{ReviewHunk, SourceSpan};
 pub use source::LineEnding;
+pub use tree_diff::ChangeNature;
 
 /// Per-revision line limit, bounding syntax storage even for files of empty lines.
 pub const MAX_REVISION_LINES: usize = 100_000;
@@ -47,6 +52,8 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<PresentedFile>
             path: path.to_owned(),
             generated,
             hunks: Vec::new(),
+            impact: FileImpact::default(),
+            consumers: 0,
         });
     }
     let before_lines = before.lines().count();
@@ -59,11 +66,15 @@ pub fn diff_file(path: &str, before: &str, after: &str) -> Result<PresentedFile>
     let correspondence = correspondence::correspond(&syntax);
     let raw_hunks = tree_diff::raw_hunks(&syntax, &correspondence);
     let refined_hunks = refine::refine_hunks(&syntax, raw_hunks);
-    let hunks = presentation::present_hunks(&syntax.before, &syntax.after, refined_hunks);
+    let (hunk_impacts, impact) = impact::file_impact(&syntax, &refined_hunks);
+    let hunks =
+        presentation::present_hunks(&syntax.before, &syntax.after, refined_hunks, hunk_impacts);
     Ok(PresentedFile {
         path: path.to_owned(),
         generated,
         hunks,
+        impact,
+        consumers: 0,
     })
 }
 

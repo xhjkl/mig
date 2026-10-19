@@ -24,6 +24,11 @@ name = "fw"
 path = "src/bin/fw.rs"
 required-features = ["fixture-bins"]
 
+[[bin]]
+name = "d"
+path = "src/bin/d.rs"
+required-features = ["fixture-bins"]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.1", features = ["derive"] }

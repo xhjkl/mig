@@ -1,10 +1,11 @@
 //! Turn source coordinates into styled rows after refinement has fixed their order and coverage.
 
 use super::context::ranges_overlap;
+use super::impact::{FileImpact, HunkImpact};
 use super::refine::RefinedHunk;
 use super::syntax::SyntaxTree;
 use super::tree_diff::{
-    CompactChange, LineEndingChange, MoveBlock, SourceChange, changed_sequence_ranges,
+    ChangeNature, CompactChange, LineEndingChange, MoveBlock, SourceChange, changed_sequence_ranges,
 };
 use super::{LineCoverage, LineEnding, SyntaxClass};
 use std::ops::Range;
@@ -75,6 +76,11 @@ pub enum ReviewRow {
 pub struct ReviewHunk {
     pub coverage: LineCoverage,
     pub rows: Vec<ReviewRow>,
+    pub nature: ChangeNature,
+    /// Declarations this hunk touches, and whether one of their headings changed.
+    pub impact: HunkImpact,
+    /// Other reviewed files that refer to a touched declaration; set by review ranking.
+    pub consumers: usize,
 }
 
 /// Styled hunks in review-priority order, which may differ from source order.
@@ -84,6 +90,9 @@ pub struct PresentedFile {
     /// Whether either source revision declares itself generated near its header.
     pub generated: bool,
     pub hunks: Vec<ReviewHunk>,
+    pub impact: FileImpact,
+    /// Other reviewed files that refer to a declaration this file changes; set by ranking.
+    pub consumers: usize,
 }
 
 /// Split one source line at syntax and diff-mark boundaries.
@@ -185,7 +194,9 @@ pub fn present_hunks(
     before: &SyntaxTree<'_>,
     after: &SyntaxTree<'_>,
     hunks: Vec<RefinedHunk>,
+    impacts: Vec<HunkImpact>,
 ) -> Vec<ReviewHunk> {
+    debug_assert_eq!(hunks.len(), impacts.len());
     let before_lines = before.source.lines().len();
     let after_lines = after.source.lines().len();
     let show_file_boundary = hunks.iter().any(|hunk| {
@@ -208,8 +219,9 @@ pub fn present_hunks(
     let last_hunk = hunks.len().saturating_sub(1);
     hunks
         .into_iter()
+        .zip(impacts)
         .enumerate()
-        .map(|(index, hunk)| {
+        .map(|(index, (hunk, impact))| {
             let mut rows = hunk
                 .changes
                 .into_iter()
@@ -221,6 +233,9 @@ pub fn present_hunks(
             ReviewHunk {
                 coverage: hunk.coverage,
                 rows,
+                nature: hunk.nature,
+                impact,
+                consumers: 0,
             }
         })
         .collect()

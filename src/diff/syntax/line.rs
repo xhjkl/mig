@@ -1,5 +1,5 @@
 use super::{
-    ChildSlot, ContentChannel, LayoutOwnership, Leaf, LeafRole, NodeId, ReviewUnit,
+    ChildSlot, ContentChannel, Declares, LayoutOwnership, Leaf, LeafRole, NodeId, ReviewUnit,
     SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree, WrapperBoundary,
 };
 use crate::diff::SyntaxClass;
@@ -24,6 +24,7 @@ pub fn lower(source: Source<'_>) -> SyntaxTree<'_> {
         decoration_owner: None,
         sibling_matching: SiblingMatching::LocalIdentity,
         wrapper_boundary: WrapperBoundary::Sealed,
+        declares: Declares::Nothing,
         review: None,
         named: true,
         extra: false,
@@ -51,6 +52,7 @@ pub fn lower(source: Source<'_>) -> SyntaxTree<'_> {
             decoration_owner: None,
             sibling_matching: SiblingMatching::OrderedSyntax,
             wrapper_boundary: WrapperBoundary::Traversable,
+            declares: Declares::Nothing,
             review: Some(ReviewUnit::linewise(LayoutOwnership::None)),
             named: true,
             extra: false,

@@ -152,6 +152,17 @@ enum WrapperBoundary {
     Sealed,
 }
 
+/// What a named node declares for code elsewhere to refer to.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Declares {
+    #[default]
+    Nothing,
+    /// A field, variant, or signature: named, but referred to through its owner.
+    Member,
+    /// A type, function, constant, module, or macro with a name of its own.
+    Definition,
+}
+
 /// Policies for a file-level unit matched independently of its neighbors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReviewUnit {
@@ -234,6 +245,8 @@ pub struct SyntaxNode {
     wrapper_boundary: WrapperBoundary,
     /// Independent review policy, allowed only on the root or its direct children.
     pub review: Option<ReviewUnit>,
+    /// Named construct other code can refer to, such as a function, type, field, or macro.
+    pub declares: Declares,
     pub named: bool,
     pub extra: bool,
     pub missing: bool,

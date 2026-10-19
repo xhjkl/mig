@@ -891,7 +891,12 @@ fn normalize_stable_revision_rows(
         .copied()
         .collect::<HashSet<_>>();
     current_owners.retain(|line| !relocated_after.contains(line));
+    let stable_before_of_after = stable
+        .iter()
+        .map(|(before, after)| (*after, *before))
+        .collect::<HashMap<_, _>>();
     for change in changes.iter_mut() {
+        let mut reunited = Vec::new();
         change.rows = std::mem::take(&mut change.rows)
             .into_iter()
             .flat_map(|row| {
@@ -907,14 +912,53 @@ fn normalize_stable_revision_rows(
                         if !current_owners.insert(line.number) {
                             return Vec::new();
                         }
+                        reunited.push(line.number);
                         vec![RowEvent::Context(line.number)]
                     }
                     row => vec![row],
                 }
             })
             .collect();
+        for after in reunited {
+            let before = stable_before_of_after[&after];
+            reorder_rows_around_reunited_context(&mut change.rows, before, after);
+        }
     }
     changes.retain(|change| change.rows.iter().any(row_has_signal));
+}
+
+/// Keep a reunited context line between the removals and additions it separates.
+///
+/// A gap emits its removals before its additions, so a line that both sides
+/// claimed sits after removals that follow it in the old source; those move
+/// past the context so deleted members stay inside their block.
+fn reorder_rows_around_reunited_context(rows: &mut Vec<RowEvent>, before: usize, after: usize) {
+    let Some(position) = rows
+        .iter()
+        .position(|row| matches!(row, RowEvent::Context(line) if *line == after))
+    else {
+        return;
+    };
+    let mut start = position;
+    while start > 0 && matches!(rows[start - 1], RowEvent::Removed(_) | RowEvent::Added(_)) {
+        start -= 1;
+    }
+    if start == position {
+        return;
+    }
+    let run = rows.drain(start..position).collect::<Vec<_>>();
+    let (following, preceding): (Vec<_>, Vec<_>) = run.into_iter().partition(|row| match row {
+        RowEvent::Removed(line) => line.number > before,
+        RowEvent::Added(line) => line.number > after,
+        _ => false,
+    });
+    let mut reordered = preceding;
+    reordered.push(RowEvent::Context(after));
+    reordered.extend(following);
+    let tail = rows.split_off(start + 1);
+    rows.truncate(start);
+    rows.extend(reordered);
+    rows.extend(tail);
 }
 
 /// Show wrapper changes around the payload they retain.

@@ -5,6 +5,7 @@ use super::syntax::{
     ChildSlot, ComparisonStrategy, ContentChannel, LayoutOwnership, LeafRole, NodeId,
     SiblingMatching, SourceRole, SyntaxKind, SyntaxPair, SyntaxTree, node_owns_complete_lines,
 };
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::ops::Range;
@@ -4202,7 +4203,19 @@ fn contextual_child_matches(
         .iter()
         .map(|index| context_shape(&pair.after, after[*index]))
         .collect::<Vec<_>>();
-    for edge in ordered_matches(&before_shapes, &after_shapes) {
+    // Shape alignment stays positional, but among equally good alignments an
+    // unchanged sibling keeps its partner instead of losing it to a nearby edit.
+    let before_exact = remaining_before
+        .iter()
+        .map(|index| before_fingerprints[before[*index].index()].full)
+        .collect::<Vec<_>>();
+    let after_exact = remaining_after
+        .iter()
+        .map(|index| after_fingerprints[after[*index].index()].full)
+        .collect::<Vec<_>>();
+    for edge in ordered_matches_preferring(&before_shapes, &after_shapes, |before, after| {
+        before_exact[before] == after_exact[after]
+    }) {
         let before_index = remaining_before[edge.before];
         let after_index = remaining_after[edge.after];
         before_match[before_index] = Some(after_index);
@@ -4609,11 +4622,9 @@ fn contextual_match_placements(
     let semantic_edges = semantic.iter().map(|(_, edge)| *edge).collect::<Vec<_>>();
     let semantic_placements = match_placements(&semantic_edges);
     let mut placements = vec![None; matches.len()];
-    let mut owner_placements = links
-        .before
-        .iter()
-        .map(|(before, link)| (*before, link.placement))
-        .collect::<HashMap<_, _>>();
+    // Owners matched in this call take precedence over earlier links; looking the
+    // rest up on demand keeps this linear in the siblings rather than the unit.
+    let mut owner_placements = HashMap::new();
     for ((match_index, edge), placement) in semantic.into_iter().zip(semantic_placements) {
         placements[match_index] = Some(placement);
         owner_placements.insert(before[edge.before], placement);
@@ -4628,7 +4639,10 @@ fn contextual_match_placements(
             .node(before)
             .decoration_owner
             .expect("only decorations are excluded from semantic placement");
-        placements[match_index] = owner_placements.get(&owner).copied();
+        placements[match_index] = owner_placements
+            .get(&owner)
+            .copied()
+            .or_else(|| links.before.get(&owner).map(|link| link.placement));
     }
     placements
         .into_iter()
@@ -4835,6 +4849,16 @@ struct OrderedMatch {
 /// Noncrossing unique values anchor the alignment. Small gaps use a longest common
 /// subsequence; large gaps use greedy matching to cap memory use.
 fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
+    ordered_matches_preferring(before, after, |_, _| false)
+}
+
+/// Order-preserving matching that breaks alignment ties toward preferred pairs.
+/// Preference never adds or removes matches; it only chooses among equal-sized alignments.
+fn ordered_matches_preferring<T: Eq + Hash>(
+    before: &[T],
+    after: &[T],
+    prefer: impl Fn(usize, usize) -> bool,
+) -> Vec<OrderedMatch> {
     let mut before_positions = HashMap::<&T, Vec<usize>>::new();
     for (index, value) in before.iter().enumerate() {
         before_positions.entry(value).or_default().push(index);
@@ -4879,6 +4903,7 @@ fn ordered_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch>
         let gap = align_gap(
             &before[before_start..anchor.before],
             &after[after_start..anchor.after],
+            |before, after| prefer(before_start + before, after_start + after),
         );
         matches.extend(gap.into_iter().map(|edge| OrderedMatch {
             before: before_start + edge.before,
@@ -5017,7 +5042,11 @@ fn increasing_subsequence_members(values: &[usize]) -> Vec<bool> {
     members
 }
 
-fn align_gap<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
+fn align_gap<T: Eq + Hash>(
+    before: &[T],
+    after: &[T],
+    prefer: impl Fn(usize, usize) -> bool,
+) -> Vec<OrderedMatch> {
     if before.is_empty() || after.is_empty() {
         return Vec::new();
     }
@@ -5026,7 +5055,7 @@ fn align_gap<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     if cells > MAX_LOCAL_ALIGNMENT_CELLS {
         return greedy_matches(before, after);
     }
-    lcs_matches(before, after)
+    lcs_matches(before, after, prefer)
 }
 
 /// Align a large gap in linear memory; the result may retain fewer matches than LCS.
@@ -5054,20 +5083,33 @@ fn greedy_matches<T: Eq + Hash>(before: &[T], after: &[T]) -> Vec<OrderedMatch> 
     matches
 }
 
-/// Maximize equal-value matches, breaking ties by the smallest total positional drift.
+/// Maximize equal-value matches, then preferred pairs, then the smallest positional drift.
 /// Callers must bound the gap size because the score table is quadratic.
-fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
+fn lcs_matches<T: Eq>(
+    before: &[T],
+    after: &[T],
+    prefer: impl Fn(usize, usize) -> bool,
+) -> Vec<OrderedMatch> {
     #[derive(Clone, Copy, Default, Eq, PartialEq)]
     struct AlignmentScore {
         retained: usize,
+        preferred: usize,
         drift: usize,
     }
 
     let width = after.len() + 1;
     let mut scores = vec![AlignmentScore::default(); (before.len() + 1) * width];
     let better = |left: AlignmentScore, right: AlignmentScore| {
-        left.retained > right.retained
-            || (left.retained == right.retained && left.drift < right.drift)
+        (left.retained, left.preferred, Reverse(left.drift))
+            > (right.retained, right.preferred, Reverse(right.drift))
+    };
+    let pair_score = |mut paired: AlignmentScore, before_index: usize, after_index: usize| {
+        paired.retained += 1;
+        paired.preferred += usize::from(prefer(before_index, after_index));
+        paired.drift = paired
+            .drift
+            .saturating_add(before_index.abs_diff(after_index));
+        paired
     };
     for before_index in (0..before.len()).rev() {
         for after_index in (0..after.len()).rev() {
@@ -5077,11 +5119,11 @@ fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
                 score = skip_after;
             }
             if before[before_index] == after[after_index] {
-                let mut paired = scores[(before_index + 1) * width + after_index + 1];
-                paired.retained += 1;
-                paired.drift = paired
-                    .drift
-                    .saturating_add(before_index.abs_diff(after_index));
+                let paired = pair_score(
+                    scores[(before_index + 1) * width + after_index + 1],
+                    before_index,
+                    after_index,
+                );
                 if better(paired, score) {
                     score = paired;
                 }
@@ -5095,11 +5137,11 @@ fn lcs_matches<T: Eq>(before: &[T], after: &[T]) -> Vec<OrderedMatch> {
     let mut after_index = 0;
     while before_index < before.len() && after_index < after.len() {
         if before[before_index] == after[after_index] {
-            let mut paired = scores[(before_index + 1) * width + after_index + 1];
-            paired.retained += 1;
-            paired.drift = paired
-                .drift
-                .saturating_add(before_index.abs_diff(after_index));
+            let paired = pair_score(
+                scores[(before_index + 1) * width + after_index + 1],
+                before_index,
+                after_index,
+            );
             if paired == scores[before_index * width + after_index] {
                 matches.push(OrderedMatch {
                     before: before_index,

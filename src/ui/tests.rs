@@ -1,6 +1,7 @@
 use super::*;
 use crate::diff::{
-    DiffMark, LineCoverage, PresentedFile, ReviewHunk, ReviewRow, SourceRow, SourceSpan,
+    ChangeNature, DiffMark, FileImpact, HunkImpact, LineCoverage, PresentedFile, ReviewHunk,
+    ReviewRow, SourceRow, SourceSpan,
 };
 
 #[test]
@@ -25,7 +26,12 @@ fn gutter_width_follows_the_widest_presented_label() {
                 ReviewRow::Current(line(2)),
                 ReviewRow::Removed(line(123_456)),
             ],
+            nature: ChangeNature::Edit,
+            impact: HunkImpact::default(),
+            consumers: 0,
         }],
+        impact: FileImpact::default(),
+        consumers: 0,
     };
     let gutter = GutterLayout::new(&diff);
 

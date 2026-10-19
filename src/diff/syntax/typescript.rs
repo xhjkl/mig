@@ -1,5 +1,7 @@
 use super::lower::{HighlightQueries, NodeAnnotation};
-use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use super::{
+    ContentChannel, Declares, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary,
+};
 use ::tree_sitter::Node;
 
 pub static TYPESCRIPT_HIGHLIGHTS: HighlightQueries = HighlightQueries::new(&[
@@ -70,9 +72,23 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
         let review = (parent_kind == Some("program"))
             .then(|| ReviewUnit::structural(LayoutOwnership::AdjacentBlankLines));
         let owner = !matches!(node.kind(), "ambient_declaration" | "export_statement");
+        let declares = match node.kind() {
+            "ambient_declaration" | "export_statement" => Declares::Nothing,
+            // Bindings count only where other modules can see them.
+            "lexical_declaration" | "variable_declaration" | "using_declaration" => {
+                if matches!(parent_kind, Some("program" | "export_statement")) {
+                    Declares::Definition
+                } else {
+                    Declares::Nothing
+                }
+            }
+            "method_signature" | "function_signature" => Declares::Member,
+            _ => Declares::Definition,
+        };
         return NodeAnnotation {
             review,
             identity,
+            declares,
             sibling_matching: if owner {
                 SiblingMatching::LocalIdentity
             } else {
@@ -109,6 +125,14 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
     .map(|identity| identity.byte_range());
     NodeAnnotation {
         identity,
+        declares: if matches!(
+            node.kind(),
+            "property_signature" | "public_field_definition" | "abstract_method_signature"
+        ) {
+            Declares::Member
+        } else {
+            Declares::Nothing
+        },
         sibling_matching: if member || is_local_container(node.kind()) {
             SiblingMatching::LocalIdentity
         } else {

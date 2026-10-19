@@ -118,10 +118,10 @@ fn real_git_scan_covers_the_net_recursive_worktree() {
             "also-modified.rs",
             "changed.rs",
             "deleted.rs",
-            "extensionless",
-            "notes.txt",
             "nested/staged.rs",
             "nested/untracked.rs",
+            "extensionless",
+            "notes.txt",
             "a-generated.txt",
             "z-generated.txt"
         ]

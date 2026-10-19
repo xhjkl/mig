@@ -1,6 +1,6 @@
 use crate::{
     input::{GitBlob, decode_text},
-    review::{FileNotice, ReviewEntry, review_source_pair},
+    review::{FileNotice, ReviewEntry, rank_reviews, review_source_pair},
 };
 use anyhow::{Context, Result, bail};
 use gix::ObjectId;
@@ -77,11 +77,7 @@ pub fn diff_commit(directory: &Path, commitish: &Path, limit: u64) -> Result<Vec
         reviews.push(review);
     }
 
-    reviews.sort_by(|left, right| {
-        left.is_generated()
-            .cmp(&right.is_generated())
-            .then_with(|| left.path().cmp(right.path()))
-    });
+    rank_reviews(&mut reviews, |_| 0);
     Ok(reviews)
 }
 

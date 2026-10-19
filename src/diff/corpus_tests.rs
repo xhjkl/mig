@@ -1926,6 +1926,94 @@ fn expression_fixture(expression: &str) -> String {
     )
 }
 
+#[test]
+fn unchanged_anonymous_sibling_keeps_its_partner_over_a_nearby_edit() {
+    let before = concat!(
+        "package main\n",
+        "\n",
+        "func run(sc *ctx) error {\n",
+        "\tquickTunnelURL := data.Result.Hostname\n",
+        "\tif !strings.HasPrefix(quickTunnelURL, \"https://\") {\n",
+        "\t\tquickTunnelURL = \"https://\" + quickTunnelURL\n",
+        "\t}\n",
+        "\n",
+        "\tif !sc.c.IsSet(flags.Protocol) {\n",
+        "\t\t_ = sc.c.Set(flags.Protocol, \"quic\")\n",
+        "\t}\n",
+        "\treturn StartServer(sc)\n",
+        "}\n",
+    );
+    let after = concat!(
+        "package main\n",
+        "\n",
+        "func run(sc *ctx) error {\n",
+        "\tquickTunnelURL := normalizeQuickTunnelURL(data.Result.Hostname)\n",
+        "\n",
+        "\tif !sc.c.IsSet(flags.Protocol) {\n",
+        "\t\t_ = sc.c.Set(flags.Protocol, \"quic\")\n",
+        "\t}\n",
+        "\treturn StartServer(sc)\n",
+        "}\n",
+    );
+
+    let diff = diff_file("alpha.go", before, after).expect("Go must diff");
+
+    assert_context_payload(&diff, "if !sc.c.IsSet(flags.Protocol) {");
+    assert_context_payload(&diff, "_ = sc.c.Set(flags.Protocol, \"quic\")");
+    assert_no_removed_payload(&diff, "_ = sc.c.Set(flags.Protocol, \"quic\")");
+    assert_removed_payload(
+        &diff,
+        "if !strings.HasPrefix(quickTunnelURL, \"https://\") {",
+    );
+    assert_source_ownership(&diff);
+}
+
+#[test]
+fn replaced_block_members_stay_inside_their_anonymous_block() {
+    let before = concat!(
+        "package main\n",
+        "\n",
+        "var x = 0\n",
+        "\n",
+        "const (\n",
+        "\talpha = 1\n",
+        "\tgamma = 3\n",
+        ")\n",
+    );
+    let after = concat!(
+        "package main\n",
+        "\n",
+        "var x = 0\n",
+        "\n",
+        "const (\n",
+        "\tdelta = 4\n",
+        "\tgamma = 3\n",
+        ")\n",
+    );
+
+    let diff = diff_file("alpha.go", before, after).expect("Go must diff");
+
+    assert_line_predecessor(&diff, 6, 6, "alpha = 1", "delta = 4");
+    let rows = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.rows)
+        .collect::<Vec<_>>();
+    let opener = rows
+        .iter()
+        .position(|row| matches!(row, ReviewRow::Current(line) if line_text(line) == "const ("))
+        .expect("block opener stays visible as context");
+    let removed = rows
+        .iter()
+        .position(|row| matches!(row, ReviewRow::Removed(line) if line.number == 6))
+        .expect("removed member remains visible");
+    assert!(
+        opener < removed,
+        "removed member escaped its block: {diff:#?}"
+    );
+    assert_source_ownership(&diff);
+}
+
 fn source_lines(diff: &PresentedFile) -> impl Iterator<Item = (&SourceRow, bool)> {
     diff.hunks
         .iter()

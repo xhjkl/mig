@@ -1,5 +1,7 @@
 use super::lower::{DecorationHint, HighlightQueries, NodeAnnotation};
-use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use super::{
+    ContentChannel, Declares, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary,
+};
 use ::tree_sitter::Node;
 
 pub static HIGHLIGHT_QUERIES: HighlightQueries =
@@ -52,6 +54,12 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>, source: &str) -> Node
         return NodeAnnotation {
             review,
             identity,
+            // Trait implementations restate protocol names; the implemented type owns them.
+            declares: if node.kind() == "function_item" && implements_trait(node) {
+                Declares::Member
+            } else {
+                Declares::Definition
+            },
             owns_decorations: true,
             sibling_matching: SiblingMatching::LocalIdentity,
             wrapper_boundary: WrapperBoundary::Sealed,
@@ -85,6 +93,14 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>, source: &str) -> Node
     let semantic_owner = is_semantic_owner(node.kind());
     NodeAnnotation {
         identity,
+        declares: if matches!(
+            node.kind(),
+            "associated_type" | "enum_variant" | "field_declaration" | "function_signature_item"
+        ) {
+            Declares::Member
+        } else {
+            Declares::Nothing
+        },
         decoration,
         owns_decorations: semantic_owner,
         sibling_matching: if semantic_owner {
@@ -106,6 +122,14 @@ pub fn whitespace_is_syntax(parent_kind: &str) -> bool {
         parent_kind,
         "char_literal" | "raw_string_literal" | "string_content" | "string_literal"
     )
+}
+
+fn implements_trait(node: ::tree_sitter::Node<'_>) -> bool {
+    node.parent()
+        .and_then(|list| list.parent())
+        .is_some_and(|owner| {
+            owner.kind() == "impl_item" && owner.child_by_field_name("trait").is_some()
+        })
 }
 
 fn identity_node<'tree>(node: ::tree_sitter::Node<'tree>) -> Option<::tree_sitter::Node<'tree>> {

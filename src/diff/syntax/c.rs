@@ -1,5 +1,7 @@
 use super::lower::{HighlightQueries, NodeAnnotation};
-use super::{ContentChannel, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary};
+use super::{
+    ContentChannel, Declares, LayoutOwnership, ReviewUnit, SiblingMatching, WrapperBoundary,
+};
 use ::tree_sitter::Node;
 
 pub static HIGHLIGHT_QUERIES: HighlightQueries =
@@ -36,6 +38,11 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
         return NodeAnnotation {
             review,
             identity: preprocessor_identity(node).map(|identity| identity.byte_range()),
+            declares: if matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+                Declares::Definition
+            } else {
+                Declares::Nothing
+            },
             sibling_matching: SiblingMatching::LocalIdentity,
             wrapper_boundary: WrapperBoundary::Sealed,
             ..NodeAnnotation::default()
@@ -48,6 +55,11 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
         return NodeAnnotation {
             review,
             identity: definition_identity(node).map(|identity| identity.byte_range()),
+            declares: if node.kind() != "declaration" || declares_at_scope(parent_kind) {
+                Declares::Definition
+            } else {
+                Declares::Nothing
+            },
             sibling_matching: SiblingMatching::LocalIdentity,
             wrapper_boundary: WrapperBoundary::Sealed,
             ..NodeAnnotation::default()
@@ -75,8 +87,15 @@ pub fn annotate(node: Node<'_>, parent_kind: Option<&str>) -> NodeAnnotation {
     }
     .map(|identity| identity.byte_range());
     let semantic_owner = is_semantic_owner(node.kind());
+    let declares = match node.kind() {
+        _ if identity.is_none() => Declares::Nothing,
+        "struct_specifier" | "union_specifier" | "enum_specifier" => Declares::Definition,
+        "field_declaration" | "enumerator" => Declares::Member,
+        _ => Declares::Nothing,
+    };
     NodeAnnotation {
         identity,
+        declares,
         sibling_matching: if semantic_owner {
             SiblingMatching::LocalIdentity
         } else {
@@ -96,6 +115,22 @@ pub fn whitespace_is_syntax(parent_kind: &str) -> bool {
         parent_kind,
         "char_literal" | "string_literal" | "system_lib_string"
     )
+}
+
+/// Accept declarations visible outside a function body: file, namespace, type, and
+/// conditional-compilation scopes.
+pub fn declares_at_scope(parent_kind: Option<&str>) -> bool {
+    parent_kind.is_some_and(|kind| {
+        kind.starts_with("preproc_")
+            || matches!(
+                kind,
+                "translation_unit"
+                    | "declaration_list"
+                    | "field_declaration_list"
+                    | "linkage_specification"
+                    | "template_declaration"
+            )
+    })
 }
 
 fn is_definition(kind: &str) -> bool {

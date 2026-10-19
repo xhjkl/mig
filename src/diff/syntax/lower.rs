@@ -1,8 +1,8 @@
 use super::parse::{ParsedFile, tree_sitter_language};
 use super::{
-    ChildSlot, ContentChannel, Delimiter, Grammar, GrammarField, GrammarSymbol, Leaf, LeafRole,
-    NodeId, ReviewUnit, SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree, WrapperBoundary, c,
-    cpp, css, go, html, json, nix, python, rust, toml, typescript,
+    ChildSlot, ContentChannel, Declares, Delimiter, Grammar, GrammarField, GrammarSymbol, Leaf,
+    LeafRole, NodeId, ReviewUnit, SiblingMatching, SyntaxKind, SyntaxNode, SyntaxTree,
+    WrapperBoundary, c, cpp, css, go, html, json, nix, python, rust, toml, typescript,
 };
 use crate::diff::SyntaxClass;
 use crate::diff::source::Source;
@@ -37,6 +37,8 @@ pub struct NodeAnnotation {
     pub extent: Option<Range<usize>>,
     /// Whole-node payload treatment, preserving the source while discarding parser children.
     pub prune_children: bool,
+    /// Named construct other code can refer to; see `SyntaxNode::declares`.
+    pub declares: Declares,
 }
 
 /// Upstream highlight queries with a shared cache of either compiled queries or their error.
@@ -258,6 +260,7 @@ fn lower_nodes(
                     decoration_owner: None,
                     sibling_matching: SiblingMatching::OrderedSyntax,
                     wrapper_boundary: WrapperBoundary::Traversable,
+                    declares: Declares::Nothing,
                     review: None,
                     named: false,
                     extra: false,
@@ -343,6 +346,7 @@ fn lower_nodes(
             decoration_owner: None,
             sibling_matching: annotation.sibling_matching,
             wrapper_boundary: annotation.wrapper_boundary,
+            declares: annotation.declares,
             review: annotation.review,
             named: node.is_named(),
             extra: node.is_extra(),

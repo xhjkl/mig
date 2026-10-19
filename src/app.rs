@@ -24,6 +24,16 @@ struct Cli {
 
 /// Run Mig from the process arguments and current directory.
 pub fn run() -> Result<()> {
+    let reviews = collect_reviews()?;
+    if reviews.is_empty() {
+        return Ok(());
+    }
+
+    ui::run(reviews)
+}
+
+/// Select review inputs from the process arguments and current directory.
+pub fn collect_reviews() -> Result<Vec<ReviewEntry>> {
     let cli = Cli::parse();
 
     let reviews = match (cli.commitish_or_before, cli.after) {
@@ -43,11 +53,7 @@ pub fn run() -> Result<()> {
             review.into_iter().collect()
         }
     };
-    if reviews.is_empty() {
-        return Ok(());
-    }
-
-    ui::run(reviews)
+    Ok(reviews)
 }
 
 fn load_file_pair(before: &Path, after: &Path, limit: u64) -> Result<Option<ReviewEntry>> {

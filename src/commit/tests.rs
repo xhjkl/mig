@@ -65,10 +65,10 @@ fn commit_review_uses_pinned_trees_and_keeps_generated_files_last() {
     assert_eq!(
         paths,
         vec![
-            "added.txt",
             "changed.rs",
             "new-name.rs",
             "old-name.rs",
+            "added.txt",
             "removed.txt",
             "a-generated.rs"
         ]

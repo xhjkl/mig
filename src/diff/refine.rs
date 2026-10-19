@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 pub struct RefinedHunk {
+    pub nature: ChangeNature,
     pub coverage: LineCoverage,
     pub changes: Vec<SourceChange>,
 }
@@ -57,13 +58,18 @@ pub fn refine_hunks(pair: &SyntaxPair<'_, '_>, raw: RawSourceDiff) -> Vec<Refine
         .into_iter()
         .map(|hunk| {
             let coverage = source_facts_coverage(hunk.groups.iter().flatten());
+            let nature = hunk.nature;
             let changes = hunk
                 .groups
                 .into_iter()
                 .flatten()
                 .map(|fact| fact.change)
                 .collect();
-            RefinedHunk { coverage, changes }
+            RefinedHunk {
+                nature,
+                coverage,
+                changes,
+            }
         })
         .collect()
 }
