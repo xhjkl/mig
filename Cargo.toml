@@ -1,8 +1,8 @@
 [package]
 name = "mig"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99"
 description = "A tool that shows what changed in a file"
 autobins = false
 default-run = "m"
