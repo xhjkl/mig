@@ -1,5 +1,9 @@
 # 🫆 mig
 
-`mig` replaces `git diff` with structural diffs designed to make code review faster.
+Mig shows source changes as focused structural hunks in a terminal.
 
-[Internals](DESIGN.md)
+```sh
+m                 # review HEAD → working tree under the current directory
+m HEAD~2          # review the changes a commit introduced
+m old.rs new.rs   # review two files; no Git required
+```

@@ -1,0 +1,55 @@
+[package]
+name = "mig-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A tool that shows what changed in a file"
+autobins = false
+default-run = "m"
+
+[features]
+fixture-bins = ["mig-core/fixtures"]
+stress = ["fixture-bins", "dep:serde", "dep:serde_json", "dep:tempfile", "dep:tree-sitter"]
+
+[[bin]]
+name = "m"
+path = "src/main.rs"
+
+[[bin]]
+name = "f"
+path = "src/bin/f.rs"
+required-features = ["fixture-bins"]
+
+[[bin]]
+name = "fw"
+path = "src/bin/fw.rs"
+required-features = ["fixture-bins"]
+
+[[bin]]
+name = "d"
+path = "src/bin/d.rs"
+required-features = ["fixture-bins"]
+
+[[bin]]
+name = "stress"
+path = "src/bin/stress.rs"
+required-features = ["stress"]
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+gix = { version = "0.87.1", default-features = false, features = ["max-performance", "revparse-regex", "sha1", "sha256", "status"] }
+mig-core.workspace = true
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+unicode-width = "0.2.2"
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+tempfile = { version = "3.23.0", optional = true }
+tree-sitter = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

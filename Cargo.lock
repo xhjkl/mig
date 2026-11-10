@@ -1684,15 +1684,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "mig"
-version = "0.1.12"
+name = "mig-cli"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "crossterm",
  "gix",
+ "mig-core",
  "ratatui",
+ "serde",
+ "serde_json",
  "tempfile",
+ "tree-sitter",
+ "unicode-width",
+]
+
+[[package]]
+name = "mig-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-cpp",
@@ -1706,7 +1718,6 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
- "unicode-width",
 ]
 
 [[package]]

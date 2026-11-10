@@ -1,0 +1,999 @@
+//! Render prepared review rows without inferring new diff structure.
+
+use crate::review::ReviewFile;
+use crate::review::{FileNotice, ReviewEntry};
+use anyhow::{Context, Result, ensure};
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use mig_core::{DiffMark, Highlight, LineEnding, LineNumber, MoveEdge, Row, SourceRow};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Clear, Paragraph, Wrap},
+};
+use std::io::{self, Stdout};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const MIN_SOURCE_COLUMNS: usize = 62;
+/// File ribbon and the blank row beneath it.
+const HEADER_ROWS: u16 = 2;
+const MIN_BODY_ROWS: u16 = 16;
+const MIN_TERMINAL_HEIGHT: u16 = HEADER_ROWS + MIN_BODY_ROWS;
+const VERTICAL_ELLIPSIS: &str = "⋮";
+const RIBBON_MARGIN: &str = "  ";
+const RIBBON_SEPARATOR: &str = " │ ";
+const RIBBON_OMISSION: &str = "…";
+const GENERATED_BADGE: &str = " @generated";
+/// Tab stops measured from the start of source text, independent of the gutter.
+const SOURCE_TAB_STOP: usize = 4;
+
+/// One gutter width for the whole file, keeping source aligned while scrolling.
+#[derive(Clone, Copy, Debug, Default)]
+struct GutterLayout {
+    label_columns: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceMarker {
+    Reflow,
+    Removed,
+    Added,
+}
+
+impl SourceMarker {
+    const fn glyph(self) -> char {
+        match self {
+            Self::Reflow => '~',
+            Self::Removed => '-',
+            Self::Added => '+',
+        }
+    }
+
+    const fn foreground(self) -> Color {
+        match self {
+            Self::Reflow => Palette::FAINT,
+            Self::Removed => Palette::GHOST,
+            Self::Added => Palette::CURRENT,
+        }
+    }
+}
+
+impl GutterLayout {
+    fn new(diff: &ReviewFile) -> Self {
+        let label_columns = diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.excerpt.rows)
+            .map(row_label_columns)
+            .max()
+            .unwrap_or(0);
+        Self { label_columns }
+    }
+
+    fn padding(self, label: &str) -> String {
+        " ".repeat(
+            self.label_columns
+                .saturating_sub(UnicodeWidthStr::width(label)),
+        )
+    }
+
+    fn width(self) -> usize {
+        self.label_columns + UnicodeWidthStr::width(" │ ")
+    }
+}
+
+fn row_label_columns(row: &Row) -> usize {
+    let label = match row {
+        Row::Ending(_) | Row::FileEnd => return 0,
+        Row::Elision(_) => return UnicodeWidthStr::width(VERTICAL_ELLIPSIS),
+        Row::Context { after, .. } | Row::Crumb { after, .. } => source_label(after.number, None),
+        Row::Reflow { after, .. } => {
+            return after
+                .iter()
+                .map(|line| {
+                    UnicodeWidthStr::width(
+                        source_label(line.number, Some(SourceMarker::Reflow)).as_str(),
+                    )
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        Row::Removed(line) => source_label(line.number, Some(SourceMarker::Removed)),
+        Row::Added(line) => source_label(line.number, Some(SourceMarker::Added)),
+        Row::Changed { before, after } => {
+            let removed = source_label(before.number, Some(SourceMarker::Removed));
+            let added = source_label(after.number, Some(SourceMarker::Added));
+            return UnicodeWidthStr::width(removed.as_str())
+                .max(UnicodeWidthStr::width(added.as_str()));
+        }
+        Row::Moved {
+            before,
+            after,
+            edge,
+        } => moved_label(
+            matches!(edge, MoveEdge::Start | MoveEdge::Only).then_some(*before),
+            after.number,
+        ),
+    };
+    UnicodeWidthStr::width(label.as_str())
+}
+
+fn source_label(number: LineNumber, marker: Option<SourceMarker>) -> String {
+    let Some(marker) = marker else {
+        return number.to_string();
+    };
+    format!("{} {number}", marker.glyph())
+}
+
+fn moved_label(before: Option<LineNumber>, after: LineNumber) -> String {
+    let Some(before) = before else {
+        return after.to_string();
+    };
+    format!("{before} → {after}")
+}
+
+/// Run the terminal review and restore terminal modes on exit.
+pub fn run(reviews: Vec<ReviewEntry>) -> Result<()> {
+    ensure!(!reviews.is_empty(), "cannot open an empty review");
+    let mut session = TerminalSession::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+    let mut app = App::new(reviews);
+
+    let event_result = run_event_loop(&mut terminal, &mut app);
+
+    // Restoring the terminal before propagating drawing or input errors.
+    let session_result = session.restore();
+    event_result?;
+    session_result
+}
+
+/// Terminal modes still owed restoration, including partially completed writes.
+struct TerminalSession {
+    raw_mode: bool,
+    alternate_screen: bool,
+    cursor_hidden: bool,
+}
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        let mut session = Self {
+            raw_mode: false,
+            alternate_screen: false,
+            cursor_hidden: false,
+        };
+
+        enable_raw_mode().context("failed to enable raw mode")?;
+        session.raw_mode = true;
+
+        // Marking before the write so Drop also recovers from partial terminal writes.
+        session.alternate_screen = true;
+        execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
+
+        session.cursor_hidden = true;
+        execute!(io::stdout(), Hide).context("failed to hide cursor")?;
+
+        Ok(session)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let mut first_error = None;
+
+        if self.cursor_hidden {
+            match execute!(io::stdout(), Show) {
+                Ok(()) => self.cursor_hidden = false,
+                Err(error) => first_error = Some(anyhow::Error::from(error)),
+            }
+        }
+        if self.alternate_screen {
+            match execute!(io::stdout(), LeaveAlternateScreen) {
+                Ok(()) => self.alternate_screen = false,
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(anyhow::Error::from(error));
+                }
+                Err(_) => {}
+            }
+        }
+        if self.raw_mode {
+            match disable_raw_mode() {
+                Ok(()) => self.raw_mode = false,
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(anyhow::Error::from(error));
+                }
+                Err(_) => {}
+            }
+        }
+
+        let Some(error) = first_error else {
+            return Ok(());
+        };
+        Err(error.context("failed to restore terminal"))
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// Review navigation and scroll position for the active file.
+#[derive(Debug)]
+struct App {
+    reviews: Vec<ReviewEntry>,
+    file_index: usize,
+    scroll: usize,
+    viewport_rows: usize,
+    total_rows: usize,
+}
+
+impl App {
+    fn new(reviews: Vec<ReviewEntry>) -> Self {
+        assert!(!reviews.is_empty(), "review needs at least one file");
+        Self {
+            reviews,
+            file_index: 0,
+            scroll: 0,
+            viewport_rows: 1,
+            total_rows: 0,
+        }
+    }
+
+    fn current_review(&self) -> &ReviewEntry {
+        &self.reviews[self.file_index]
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.total_rows.saturating_sub(self.viewport_rows.max(1))
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_sub(amount);
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_add(amount).min(self.max_scroll());
+    }
+
+    fn previous_file(&mut self) {
+        if self.file_index == 0 {
+            return;
+        }
+
+        self.file_index -= 1;
+        self.scroll = 0;
+    }
+
+    fn next_file(&mut self) {
+        if self.file_index + 1 >= self.reviews.len() {
+            return;
+        }
+
+        self.file_index += 1;
+        self.scroll = 0;
+    }
+}
+
+fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    terminal
+        .draw(|frame| render(frame, app))
+        .context("failed to draw structural review")?;
+
+    loop {
+        let event = event::read().context("failed to read terminal input")?;
+        match event {
+            Event::Key(key) => {
+                if handle_key(app, key) == KeyOutcome::Exit {
+                    break;
+                }
+                terminal
+                    .draw(|frame| render(frame, app))
+                    .context("failed to redraw structural review")?;
+            }
+            Event::Resize(_, _) => {
+                terminal
+                    .draw(|frame| render(frame, app))
+                    .context("failed to redraw resized structural review")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyOutcome {
+    Continue,
+    Exit,
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> KeyOutcome {
+    if key.kind == KeyEventKind::Release {
+        return KeyOutcome::Continue;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyOutcome::Exit;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return KeyOutcome::Exit,
+        KeyCode::Left | KeyCode::Char('h' | '[') => app.previous_file(),
+        KeyCode::Right | KeyCode::Char('l' | ']') => app.next_file(),
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
+        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_up(app.viewport_rows.max(1)),
+        KeyCode::PageDown | KeyCode::Char(' ' | 'd') => app.scroll_down(app.viewport_rows.max(1)),
+        KeyCode::Home => app.scroll = 0,
+        KeyCode::End => app.scroll = app.max_scroll(),
+        _ => {}
+    }
+    KeyOutcome::Continue
+}
+
+fn render(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let gutter = match app.current_review() {
+        ReviewEntry::Diff(diff) => GutterLayout::new(diff),
+        ReviewEntry::Notice(_) => GutterLayout::default(),
+    };
+    let required_width = gutter.width() + MIN_SOURCE_COLUMNS;
+    if usize::from(area.width) < required_width || area.height < MIN_TERMINAL_HEIGHT {
+        render_too_small(frame, area, required_width);
+        return;
+    }
+
+    let body = Rect::new(
+        area.x,
+        area.y + HEADER_ROWS,
+        area.width,
+        area.height.saturating_sub(HEADER_ROWS),
+    );
+    let rows = match app.current_review() {
+        ReviewEntry::Diff(diff) => compose_review(diff, gutter, body.width as usize),
+        ReviewEntry::Notice(notice) => compose_notice(notice, body.width as usize),
+    };
+    app.total_rows = rows.len();
+    app.viewport_rows = body.height as usize;
+    app.clamp_scroll();
+
+    let ribbon = file_ribbon(&app.reviews, app.file_index, usize::from(area.width));
+    frame.render_widget(
+        Paragraph::new(ribbon),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let visible = rows
+        .into_iter()
+        .skip(app.scroll)
+        .take(app.viewport_rows)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), body);
+}
+
+/// Keep the active path visible in a contiguous run of neighboring paths.
+fn file_ribbon(items: &[ReviewEntry], active: usize, width: usize) -> Line<'static> {
+    if items.is_empty() || active >= items.len() || width == 0 {
+        return Line::from("");
+    }
+
+    let margin_width = UnicodeWidthStr::width(RIBBON_MARGIN).min(width.saturating_sub(1));
+    let available = width.saturating_sub(margin_width);
+    let mut start = active;
+    let mut end = active + 1;
+
+    loop {
+        let mut candidates = [
+            start.checked_sub(1).map(|start| (start, end)),
+            (end < items.len()).then(|| (start, end + 1)),
+        ];
+        // Favoring the less populated side keeps the active path near the middle.
+        if active - start >= end - active {
+            candidates.reverse();
+        }
+        let mut grew = false;
+        for (candidate_start, candidate_end) in candidates.into_iter().flatten() {
+            let candidate_width = ribbon_run_width(items, candidate_start, candidate_end);
+            if candidate_width > available {
+                continue;
+            }
+
+            start = candidate_start;
+            end = candidate_end;
+            grew = true;
+            break;
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut spans = vec![Span::raw(" ".repeat(margin_width))];
+    let hidden_left = start > 0;
+    let hidden_right = end < items.len();
+    if hidden_left {
+        spans.push(Span::styled(RIBBON_OMISSION, muted()));
+        spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
+    }
+
+    let edge = UnicodeWidthStr::width(RIBBON_OMISSION) + UnicodeWidthStr::width(RIBBON_SEPARATOR);
+    let edge_width = (usize::from(hidden_left) + usize::from(hidden_right)) * edge;
+    let separator_width = UnicodeWidthStr::width(RIBBON_SEPARATOR);
+    let separators_width = separator_width * (end - start - 1);
+    let items_width = available.saturating_sub(edge_width + separators_width);
+
+    for (offset, item) in items[start..end].iter().enumerate() {
+        if offset > 0 {
+            spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
+        }
+        // Clipping only a lone active path; runs with neighbors already fit in full.
+        let budget = if end - start == 1 {
+            items_width
+        } else {
+            ribbon_item_width(item)
+        };
+        spans.extend(ribbon_item_spans(item, start + offset == active, budget));
+    }
+
+    if hidden_right {
+        spans.push(Span::styled(RIBBON_SEPARATOR, muted()));
+        spans.push(Span::styled(RIBBON_OMISSION, muted()));
+    }
+    clip_line(spans, width)
+}
+
+fn ribbon_run_width(items: &[ReviewEntry], start: usize, end: usize) -> usize {
+    let item_width = (start..end)
+        .map(|index| ribbon_item_width(&items[index]))
+        .sum::<usize>();
+    let separators =
+        end.saturating_sub(start + 1) + usize::from(start > 0) + usize::from(end < items.len());
+    item_width
+        + separators * UnicodeWidthStr::width(RIBBON_SEPARATOR)
+        + usize::from(start > 0) * UnicodeWidthStr::width(RIBBON_OMISSION)
+        + usize::from(end < items.len()) * UnicodeWidthStr::width(RIBBON_OMISSION)
+}
+
+fn ribbon_item_width(item: &ReviewEntry) -> usize {
+    UnicodeWidthStr::width(item.path())
+        + usize::from(item.is_generated()) * UnicodeWidthStr::width(GENERATED_BADGE)
+}
+
+fn ribbon_item_spans(item: &ReviewEntry, active: bool, width: usize) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let active_style = Style::default()
+        .fg(Palette::PATH)
+        .add_modifier(Modifier::BOLD);
+    let path_style = if active { active_style } else { muted() };
+    let badge = if item.is_generated() {
+        GENERATED_BADGE
+    } else {
+        ""
+    };
+    let reserved = UnicodeWidthStr::width(badge);
+    if reserved > width {
+        let label = format!("{}{badge}", item.path());
+        let label = clip_text_start(&label, width);
+        return vec![Span::styled(label, path_style)];
+    }
+
+    let mut spans = Vec::new();
+    let path = clip_text_start(item.path(), width - reserved);
+    if !path.is_empty() {
+        spans.push(Span::styled(path, path_style));
+    }
+    if !badge.is_empty() {
+        let badge_style = Style::default().fg(Palette::WARNING);
+        let badge_style = if active {
+            badge_style.add_modifier(Modifier::BOLD)
+        } else {
+            badge_style
+        };
+        spans.push(Span::styled(badge, badge_style));
+    }
+    spans
+}
+
+fn render_too_small(frame: &mut Frame<'_>, area: Rect, required_width: usize) {
+    let message = vec![
+        Line::styled(
+            "Mig needs a little more room.",
+            Style::default().fg(Palette::WARNING),
+        ),
+        Line::from(""),
+        Line::from(format!(
+            "Need {required_width}x{MIN_TERMINAL_HEIGHT}; current {}x{}.",
+            area.width, area.height
+        )),
+        Line::styled("Resize or press q.", Style::default().fg(Palette::MUTED)),
+    ];
+    let width = area.width.saturating_sub(4).min(60);
+    let height = 6.min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let message = Paragraph::new(message)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(message, popup);
+}
+
+fn compose_review(diff: &ReviewFile, gutter: GutterLayout, width: usize) -> Vec<Line<'static>> {
+    if diff.hunks.is_empty() {
+        return vec![Line::from(""), Line::styled("  no changes", muted())];
+    }
+
+    let mut rows = Vec::new();
+    for (index, hunk) in diff.hunks.iter().enumerate() {
+        if index > 0 {
+            rows.push(Line::from(""));
+        }
+        for row in &hunk.excerpt.rows {
+            match row {
+                Row::Context { after, .. } | Row::Crumb { after, .. } => {
+                    rows.push(source_line(after, None, gutter, width, true));
+                }
+                Row::Reflow { after, .. } => {
+                    for line in after {
+                        rows.push(source_line(
+                            line,
+                            Some(SourceMarker::Reflow),
+                            gutter,
+                            width,
+                            false,
+                        ));
+                    }
+                }
+                Row::Removed(line) => rows.push(source_line(
+                    line,
+                    Some(SourceMarker::Removed),
+                    gutter,
+                    width,
+                    false,
+                )),
+                Row::Added(line) => rows.push(source_line(
+                    line,
+                    Some(SourceMarker::Added),
+                    gutter,
+                    width,
+                    false,
+                )),
+                Row::Changed { before, after } => {
+                    rows.push(source_line(
+                        before,
+                        Some(SourceMarker::Removed),
+                        gutter,
+                        width,
+                        false,
+                    ));
+                    rows.push(source_line(
+                        after,
+                        Some(SourceMarker::Added),
+                        gutter,
+                        width,
+                        false,
+                    ));
+                }
+                Row::Ending(change) => {
+                    rows.push(line_ending_diff(
+                        change.before().map(|terminator| terminator.ending),
+                        change.after().map(|terminator| terminator.ending),
+                        gutter,
+                        width,
+                    ));
+                }
+                Row::Moved {
+                    before,
+                    after,
+                    edge,
+                } => {
+                    let origin =
+                        matches!(edge, MoveEdge::Start | MoveEdge::Only).then_some(*before);
+                    rows.push(moved_source_line(after, origin, gutter, width));
+                }
+                Row::Elision(_) => rows.push(elision_line(gutter, width)),
+                Row::FileEnd => rows.push(eof_guardian_line(gutter)),
+            }
+        }
+    }
+    rows
+}
+
+fn compose_notice(notice: &FileNotice, width: usize) -> Vec<Line<'static>> {
+    let (limit, before, after) = match notice {
+        FileNotice::TooLarge {
+            before_bytes,
+            after_bytes,
+            limit_bytes,
+            ..
+        } => (
+            format_bytes(*limit_bytes),
+            before_bytes.map(format_bytes),
+            after_bytes.map(format_bytes),
+        ),
+        FileNotice::TooManyLines {
+            before_lines,
+            after_lines,
+            limit_lines,
+            ..
+        } => (
+            format!("{limit_lines}-line"),
+            before_lines.map(|lines| format!("{lines} lines")),
+            after_lines.map(|lines| format!("{lines} lines")),
+        ),
+    };
+    let heading = format!("  file not shown — exceeds the {limit} per-revision limit");
+    let mut details = vec![Span::raw("  ")];
+    let has_before = before.is_some();
+    if let Some(before) = before {
+        details.push(Span::styled("before ", muted()));
+        details.push(Span::styled(before, surrounding_style()));
+    }
+    if let Some(after) = after {
+        if has_before {
+            details.push(Span::styled("  ·  ", muted()));
+        }
+        details.push(Span::styled("current ", muted()));
+        details.push(Span::styled(after, surrounding_style()));
+    }
+
+    vec![
+        Line::from(""),
+        clip_line(
+            vec![Span::styled(heading, Style::default().fg(Palette::WARNING))],
+            width,
+        ),
+        clip_line(details, width),
+    ]
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+
+    for (unit, scale) in [("GiB", GIB), ("MiB", MIB), ("KiB", KIB)] {
+        if bytes < scale {
+            continue;
+        }
+        if bytes.is_multiple_of(scale) {
+            return format!("{} {unit}", bytes / scale);
+        }
+        return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+    }
+
+    format!("{bytes} B")
+}
+
+fn line_ending_diff(
+    before: Option<LineEnding>,
+    after: Option<LineEnding>,
+    gutter: GutterLayout,
+    width: usize,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(gutter.width()))];
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            spans.push(Span::styled("line ending: ", muted()));
+            spans.push(Span::styled(
+                line_ending_label(before),
+                change_emphasis_style(DiffMark::Removed),
+            ));
+            spans.push(Span::styled(" → ", Style::default().fg(Palette::MOVE)));
+            spans.push(Span::styled(
+                line_ending_label(after),
+                change_emphasis_style(DiffMark::Added),
+            ));
+        }
+        (Some(before), None) => {
+            spans.push(Span::styled("before: ", muted()));
+            spans.push(Span::styled(
+                line_ending_label(before),
+                change_emphasis_style(DiffMark::Removed),
+            ));
+        }
+        (None, Some(after)) => {
+            spans.push(Span::styled("after: ", muted()));
+            spans.push(Span::styled(
+                line_ending_label(after),
+                change_emphasis_style(DiffMark::Added),
+            ));
+        }
+        (None, None) => unreachable!("a line-ending row always has a source side"),
+    }
+    clip_line(spans, width)
+}
+
+fn line_ending_label(ending: LineEnding) -> &'static str {
+    match ending {
+        LineEnding::Missing => "no newline at end of file",
+        LineEnding::Lf => "LF",
+        LineEnding::CrLf => "CRLF",
+    }
+}
+
+fn source_line(
+    line: &SourceRow,
+    marker: Option<SourceMarker>,
+    gutter: GutterLayout,
+    width: usize,
+    row_is_context: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    let row_is_ghost = marker == Some(SourceMarker::Removed);
+    let label = source_label(line.number, marker);
+    spans.push(Span::raw(gutter.padding(&label)));
+    if let Some(marker) = marker {
+        spans.push(Span::styled(
+            format!("{} ", marker.glyph()),
+            Style::default().fg(marker.foreground()),
+        ));
+    }
+    let gutter_style = if row_is_context {
+        Style::default()
+            .fg(Palette::FAINT)
+            .add_modifier(Modifier::DIM)
+    } else if row_is_ghost {
+        Style::default().fg(Palette::GHOST)
+    } else {
+        Style::default().fg(Palette::GUTTER)
+    };
+    spans.push(Span::styled(format!("{} │ ", line.number), gutter_style));
+    append_source_spans(
+        &mut spans,
+        line,
+        width.saturating_sub(gutter.width()),
+        row_is_ghost,
+    );
+    Line::from(spans)
+}
+
+fn moved_source_line(
+    line: &SourceRow,
+    before: Option<LineNumber>,
+    gutter: GutterLayout,
+    width: usize,
+) -> Line<'static> {
+    let label = moved_label(before, line.number);
+    let gutter_text = format!("{}{label} │ ", gutter.padding(&label));
+    let mut spans = vec![Span::styled(
+        gutter_text,
+        Style::default().fg(Palette::MOVE),
+    )];
+    append_source_spans(
+        &mut spans,
+        line,
+        width.saturating_sub(gutter.width()),
+        false,
+    );
+    Line::from(spans)
+}
+
+fn append_source_spans(
+    spans: &mut Vec<Span<'static>>,
+    line: &SourceRow,
+    width: usize,
+    historical: bool,
+) {
+    let mut column = 0;
+    for span in &line.spans {
+        if column >= width {
+            break;
+        }
+        let (text, text_width) = clip_source_text(&span.text, width - column, column);
+        if text_width == 0 {
+            continue;
+        }
+        // Muting historical syntax keeps attention on the current revision.
+        let style = match (historical, span.mark) {
+            (true, DiffMark::Added) => {
+                unreachable!("before-side ghost lines cannot contain added source")
+            }
+            (true, DiffMark::Context) => Style::default().fg(Palette::GHOST),
+            (false, DiffMark::Context) => softened_syntax_style(span.highlight),
+            (_, mark) => change_emphasis_style(mark),
+        };
+        spans.push(Span::styled(text, style));
+        column += text_width;
+    }
+}
+
+fn elision_line(gutter: GutterLayout, width: usize) -> Line<'static> {
+    let label = VERTICAL_ELLIPSIS;
+    let gutter_text = format!("{}{label} │ ", gutter.padding(label));
+    let mut spans = vec![Span::styled(
+        gutter_text,
+        Style::default()
+            .fg(Palette::FAINT)
+            .add_modifier(Modifier::DIM),
+    )];
+    if gutter.width() < width {
+        spans.push(Span::styled(
+            VERTICAL_ELLIPSIS,
+            Style::default()
+                .fg(Palette::FAINT)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn eof_guardian_line(gutter: GutterLayout) -> Line<'static> {
+    Line::styled(
+        format!("{} │", gutter.padding("")),
+        Style::default().fg(Palette::GUTTER),
+    )
+}
+
+/// Give source edits and metadata changes the same visual emphasis.
+fn change_emphasis_style(mark: DiffMark) -> Style {
+    let foreground = match mark {
+        DiffMark::Removed => Palette::GHOST_EMPHASIS,
+        DiffMark::Added => Palette::CURRENT,
+        DiffMark::Context => unreachable!("context source does not carry change emphasis"),
+    };
+    Style::default().fg(foreground).add_modifier(Modifier::BOLD)
+}
+
+fn softened_syntax_style(class: Highlight) -> Style {
+    // Blending toward neutral gray keeps unchanged syntax legible behind the edits.
+    let foreground = syntax_foreground(class);
+    let foreground = match (foreground, Palette::MUTED) {
+        (Color::Rgb(red, green, blue), Color::Rgb(nr, ng, nb)) => {
+            let blend = |channel: u8, neutral: u8| {
+                ((u16::from(channel) * 2 + u16::from(neutral)) / 3) as u8
+            };
+            Color::Rgb(blend(red, nr), blend(green, ng), blend(blue, nb))
+        }
+        _ => foreground,
+    };
+    Style::default().fg(foreground)
+}
+
+fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut clipped = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        if used >= width {
+            break;
+        }
+        let text = clip_text(span.content.as_ref(), width - used);
+        used += UnicodeWidthStr::width(text.as_str());
+        clipped.push(Span::styled(text, span.style));
+    }
+    Line::from(clipped)
+}
+
+fn clip_text(text: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    output
+}
+
+/// Expand tabs before clipping so Ratatui cannot discard their indentation.
+fn clip_source_text(text: &str, width: usize, start_column: usize) -> (String, usize) {
+    let mut output = String::with_capacity(text.len());
+    let mut used = 0;
+    for character in text.chars() {
+        if character == '\t' {
+            let column = start_column.saturating_add(used);
+            let tab_width = SOURCE_TAB_STOP - column % SOURCE_TAB_STOP;
+            let available = width.saturating_sub(used);
+            let displayed = tab_width.min(available);
+            output.push_str(&" ".repeat(displayed));
+            used += displayed;
+            if displayed < tab_width {
+                break;
+            }
+            continue;
+        }
+
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    (output, used)
+}
+
+/// Clip the start of a path to keep its distinguishing filename visible.
+fn clip_text_start(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let omission_width = UnicodeWidthStr::width(RIBBON_OMISSION);
+    if width <= omission_width {
+        return clip_text(RIBBON_OMISSION, width);
+    }
+
+    let mut suffix = Vec::new();
+    let mut used = omission_width;
+    for character in text.chars().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        suffix.push(character);
+        used += character_width;
+    }
+    suffix.reverse();
+
+    let mut output = String::from(RIBBON_OMISSION);
+    output.extend(suffix);
+    output
+}
+
+fn syntax_foreground(class: Highlight) -> Color {
+    match class {
+        Highlight::Plain | Highlight::Punctuation | Highlight::Identifier => Palette::TEXT,
+        Highlight::Keyword => Palette::KEYWORD,
+        Highlight::Type => Palette::TYPE,
+        Highlight::Literal => Palette::LITERAL,
+        Highlight::String => Palette::STRING,
+        Highlight::Comment => Palette::COMMENT,
+    }
+}
+
+fn muted() -> Style {
+    Style::default().fg(Palette::MUTED)
+}
+
+fn surrounding_style() -> Style {
+    softened_syntax_style(Highlight::Plain)
+}
+
+/// Foreground colors only; backgrounds come from the user's terminal.
+struct Palette;
+
+impl Palette {
+    const TEXT: Color = Color::Rgb(205, 214, 226);
+    const PATH: Color = Color::Rgb(139, 190, 255);
+    const MUTED: Color = Color::Rgb(119, 132, 149);
+    const FAINT: Color = Color::Rgb(77, 89, 103);
+    const GUTTER: Color = Color::Rgb(87, 100, 116);
+    const WARNING: Color = Color::Rgb(225, 174, 89);
+    const MOVE: Color = Color::Rgb(101, 181, 190);
+    const CURRENT: Color = Color::Rgb(100, 205, 144);
+    const GHOST: Color = Color::Rgb(127, 110, 149);
+    const GHOST_EMPHASIS: Color = Color::Rgb(136, 106, 153);
+
+    const KEYWORD: Color = Color::Rgb(195, 148, 235);
+    const TYPE: Color = Color::Rgb(105, 190, 199);
+    const LITERAL: Color = Color::Rgb(224, 178, 112);
+    const STRING: Color = Color::Rgb(151, 196, 130);
+    const COMMENT: Color = Color::Rgb(139, 151, 167);
+}
+
+#[cfg(test)]
+mod tests;
